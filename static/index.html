@@ -1,0 +1,925 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>MITS Snapshot Analyzer</title>
+  <style>
+    * { box-sizing: border-box; }
+    body {
+      font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', sans-serif;
+      background: #0d1117;
+      color: #e6edf3;
+      height: 100vh;
+      display: flex;
+      flex-direction: column;
+      overflow: hidden;
+      margin: 0;
+    }
+
+    /* ── Header ── */
+    #header {
+      background: #161b22;
+      border-bottom: 1px solid #30363d;
+      padding: 0 16px;
+      height: 48px;
+      display: flex;
+      align-items: center;
+      gap: 12px;
+      flex-shrink: 0;
+    }
+    #header .logo { font-size: 18px; font-weight: 700; color: #58a6ff; white-space: nowrap; }
+    #header .sep { color: #30363d; font-size: 18px; }
+
+    /* breadcrumb */
+    #breadcrumb {
+      display: flex;
+      align-items: center;
+      gap: 2px;
+      flex: 1;
+      overflow: hidden;
+      font-size: 13px;
+    }
+    .bc-seg {
+      color: #58a6ff;
+      cursor: pointer;
+      padding: 2px 4px;
+      border-radius: 4px;
+      white-space: nowrap;
+      max-width: 160px;
+      overflow: hidden;
+      text-overflow: ellipsis;
+    }
+    .bc-seg:hover { background: #21262d; }
+    .bc-seg.current { color: #e6edf3; cursor: default; pointer-events: none; }
+    .bc-slash { color: #484f58; padding: 0 1px; }
+
+    /* status pill */
+    #status-pill {
+      display: flex;
+      align-items: center;
+      gap: 6px;
+      font-size: 12px;
+      color: #8b949e;
+      white-space: nowrap;
+      flex-shrink: 0;
+    }
+    #status-dot { width: 7px; height: 7px; border-radius: 50%; background: #484f58; flex-shrink: 0; }
+    #status-dot.ok  { background: #3fb950; }
+    #status-dot.err { background: #f85149; }
+    #status-dot.spin { animation: pulse 1s ease infinite; background: #d29922; }
+    @keyframes pulse { 0%,100%{opacity:1} 50%{opacity:.4} }
+
+    /* ── Main layout ── */
+    #main { display: flex; flex: 1; overflow: hidden; }
+
+    /* ── File pane (left) ── */
+    #file-pane {
+      width: 380px;
+      min-width: 200px;
+      flex-shrink: 0;
+      border-right: 1px solid #30363d;
+      display: flex;
+      flex-direction: column;
+      overflow: hidden;
+    }
+
+    /* mode tabs */
+    #mode-tabs {
+      display: flex;
+      border-bottom: 1px solid #30363d;
+      flex-shrink: 0;
+      background: #0d1117;
+    }
+    .mode-tab {
+      flex: 1;
+      padding: 9px 0;
+      font-size: 12px;
+      font-weight: 600;
+      letter-spacing: .04em;
+      text-transform: uppercase;
+      color: #8b949e;
+      background: none;
+      border: none;
+      border-bottom: 2px solid transparent;
+      cursor: pointer;
+      transition: color .1s, background .1s;
+      font-family: inherit;
+    }
+    .mode-tab:hover { background: #161b22; color: #e6edf3; }
+    .mode-tab.active { color: #58a6ff; border-bottom-color: #58a6ff; }
+
+    /* ── Saved CSV results ── */
+    .saved-results {
+      flex: 0 0 auto; border-top: 1px solid #30363d; background: #0d1117;
+    }
+    .saved-header { display: flex; align-items: center; padding: 6px 8px; gap: 4px; }
+    .saved-toggle {
+      display: flex; align-items: center; gap: 6px; flex: 1; min-width: 0;
+      padding: 2px; border: 0; background: transparent; color: #8b949e;
+      cursor: pointer; text-align: left; font-family: inherit; font-size: 10px; font-weight: 600;
+      letter-spacing: .05em; text-transform: uppercase;
+    }
+    .saved-toggle::before { content: '▸'; font-size: 9px; transition: transform .12s; }
+    .saved-results.open .saved-toggle::before { transform: rotate(90deg); }
+    .saved-toggle:hover { color: #e6edf3; }
+    .saved-count { color: #484f58; font-weight: 400; }
+    .saved-refresh {
+      padding: 2px 6px; border: 1px solid #30363d; border-radius: 4px;
+      background: #161b22; color: #8b949e; cursor: pointer; font-family: inherit; font-size: 11px;
+    }
+    .saved-refresh:hover { color: #e6edf3; background: #21262d; }
+    .saved-list { max-height: 190px; overflow-y: auto; padding: 0 6px 6px; }
+    .saved-results:not(.open) .saved-list { display: none; }
+    .history-empty { padding: 8px 6px 10px; color: #484f58; font-size: 11px; }
+    .history-item {
+      display: flex; align-items: center; gap: 5px; width: 100%; padding: 6px;
+      border: 0; border-radius: 5px; background: transparent; color: #c9d1d9;
+      cursor: pointer; text-align: left; font-family: inherit;
+    }
+    .history-item:hover { background: #161b22; }
+    .history-item.expired { opacity: .55; }
+    .history-star {
+      width: 20px; flex-shrink: 0; padding: 0; border: 0; background: transparent;
+      color: #6e7681; cursor: pointer; font-size: 15px; line-height: 1;
+    }
+    .history-star.favorite { color: #d29922; }
+    .history-rename, .history-delete {
+      width: 18px; flex-shrink: 0; padding: 0; border: 0; background: transparent;
+      color: #6e7681; cursor: pointer; font-family: inherit; font-size: 13px; line-height: 1;
+    }
+    .history-rename:hover { color: #58a6ff; }
+    .history-delete:hover { color: #f85149; }
+    .history-copy { min-width: 0; flex: 1; }
+    .history-title { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; font-size: 11px; }
+    .history-meta { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; color: #6e7681; font-size: 9.5px; margin-top: 2px; }
+    .history-open { color: #58a6ff; font-size: 10px; flex-shrink: 0; }
+
+    .mode-pane { flex: 1; display: none; flex-direction: column; overflow: hidden; }
+    .mode-pane.active { display: flex; }
+
+    #file-pane-header {
+      padding: 8px 12px;
+      font-size: 11px;
+      font-weight: 600;
+      text-transform: uppercase;
+      letter-spacing: .06em;
+      color: #8b949e;
+      border-bottom: 1px solid #21262d;
+      display: flex;
+      align-items: center;
+      justify-content: space-between;
+      flex-shrink: 0;
+    }
+    #file-list { flex: 1; overflow-y: auto; }
+
+    .dir-item, .file-item {
+      display: flex;
+      align-items: center;
+      gap: 8px;
+      padding: 6px 12px;
+      font-size: 13px;
+      cursor: pointer;
+      border-bottom: 1px solid #161b22;
+      transition: background .1s;
+      user-select: none;
+    }
+    .dir-item:hover  { background: #161b22; }
+    .file-item:hover { background: #161b22; }
+    .file-item.active { background: #1f2937; border-left: 2px solid #58a6ff; }
+    .dir-item .icon  { color: #d29922; flex-shrink: 0; }
+    .file-item .icon { color: #8b949e; flex-shrink: 0; }
+    .item-name { flex: 1; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+    .dir-item .item-name  { color: #58a6ff; }
+    .file-item .item-name { color: #e6edf3; }
+    .item-size { font-size: 11px; color: #484f58; flex-shrink: 0; }
+
+    /* up-dir row */
+    .up-item {
+      display: flex; align-items: center; gap: 8px;
+      padding: 6px 12px; font-size: 13px; cursor: pointer;
+      color: #8b949e; border-bottom: 1px solid #21262d;
+      transition: background .1s;
+    }
+    .up-item:hover { background: #161b22; }
+
+    /* empty / loading states */
+    .pane-msg {
+      display: flex; align-items: center; justify-content: center;
+      height: 100%; color: #484f58; font-size: 13px; text-align: center; padding: 24px;
+    }
+
+    /* ── Explore filter bar ── */
+    #search-bar { padding: 6px 8px; border-bottom: 1px solid #21262d; flex-shrink: 0; position: relative; }
+    #search-input {
+      width: 100%; background: #161b22; border: 1px solid #30363d;
+      border-radius: 5px; color: #e6edf3; font-size: 12px;
+      padding: 5px 8px 5px 26px; outline: none; box-sizing: border-box;
+      font-family: inherit;
+    }
+    #search-input:focus { border-color: #388bfd; background: #0d1117; }
+    #search-input::placeholder { color: #484f58; }
+    #search-bar::before {
+      content: '⌕'; position: absolute; left: 16px; top: 50%;
+      transform: translateY(-50%); color: #484f58; font-size: 14px;
+      pointer-events: none;
+    }
+
+    /* ── Search mode ── */
+    #search-form {
+      padding: 12px; border-bottom: 1px solid #21262d; flex-shrink: 0;
+      display: flex; flex-direction: column; gap: 10px;
+    }
+    #availability-form {
+      padding: 12px; border-bottom: 1px solid #21262d; flex-shrink: 0;
+      display: flex; flex-direction: column; gap: 10px;
+    }
+    #agent-unknown-toggle { display: flex; align-items: center; gap: 6px; cursor: pointer; font-size: 12px; color: #c9d1d9; }
+    #agent-unknown-toggle input { accent-color: #388bfd; cursor: pointer; margin: 0; }
+    .agent-toggle { display: flex; align-items: center; gap: 6px; cursor: pointer; font-size: 11.5px; color: #c9d1d9; }
+    .agent-toggle input { accent-color: #388bfd; cursor: pointer; margin: 0; }
+    #agent-optional-filters { border-top: 1px dashed #21262d; padding-top: 10px; }
+    #agent-optional-filters summary { font-size: 10px; font-weight: 600; text-transform: uppercase; letter-spacing: .06em; color: #6e7681; cursor: pointer; }
+    #agent-optional-body { display: flex; flex-direction: column; gap: 10px; padding-top: 10px; }
+    #btn-run-availability {
+      background: #238636; border: 1px solid #2ea043; color: #fff;
+      padding: 7px 0; border-radius: 6px; cursor: pointer; font-size: 12.5px;
+      font-weight: 600; font-family: inherit;
+    }
+    #btn-run-availability[disabled] { opacity: .4; cursor: not-allowed; }
+    #availability-summary { padding: 7px 12px; font-size: 11px; color: #8b949e; border-bottom: 1px solid #21262d; flex-shrink: 0; display: none; }
+    #availability-summary.show { display: block; }
+    #availability-results { flex: 1; overflow-y: auto; }
+    .field { display: flex; flex-direction: column; gap: 4px; }
+    .field label {
+      font-size: 10px; font-weight: 600; text-transform: uppercase;
+      letter-spacing: .06em; color: #8b949e;
+    }
+    .field select, .field input {
+      width: 100%; background: #161b22; border: 1px solid #30363d;
+      border-radius: 5px; color: #e6edf3; font-size: 12.5px;
+      padding: 6px 8px; outline: none; font-family: inherit;
+    }
+    .field select:focus, .field input:focus { border-color: #388bfd; background: #0d1117; }
+    .field input::placeholder { color: #484f58; }
+    .field select:disabled, .field input:disabled { opacity: .45; cursor: not-allowed; }
+    .field-hint { font-size: 10.5px; color: #484f58; }
+    .field-hint.ok  { color: #3fb950; }
+    .field-hint.err { color: #f85149; }
+    .field-optional { font-weight: 400; text-transform: none; letter-spacing: 0; color: #6e7681; }
+
+    #btn-run-search {
+      background: #238636; border: 1px solid #2ea043; color: #fff;
+      padding: 7px 0; border-radius: 6px; cursor: pointer;
+      font-size: 12.5px; font-weight: 600; font-family: inherit;
+      transition: background .1s;
+    }
+    #btn-run-search:hover:not([disabled]) { background: #2ea043; }
+    #btn-run-search[disabled] { opacity: .4; cursor: not-allowed; }
+
+    /* index status + progress */
+    #index-status {
+      padding: 8px 12px; border-bottom: 1px solid #21262d; flex-shrink: 0;
+      font-size: 11px; color: #8b949e; display: none;
+      align-items: center; gap: 8px;
+    }
+    #index-status.show { display: flex; }
+    #index-status .dot {
+      width: 6px; height: 6px; border-radius: 50%; flex-shrink: 0; background: #484f58;
+    }
+    #index-status.ready  .dot { background: #3fb950; }
+    #index-status.stale  .dot { background: #d29922; }
+    #index-status.none   .dot { background: #f85149; }
+    #index-text { flex: 1; }
+    #btn-index {
+      font-size: 10.5px; padding: 3px 9px; border-radius: 5px;
+      background: #21262d; border: 1px solid #30363d; color: #8b949e;
+      cursor: pointer; flex-shrink: 0; font-family: inherit;
+    }
+    #btn-index:hover:not([disabled]) { background: #30363d; color: #e6edf3; }
+    #btn-index[disabled] { opacity: .4; cursor: not-allowed; }
+
+    #progress-wrap {
+      padding: 10px 12px; border-bottom: 1px solid #21262d;
+      flex-shrink: 0; display: none;
+    }
+    #progress-wrap.show { display: block; }
+    #progress-label {
+      font-size: 11px; color: #8b949e; margin-bottom: 6px;
+      display: flex; justify-content: space-between; gap: 8px;
+    }
+    #progress-track {
+      height: 4px; background: #21262d; border-radius: 2px; overflow: hidden;
+    }
+    #progress-fill {
+      height: 100%; width: 0%; background: #58a6ff;
+      border-radius: 2px; transition: width .25s ease;
+    }
+    #progress-fill.indeterminate {
+      width: 35%; animation: slide 1.1s ease-in-out infinite;
+    }
+    @keyframes slide {
+      0% { margin-left: -35%; } 100% { margin-left: 100%; }
+    }
+
+    #search-summary {
+      padding: 7px 12px; font-size: 11px; color: #8b949e;
+      border-bottom: 1px solid #21262d; flex-shrink: 0; display: none;
+    }
+    #search-summary.show { display: block; }
+    #search-results { flex: 1; overflow-y: auto; }
+
+    .result-item {
+      padding: 8px 12px; border-bottom: 1px solid #161b22;
+      cursor: pointer; transition: background .1s;
+    }
+    .result-item:hover { background: #161b22; }
+    .result-item.active { background: #1f2937; border-left: 2px solid #58a6ff; }
+    .result-top {
+      display: flex; align-items: center; gap: 8px; margin-bottom: 3px;
+    }
+    .result-entity {
+      flex: 1; font-size: 13px; color: #58a6ff;
+      overflow: hidden; text-overflow: ellipsis; white-space: nowrap;
+    }
+    .result-sub {
+      font-size: 10.5px; color: #6e7681; margin-bottom: 3px;
+      overflow: hidden; text-overflow: ellipsis; white-space: nowrap;
+    }
+
+    /* ── Fields-mode result: download + preview table ── */
+    #fields-download {
+      margin: 12px; padding: 12px; background: #161b22;
+      border: 1px solid #30363d; border-radius: 8px;
+      display: flex; align-items: center; justify-content: space-between; gap: 12px;
+    }
+    #fields-download-text { font-size: 12px; color: #8b949e; }
+    #fields-download-text strong { color: #e6edf3; }
+    .btn-download-csv {
+      background: #238636; border: 1px solid #2ea043; color: #fff;
+      padding: 7px 16px; border-radius: 6px; cursor: pointer;
+      font-size: 12.5px; font-weight: 600; font-family: inherit;
+      text-decoration: none; white-space: nowrap; transition: background .1s;
+    }
+    .btn-download-csv:hover { background: #2ea043; }
+
+    #fields-preview-wrap { margin: 0 12px 12px; overflow-x: auto; }
+    #fields-preview-wrap .preview-caption {
+      font-size: 10.5px; color: #6e7681; margin-bottom: 6px;
+    }
+    table.fields-preview {
+      width: 100%; border-collapse: collapse; font-size: 11.5px;
+      font-family: 'SF Mono', 'Fira Code', monospace;
+    }
+    table.fields-preview th, table.fields-preview td {
+      text-align: left; padding: 5px 10px; border-bottom: 1px solid #21262d;
+      white-space: nowrap; max-width: 260px; overflow: hidden; text-overflow: ellipsis;
+    }
+    table.fields-preview th {
+      color: #8b949e; font-weight: 600; text-transform: uppercase;
+      font-size: 9.5px; letter-spacing: .04em; border-bottom: 1px solid #30363d;
+      font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', sans-serif;
+    }
+    table.fields-preview td { color: #c9d1d9; }
+    table.fields-preview td.cell-blank { color: #484f58; font-style: italic; }
+    table.fields-preview th.csv-sortable { padding: 0; }
+    .csv-sort-btn {
+      width: 100%; padding: 6px 10px; border: 0; background: transparent;
+      color: inherit; font: inherit; text-align: left; text-transform: inherit;
+      letter-spacing: inherit; cursor: pointer; white-space: nowrap;
+    }
+    .csv-sort-btn:hover { color: #e6edf3; background: #1c2129; }
+    .csv-sort-indicator { color: #58a6ff; margin-left: 4px; }
+    .csv-filter-row th { padding: 4px 6px !important; background: #0d1117; }
+    .csv-filter-input {
+      box-sizing: border-box; width: 100%; min-width: 84px; padding: 4px 6px;
+      border: 1px solid #30363d; border-radius: 4px; background: #161b22;
+      color: #c9d1d9; font: 10.5px 'SF Mono', 'Fira Code', monospace;
+      text-transform: none; letter-spacing: normal;
+    }
+    .csv-filter-input:focus { outline: 1px solid #58a6ff88; border-color: #58a6ff; }
+    .csv-pagination {
+      display: flex; align-items: center; justify-content: center; gap: 8px;
+      padding: 10px 0 2px; font-size: 11px; color: #8b949e;
+    }
+    .csv-page-btn, .csv-page-size {
+      border: 1px solid #30363d; border-radius: 4px; background: #161b22;
+      color: #c9d1d9; font: 11px inherit; padding: 4px 8px;
+    }
+    .csv-page-btn { cursor: pointer; }
+    .csv-page-btn:hover:not(:disabled) { background: #30363d; }
+    .csv-page-btn:disabled { opacity: .45; cursor: default; }
+    .csv-page-size { margin-left: auto; }
+    .csv-loading { color: #6e7681; text-align: center !important; padding: 18px !important; }
+
+    /* ── Search By toggle ── */
+    #search-by-toggle { display: flex; gap: 6px; }
+    .sb-opt {
+      flex: 1; font-size: 11.5px; font-weight: 600; padding: 6px 0;
+      background: #161b22; border: 1px solid #30363d; border-radius: 5px;
+      color: #8b949e; cursor: pointer; font-family: inherit;
+      transition: background .1s, color .1s, border-color .1s;
+    }
+    .sb-opt:hover  { background: #1c2129; color: #e6edf3; }
+    .sb-opt.active { background: #388bfd22; border-color: #58a6ff77; color: #58a6ff; }
+
+    .search-by-pane { display: none; }
+    .search-by-pane.active { display: flex; }
+
+    /* ── Fields mode: add row + chips ── */
+    #sel-field-schema { margin-bottom: 2px; }
+    #field-schema-hint { margin-bottom: 4px; }
+    #field-add-row { display: flex; gap: 6px; }
+    #field-add-row input { flex: 1; }
+    #btn-add-field {
+      font-size: 12px; padding: 0 12px; border-radius: 5px;
+      background: #21262d; border: 1px solid #30363d; color: #8b949e;
+      cursor: pointer; font-family: inherit; flex-shrink: 0;
+      transition: background .1s, color .1s;
+    }
+    #btn-add-field:hover:not([disabled]) { background: #30363d; color: #e6edf3; }
+    #btn-add-field[disabled] { opacity: .4; cursor: not-allowed; }
+
+    #field-chips { display: flex; flex-wrap: wrap; gap: 6px; }
+    #field-chips:empty { display: none; }
+    .field-chip {
+      display: flex; align-items: center; gap: 6px;
+      background: #388bfd18; border: 1px solid #388bfd44; border-radius: 14px;
+      padding: 3px 6px 3px 11px; font-size: 11.5px; color: #79c0ff;
+    }
+    .field-chip .chip-order {
+      font-size: 9.5px; color: #4d95d8; font-weight: 700;
+    }
+    .field-chip .chip-path {
+      font-size: 9.5px; color: #5e7ea3;
+    }
+    .field-chip.manual { background: #ffffff08; border-color: #30363d; color: #c9d1d9; }
+    .field-chip.manual .chip-order { color: #6e7681; }
+    .field-chip button {
+      background: none; border: none; color: #6e9dc9; cursor: pointer;
+      font-size: 13px; line-height: 1; padding: 2px 4px; border-radius: 50%;
+      font-family: inherit;
+    }
+    .field-chip button:hover { background: #388bfd33; color: #e6edf3; }
+
+    #unique-toggle {
+      display: flex; align-items: center; gap: 6px; cursor: pointer;
+      font-size: 12px; color: #c9d1d9; user-select: none;
+    }
+    #unique-toggle input { accent-color: #388bfd; cursor: pointer; margin: 0; }
+
+    #related-files { display: flex; flex-direction: column; gap: 8px; }
+    .related-file-card {
+      padding: 9px; background: #161b22; border: 1px solid #30363d;
+      border-radius: 6px; display: flex; flex-direction: column; gap: 6px;
+    }
+    .related-file-head { display: flex; align-items: center; gap: 6px; }
+    .related-file-head select { flex: 1; }
+    .related-file-remove {
+      background: none; border: none; color: #8b949e; cursor: pointer;
+      font-size: 16px; padding: 0 4px; line-height: 1;
+    }
+    .related-file-remove:hover { color: #f85149; }
+    .related-file-card .field-label {
+      color: #6e7681; font-size: 10px; text-transform: uppercase;
+      letter-spacing: .05em;
+    }
+    .related-file-fields { display: flex; flex-wrap: wrap; gap: 4px; }
+    .related-field-chip {
+      background: #388bfd18; border: 1px solid #388bfd44; border-radius: 12px;
+      padding: 2px 7px; font-size: 10.5px; color: #79c0ff;
+    }
+    .related-field-chip button {
+      background: none; border: none; color: #6e9dc9; cursor: pointer;
+      padding: 0 0 0 3px; font-size: 12px; line-height: 1;
+    }
+    #btn-add-related-file {
+      align-self: flex-start; font-size: 11.5px; padding: 5px 9px;
+      border-radius: 5px; background: #21262d; border: 1px solid #30363d;
+      color: #8b949e; cursor: pointer; font-family: inherit;
+    }
+    #btn-add-related-file:hover { background: #30363d; color: #e6edf3; }
+    #condition-groups { display: flex; flex-direction: column; gap: 8px; }
+    .condition-group {
+      padding: 9px; background: #161b22; border: 1px solid #30363d;
+      border-radius: 6px; display: flex; flex-direction: column; gap: 6px;
+    }
+    .condition-group-head, .condition-row { display: flex; align-items: center; gap: 6px; }
+    .condition-group-head select { width: 90px; }
+    .condition-group-head span { flex: 1; color: #6e7681; font-size: 10px; text-transform: uppercase; letter-spacing: .05em; }
+    .condition-row select:first-child { flex: 1.4; }
+    .condition-row select:nth-child(2) { flex: .9; }
+    .condition-row input { flex: 1.2; min-width: 70px; }
+    .condition-row button, .condition-group-head button {
+      background: none; border: none; color: #8b949e; cursor: pointer;
+      font-size: 15px; padding: 0 3px; line-height: 1;
+    }
+    .condition-row button:hover, .condition-group-head button:hover { color: #f85149; }
+    .condition-add-btn {
+      align-self: flex-start; background: none; border: 1px solid #30363d;
+      color: #8b949e; border-radius: 4px; cursor: pointer; padding: 3px 7px;
+      font: inherit; font-size: 10.5px;
+    }
+    .condition-add-btn:hover { background: #21262d; color: #e6edf3; }
+
+    /* ── Optional filters (collapsed by default) ── */
+    #optional-filters { border-top: 1px dashed #21262d; padding-top: 10px; }
+    #optional-filters summary {
+      font-size: 10px; font-weight: 600; text-transform: uppercase;
+      letter-spacing: .06em; color: #6e7681; cursor: pointer;
+      list-style: none; display: flex; align-items: center; gap: 5px;
+      user-select: none;
+    }
+    #optional-filters summary::-webkit-details-marker { display: none; }
+    #optional-filters summary::before {
+      content: '▸'; font-size: 9px; color: #6e7681; transition: transform .12s;
+    }
+    #optional-filters[open] summary::before { transform: rotate(90deg); }
+    #optional-filters summary:hover { color: #8b949e; }
+    #optional-filters summary:hover::before { color: #8b949e; }
+    #optional-filters-body {
+      display: flex; flex-direction: column; gap: 10px; padding-top: 10px;
+    }
+
+    /* optional DB-backed filters */
+    #db-filters {
+      display: none; flex-direction: column; gap: 10px;
+    }
+    #db-filters.show { display: flex; }
+    #snowflake-note {
+      font-size: 10.5px; color: #6e7681; padding: 6px 12px;
+      border-bottom: 1px solid #21262d; display: none;
+    }
+    #snowflake-note.show { display: block; }
+    #snowflake-note b { color: #d29922; font-weight: 600; }
+    .credential-inline-btn {
+      margin-left: 6px; padding: 3px 7px; border-radius: 4px;
+      border: 1px solid #388bfd66; background: #388bfd18; color: #79c0ff;
+      cursor: pointer; font: inherit;
+    }
+    .credential-inline-btn:hover { background: #388bfd33; }
+    #snowflake-credentials {
+      display: none; position: fixed; inset: 0; z-index: 10;
+      background: #0009; align-items: center; justify-content: center;
+    }
+    #snowflake-credentials.show { display: flex; }
+    #snowflake-credentials-card {
+      width: min(520px, calc(100vw - 32px)); max-height: calc(100vh - 32px);
+      overflow-y: auto; background: #161b22; border: 1px solid #30363d;
+      border-radius: 8px; padding: 18px; box-shadow: 0 12px 40px #0008;
+    }
+    #snowflake-credentials-card h2 { margin: 0 0 6px; font-size: 15px; }
+    #snowflake-credentials-card p { margin: 0 0 14px; color: #8b949e; font-size: 11.5px; line-height: 1.45; }
+    #snowflake-credentials-card .credential-grid { display: grid; grid-template-columns: 1fr 1fr; gap: 10px; }
+    #snowflake-credentials-card .credential-full { grid-column: 1 / -1; }
+    #snowflake-credentials-card .credential-actions { display: flex; justify-content: flex-end; gap: 8px; margin-top: 15px; }
+    .credential-btn { padding: 7px 13px; border-radius: 5px; border: 1px solid #30363d; background: #21262d; color: #c9d1d9; cursor: pointer; font-family: inherit; font-size: 12px; }
+    .credential-btn.primary { background: #238636; border-color: #2ea043; color: #fff; }
+    #credential-error { color: #f85149; font-size: 11px; min-height: 15px; margin-top: 8px; }
+    .result-count {
+      font-size: 10px; color: #d29922; background: #d2992218;
+      border-radius: 9px; padding: 1px 7px; flex-shrink: 0;
+    }
+    .result-snippet {
+      font-size: 11px; color: #8b949e; line-height: 1.45;
+      font-family: 'SF Mono', 'Fira Code', monospace;
+      display: -webkit-box; -webkit-line-clamp: 2; -webkit-box-orient: vertical;
+      overflow: hidden; word-break: break-all;
+    }
+    .result-snippet mark { background: #d2992244; color: #f0c674; border-radius: 2px; }
+
+    /* ── Preview pane (right) ── */
+    #preview-pane {
+      flex: 1;
+      display: flex;
+      flex-direction: column;
+      overflow: hidden;
+    }
+    #preview-header {
+      padding: 8px 16px;
+      border-bottom: 1px solid #21262d;
+      display: flex;
+      align-items: center;
+      justify-content: space-between;
+      flex-shrink: 0;
+      min-height: 40px;
+    }
+    #preview-key {
+      font-size: 12px;
+      color: #8b949e;
+      font-family: 'SF Mono', 'Fira Code', monospace;
+      overflow: hidden;
+      text-overflow: ellipsis;
+      white-space: nowrap;
+      flex: 1;
+    }
+    #preview-meta { font-size: 11px; color: #484f58; white-space: nowrap; margin-left: 16px; flex-shrink: 0; }
+    .preview-actions { display: flex; gap: 6px; flex-shrink: 0; margin-left: 12px; }
+    .preview-btn {
+      font-size: 11px; padding: 3px 10px; border-radius: 5px;
+      background: #21262d; border: 1px solid #30363d; color: #8b949e;
+      cursor: pointer; transition: background .1s, color .1s; font-family: inherit;
+    }
+    .preview-btn:hover { background: #30363d; color: #e6edf3; }
+    .preview-btn.active { background: #388bfd22; border-color: #58a6ff55; color: #58a6ff; }
+
+    #preview-content { flex: 1; overflow: auto; padding: 16px; }
+    pre { margin: 0; font-family: 'SF Mono', 'Fira Code', 'Cascadia Code', monospace;
+           font-size: 12.5px; line-height: 1.6; white-space: pre-wrap; word-break: break-all; }
+
+    /* JSON syntax */
+    .jk { color: #79c0ff; }   /* key */
+    .js { color: #a5d6ff; }   /* string value */
+    .jn { color: #f0883e; }   /* number */
+    .jb { color: #ff7b72; }   /* boolean */
+    .jx { color: #8b949e; }   /* null */
+    .hit { background: #d2992255; outline: 1px solid #d2992288; border-radius: 2px; }
+
+    /* ── Scrollbar ── */
+    ::-webkit-scrollbar { width: 6px; height: 6px; }
+    ::-webkit-scrollbar-track { background: transparent; }
+    ::-webkit-scrollbar-thumb { background: #30363d; border-radius: 3px; }
+
+    /* ── Error screen ── */
+    #error-screen {
+      display: none;
+      flex: 1; align-items: center; justify-content: center; flex-direction: column;
+      gap: 12px; padding: 32px;
+    }
+    #error-screen.show { display: flex; }
+    #error-screen h2 { font-size: 16px; font-weight: 600; color: #f85149; }
+    #error-screen pre {
+      background: #161b22; border: 1px solid #30363d; border-radius: 6px;
+      padding: 12px 16px; font-size: 12px; color: #8b949e; max-width: 540px; width: 100%;
+    }
+  </style>
+</head>
+<body>
+
+<!-- Header -->
+<div id="header">
+  <span class="logo">⬡ MITS</span>
+  <div id="status-pill">
+    <span id="status-dot"></span>
+    <span id="status-text">Connecting…</span>
+  </div>
+</div>
+
+<!-- Error screen (shown if env vars not set) -->
+<div id="error-screen">
+  <h2>Could not connect to S3</h2>
+  <p style="color:#8b949e;font-size:13px;text-align:center;max-width:460px;">
+    Create a <code style="color:#58a6ff">.env</code> file in the project folder,
+    then click <strong>Retry</strong> — no server restart needed.
+  </p>
+  <pre>AWS_ACCESS_KEY_ID=ASIA...
+AWS_SECRET_ACCESS_KEY=...
+AWS_SESSION_TOKEN=IQoJb3...</pre>
+  <button id="btn-retry"
+    style="background:#238636;border:1px solid #2ea043;color:#fff;padding:7px 20px;border-radius:6px;cursor:pointer;font-size:13px;font-family:inherit;">
+    Retry
+  </button>
+  <div id="error-detail" style="font-size:12px;color:#f85149;margin-top:4px;"></div>
+</div>
+
+<!-- Main -->
+<div id="main">
+  <!-- Left pane -->
+  <div id="file-pane">
+    <div id="mode-tabs">
+      <button class="mode-tab active" data-mode="search">Search</button>
+      <button class="mode-tab" data-mode="availability">Availability Agent</button>
+    </div>
+
+    <!-- Availability Agent mode -->
+    <div class="mode-pane" id="pane-availability">
+      <div id="availability-form">
+        <div class="field">
+          <label for="agent-sel-integration">Integration</label>
+          <select id="agent-sel-integration"><option value="">Loading…</option></select>
+          <span class="field-hint">Availability rules are loaded from the agent mapping file.</span>
+        </div>
+        <label class="agent-toggle">
+          <input type="checkbox" id="agent-include-students" />
+          <span>Include student communities</span>
+        </label>
+        <label class="agent-toggle">
+          <input type="checkbox" id="agent-include-applications" />
+          <span>Include Applications-launched communities</span>
+        </label>
+        <label id="agent-unknown-toggle">
+          <input type="checkbox" id="agent-show-unknown" />
+          <span>Show Unknown Mappings only</span>
+        </label>
+        <div class="field">
+          <label for="agent-limit">Maximum results <span class="field-optional">(optional)</span></label>
+          <input type="number" id="agent-limit" min="1" max="200000" step="1" placeholder="e.g. 500" autocomplete="off" />
+          <span class="field-hint" id="agent-limit-hint">No limit — evaluate all matching units</span>
+        </div>
+        <details id="agent-optional-filters">
+          <summary>Optional filters</summary>
+          <div id="agent-optional-body">
+            <div class="field"><label for="agent-asof">As of <span class="field-optional">(optional)</span></label><input type="text" id="agent-asof" placeholder="YYYY-MM-DDTHH:MM (UTC)" autocomplete="off" /><span class="field-hint" id="agent-asof-hint">Uses latest syncs created within the past 24 hours</span></div>
+            <div class="field"><label for="agent-sel-org">Organization</label><select id="agent-sel-org"><option value="">Any organization</option></select></div>
+            <div class="field"><label for="agent-buildings">Building ID</label><input type="text" id="agent-buildings" placeholder="e.g. 10238, 10287 — blank for all" autocomplete="off" /></div>
+          </div>
+        </details>
+        <button id="btn-run-availability" disabled>Run Availability Agent</button>
+      </div>
+      <div id="availability-summary"></div>
+      <div id="availability-results"><div class="pane-msg">Choose an integration to analyze availability</div></div>
+      <div class="saved-results" id="saved-availability">
+        <div class="saved-header">
+          <button type="button" class="saved-toggle" data-history-kind="availability" aria-expanded="false">
+            <span>Saved Availability results</span>
+            <span class="saved-count" data-history-count="availability">(0)</span>
+          </button>
+          <button type="button" class="saved-refresh" data-history-refresh="availability" title="Refresh saved results">↻</button>
+        </div>
+        <div class="saved-list" id="history-availability-list"></div>
+      </div>
+    </div>
+
+    <!-- Search mode -->
+    <div class="mode-pane active" id="pane-search">
+      <div id="search-form">
+        <div class="field">
+          <label for="sel-integration">Integration</label>
+          <select id="sel-integration">
+            <option value="">Loading…</option>
+          </select>
+        </div>
+        <div class="field">
+          <label for="sel-filename">File name</label>
+          <select id="sel-filename" disabled>
+            <option value="">Select an integration first</option>
+          </select>
+          <span class="field-hint" id="filename-hint"></span>
+        </div>
+        <div class="field">
+          <label>Search by</label>
+          <div id="search-by-toggle" role="radiogroup">
+            <button type="button" class="sb-opt active" data-search-by="text">Text Match</button>
+            <button type="button" class="sb-opt" data-search-by="fields">Fields</button>
+          </div>
+        </div>
+
+        <!-- Text Match mode -->
+        <div class="field search-by-pane active" id="pane-text-match">
+          <label for="input-text">Text match</label>
+          <input type="text" id="input-text" placeholder="Exact text to find…"
+                 autocomplete="off" spellcheck="false" disabled />
+        </div>
+
+        <!-- Fields mode -->
+        <div class="field search-by-pane" id="pane-fields">
+          <label for="sel-field-schema">Fields</label>
+          <select id="sel-field-schema" disabled>
+            <option value="">Select an integration and file first</option>
+          </select>
+          <span class="field-hint" id="field-schema-hint"></span>
+          <div id="field-add-row">
+            <input type="text" id="input-field" placeholder="Or type a field name manually…"
+                   autocomplete="off" spellcheck="false" disabled />
+            <button type="button" id="btn-add-field" disabled>Add</button>
+          </div>
+          <div id="field-chips"></div>
+          <span class="field-hint">
+            Fields picked from the dropdown are scoped to one object type, so
+            picking two never mixes up values from different things. Fields typed
+            manually match the name wherever it occurs.
+          </span>
+          <label id="unique-toggle">
+            <input type="checkbox" id="input-unique" />
+            <span>Unique values only</span>
+          </label>
+          <div class="field" id="related-files-section">
+            <label>Additional files</label>
+            <div id="related-files"></div>
+            <button type="button" id="btn-add-related-file" class="btn-secondary">
+              + Add related file
+            </button>
+            <span class="field-hint">
+              Join each file to the primary file by building and matching fields.
+              Related fields are added with a filename prefix.
+            </span>
+          </div>
+          <div class="field" id="conditions-section">
+            <label>Conditions</label>
+            <div id="condition-groups"></div>
+            <button type="button" id="btn-add-condition-group" class="condition-add-btn">+ Add condition group</button>
+            <span class="field-hint">
+              Conditions in an “any” group are OR’ed; groups are AND’ed together.
+            </span>
+          </div>
+        </div>
+
+        <details id="optional-filters">
+          <summary>Optional filters</summary>
+          <div id="optional-filters-body">
+            <div class="field">
+              <label for="input-asof">As of <span class="field-optional">(optional)</span></label>
+              <input type="text" id="input-asof"
+                     placeholder="YYYY-MM-DDTHH:MM (UTC) or paste a snapshot-viewer link"
+                     autocomplete="off" spellcheck="false" />
+              <span class="field-hint" id="asof-hint">Uses each building's latest snapshot</span>
+            </div>
+            <div id="db-filters">
+              <div class="field">
+                <label for="sel-org">Organization</label>
+                <select id="sel-org">
+                  <option value="">Any organization</option>
+                </select>
+              </div>
+              <div class="field">
+                <label for="input-buildings">Building ID</label>
+                <input type="text" id="input-buildings"
+                       placeholder="e.g. 10238, 10287 — blank for all"
+                       autocomplete="off" spellcheck="false" />
+              </div>
+            </div>
+          </div>
+        </details>
+
+        <button id="btn-run-search" disabled>Search latest snapshots</button>
+      </div>
+      <div id="snowflake-note"></div>
+      <div id="index-status">
+        <span class="dot"></span>
+        <span id="index-text"></span>
+        <button id="btn-index">Build index</button>
+      </div>
+      <div id="search-summary"></div>
+      <div id="search-results">
+        <div class="pane-msg">Choose an integration and file, then search by text or fields</div>
+      </div>
+      <div class="saved-results" id="saved-search">
+        <div class="saved-header">
+          <button type="button" class="saved-toggle" data-history-kind="fields" aria-expanded="false">
+            <span>Saved Search results</span>
+            <span class="saved-count" data-history-count="fields">(0)</span>
+          </button>
+          <button type="button" class="saved-refresh" data-history-refresh="fields" title="Refresh saved results">↻</button>
+        </div>
+        <div class="saved-list" id="history-search-list"></div>
+      </div>
+    </div>
+    <div id="progress-wrap">
+      <div id="progress-label">
+        <span id="progress-note">Working…</span>
+        <span id="progress-pct"></span>
+      </div>
+      <div id="progress-track"><div id="progress-fill"></div></div>
+    </div>
+  </div>
+
+  <!-- Preview pane -->
+  <div id="preview-pane">
+    <div id="preview-header" style="display:none">
+      <div id="preview-key"></div>
+      <div id="preview-meta"></div>
+      <div class="preview-actions">
+        <button class="preview-btn" id="btn-raw">Raw</button>
+        <button class="preview-btn" id="btn-copy">Copy</button>
+      </div>
+    </div>
+    <div id="preview-content">
+      <div class="pane-msg" style="flex-direction:column;gap:6px;">
+        <span style="font-size:24px;opacity:.3">📄</span>
+        <span>Click a file to preview it</span>
+      </div>
+    </div>
+  </div>
+</div>
+
+<div id="snowflake-credentials" role="dialog" aria-modal="true" aria-labelledby="snowflake-credentials-title">
+  <div id="snowflake-credentials-card">
+    <h2 id="snowflake-credentials-title">Snowflake credentials</h2>
+    <p>These values will be saved to the project’s <code>.env</code> file. Secrets are never displayed after saving.</p>
+    <div class="credential-grid">
+      <div class="field"><label for="credential-account">Account</label><input id="credential-account" autocomplete="off" /></div>
+      <div class="field"><label for="credential-user">User</label><input id="credential-user" autocomplete="username" /></div>
+      <div class="field credential-full"><label for="credential-auth">Authentication</label>
+        <select id="credential-auth">
+          <option value="access_token">Programmatic access token</option>
+          <option value="password">Password</option>
+          <option value="externalbrowser">SSO / external browser</option>
+          <option value="oauth">OAuth bearer token</option>
+          <option value="key_pair">Key pair</option>
+        </select>
+      </div>
+      <div class="field credential-full" id="credential-secret-wrap"><label for="credential-secret">Token or password</label><input id="credential-secret" type="password" autocomplete="new-password" /></div>
+      <div class="field credential-full" id="credential-key-path-wrap" style="display:none"><label for="credential-key-path">Private key path</label><input id="credential-key-path" placeholder="~/.snowflake/rsa_key.p8" autocomplete="off" /></div>
+      <div class="field credential-full"><label for="credential-role">Role <span class="field-optional">(optional)</span></label><input id="credential-role" autocomplete="off" /></div>
+      <div class="field"><label for="credential-warehouse">Warehouse <span class="field-optional">(optional)</span></label><input id="credential-warehouse" autocomplete="off" /></div>
+      <div class="field"><label for="credential-database">Database <span class="field-optional">(optional)</span></label><input id="credential-database" autocomplete="off" /></div>
+      <div class="field credential-full"><label for="credential-schema">Schema <span class="field-optional">(optional)</span></label><input id="credential-schema" autocomplete="off" /></div>
+    </div>
+    <div id="credential-error"></div>
+    <div class="credential-actions"><button class="credential-btn" id="btn-cancel-credentials">Cancel</button><button class="credential-btn primary" id="btn-save-credentials">Save and connect</button></div>
+  </div>
+</div>
+
+<script src="app.js"></script>
+</body>
+</html>
