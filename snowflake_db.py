@@ -685,7 +685,14 @@ def health():
         return {'state': 'unavailable',
                 'error': 'snowflake-connector-python is not installed'}
     if not configured():
-        return {'state': 'unconfigured', 'missing': missing_keys()}
+        return {
+            'state': 'unconfigured',
+            'missing': missing_keys(),
+            'account': _env('SNOWFLAKE_ACCOUNT'),
+            'user': _env('SNOWFLAKE_USER'),
+            # This is only a presence flag; the token itself is never returned.
+            'hasAccessToken': bool(_env('SNOWFLAKE_TOKEN')),
+        }
 
     started = time.time()
     try:

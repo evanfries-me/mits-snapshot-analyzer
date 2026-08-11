@@ -3061,8 +3061,18 @@ def snowflake_credentials():
     auth_values = {}
     if auth_method == 'access_token':
         if not secret:
-            return jsonify({'error': 'A programmatic access token is required'}), 400
-        auth_values['SNOWFLAKE_ACCESS_TOKEN'] = secret
+            # The token is intentionally never displayed in the UI. Allow the
+            # user to supply only the missing account/user while retaining an
+            # already-configured token in the environment.
+            existing_authenticator = (os.environ.get('SNOWFLAKE_AUTHENTICATOR') or '').strip().lower()
+            existing_token = (os.environ.get('SNOWFLAKE_ACCESS_TOKEN') or '').strip()
+            if not existing_token and not existing_authenticator:
+                existing_token = (os.environ.get('SNOWFLAKE_TOKEN') or '').strip()
+            if not existing_token:
+                return jsonify({'error': 'A programmatic access token is required'}), 400
+            auth_values['SNOWFLAKE_ACCESS_TOKEN'] = existing_token
+        else:
+            auth_values['SNOWFLAKE_ACCESS_TOKEN'] = secret
     elif auth_method == 'password':
         if not secret:
             return jsonify({'error': 'A Snowflake password is required'}), 400

@@ -547,10 +547,12 @@ async function loadSnowflake() {
     if (health.state !== 'ready') {
       filters.classList.remove('show');
       note.classList.add('show');
-      const title = health.state === 'unconfigured' ? 'Snowflake credentials required' :
+      const title = health.state === 'unconfigured' && health.hasAccessToken
+        ? 'Snowflake connection details required'
+        : health.state === 'unconfigured' ? 'Snowflake credentials required' :
         `Snowflake ${esc(health.state)}`;
       const detail = health.state === 'unconfigured'
-        ? `Missing: ${esc((health.missing || []).join(', '))}`
+        ? `${health.hasAccessToken ? 'Saved access token detected. ' : ''}Missing: ${esc((health.missing || []).join(', '))}`
         : esc(health.error || 'unavailable');
       const canEdit = health.state === 'unconfigured' || health.credentialIssue;
       note.innerHTML = `<b>${title}</b> — ${detail}` + (canEdit
@@ -612,7 +614,9 @@ function renderCredentialAuth() {
   keyWrap.style.display = method === 'key_pair' ? '' : 'none';
   secretLabel.textContent = method === 'password' ? 'Password' :
     method === 'oauth' ? 'OAuth bearer token' : 'Programmatic access token';
-  secret.required = needsSecret;
+  const canReuseSavedToken = method === 'access_token' && Boolean(search.snowflake?.hasAccessToken);
+  secret.required = needsSecret && !canReuseSavedToken;
+  secret.placeholder = canReuseSavedToken ? 'Leave blank to keep the saved token' : '';
 }
 
 function openSnowflakeCredentials() {
