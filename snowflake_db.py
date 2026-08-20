@@ -59,7 +59,8 @@ APPLICATIONS_ORG_TABLE = os.environ.get(
 # Columns worth returning for enrichment — building_details has 200+, and
 # selecting them all for 500 results makes the payload needlessly large.
 DETAIL_COLUMNS = ('BUILDING_NAME', 'ORGANIZATION_ID', 'ACTIVE', 'CITY',
-                  'STATE', 'POSTAL_CODE', 'TOTAL_UNITS', 'SLUG')
+                  'STATE', 'POSTAL_CODE', 'TOTAL_UNITS', 'SLUG',
+                  'EXCLUDE_NOT_RENT_READY_UNITS')
 
 # Fivetran soft-delete flag present on both tables.
 _LIVE = 'COALESCE({alias}._FIVETRAN_DELETED, FALSE) = FALSE'
@@ -250,6 +251,11 @@ def reset():
     with _lock:
         old, _conn = _conn, None
     _abandon(old)
+    # Credential/config changes must not retain account-scoped filter data.
+    try:
+        _availability_filter_cache.clear()
+    except NameError:
+        pass
 
 
 _READ_ONLY_PREFIXES = ('select', 'with', 'show', 'describe', 'desc', 'explain')
@@ -465,6 +471,10 @@ def building_ids_for_org(org_value):
     return {f'building_{r["ID"]}' for r in rows if r['ID'] is not None}
 
 
+_availability_filter_cache = {}
+_AVAILABILITY_FILTER_TTL = 5 * 60
+
+
 def availability_filter_ids(exclude_students=False, exclude_applications=False):
     """Return building ids allowed by Availability Agent community filters.
 
@@ -476,6 +486,13 @@ def availability_filter_ids(exclude_students=False, exclude_applications=False):
     """
     if not exclude_students and not exclude_applications:
         return None, []
+
+    cache_key = (bool(exclude_students), bool(exclude_applications))
+    cached = _availability_filter_cache.get(cache_key)
+    if cached and (time.time() - cached['ts']) < _AVAILABILITY_FILTER_TTL:
+        allowed = cached['allowed']
+        return (set(allowed) if allowed is not None else None,
+                list(cached['notes']))
 
     cmap = column_map()
     id_col = cmap['id']
@@ -534,6 +551,9 @@ def availability_filter_ids(exclude_students=False, exclude_applications=False):
         conditions.append(
             f"(b.{student_col} IS NULL OR NOT ({truthy.format(col=student_col)}))")
     if not student_col and not exclude_applications:
+        _availability_filter_cache[cache_key] = {
+            'allowed': None, 'notes': list(unavailable), 'ts': time.time(),
+        }
         return None, unavailable
 
     rows = query(
@@ -543,6 +563,9 @@ def availability_filter_ids(exclude_students=False, exclude_applications=False):
     allowed = {f'building_{r["ID"]}' for r in rows if r.get('ID') is not None}
     if exclude_applications:
         allowed -= launched_applications
+    _availability_filter_cache[cache_key] = {
+        'allowed': set(allowed), 'notes': list(unavailable), 'ts': time.time(),
+    }
     return allowed, unavailable
 
 

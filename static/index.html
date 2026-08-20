@@ -241,12 +241,15 @@
     #agent-optional-filters { border-top: 1px dashed #21262d; padding-top: 10px; }
     #agent-optional-filters summary { font-size: 10px; font-weight: 600; text-transform: uppercase; letter-spacing: .06em; color: #6e7681; cursor: pointer; }
     #agent-optional-body { display: flex; flex-direction: column; gap: 10px; padding-top: 10px; }
-    #btn-run-availability {
+    #agent-run-actions { display: flex; gap: 8px; }
+    #btn-run-availability, #btn-stop-availability {
+      flex: 1;
       background: #238636; border: 1px solid #2ea043; color: #fff;
       padding: 7px 0; border-radius: 6px; cursor: pointer; font-size: 12.5px;
       font-weight: 600; font-family: inherit;
     }
-    #btn-run-availability[disabled] { opacity: .4; cursor: not-allowed; }
+    #btn-stop-availability { background: #da3633; border-color: #f85149; }
+    #btn-run-availability[disabled], #btn-stop-availability[disabled] { opacity: .4; cursor: not-allowed; }
     #availability-summary { padding: 7px 12px; font-size: 11px; color: #8b949e; border-bottom: 1px solid #21262d; flex-shrink: 0; display: none; }
     #availability-summary.show { display: block; }
     #availability-results { flex: 1; overflow-y: auto; }
@@ -278,26 +281,27 @@
     #btn-run-search[disabled] { opacity: .4; cursor: not-allowed; }
 
     /* index status + progress */
-    #index-status {
+    #index-status, #agent-index-status {
       padding: 8px 12px; border-bottom: 1px solid #21262d; flex-shrink: 0;
       font-size: 11px; color: #8b949e; display: none;
       align-items: center; gap: 8px;
     }
-    #index-status.show { display: flex; }
-    #index-status .dot {
+    #index-status.show, #agent-index-status.show { display: flex; }
+    #index-status .dot, #agent-index-status .dot {
       width: 6px; height: 6px; border-radius: 50%; flex-shrink: 0; background: #484f58;
     }
-    #index-status.ready  .dot { background: #3fb950; }
-    #index-status.stale  .dot { background: #d29922; }
-    #index-status.none   .dot { background: #f85149; }
-    #index-text { flex: 1; }
-    #btn-index {
+    #index-status.ready .dot, #agent-index-status.ready .dot { background: #3fb950; }
+    #index-status.stale .dot, #agent-index-status.stale .dot { background: #d29922; }
+    #index-status.none .dot, #agent-index-status.none .dot { background: #f85149; }
+    #index-text, #agent-index-text { flex: 1; }
+    #btn-index, #btn-agent-index, #btn-agent-companion, #agent-index-percent {
       font-size: 10.5px; padding: 3px 9px; border-radius: 5px;
       background: #21262d; border: 1px solid #30363d; color: #8b949e;
       cursor: pointer; flex-shrink: 0; font-family: inherit;
     }
-    #btn-index:hover:not([disabled]) { background: #30363d; color: #e6edf3; }
-    #btn-index[disabled] { opacity: .4; cursor: not-allowed; }
+    #btn-index:hover:not([disabled]), #btn-agent-index:hover:not([disabled]), #btn-agent-companion:hover:not([disabled]) { background: #30363d; color: #e6edf3; }
+    #btn-index[disabled], #btn-agent-index[disabled], #btn-agent-companion[disabled] { opacity: .4; cursor: not-allowed; }
+    #agent-index-percent { padding-right: 4px; }
 
     #progress-wrap {
       padding: 10px 12px; border-bottom: 1px solid #21262d;
@@ -440,8 +444,11 @@
     #btn-add-field:hover:not([disabled]) { background: #30363d; color: #e6edf3; }
     #btn-add-field[disabled] { opacity: .4; cursor: not-allowed; }
 
-    #field-chips { display: flex; flex-wrap: wrap; gap: 6px; }
+    #field-chips { display: flex; flex-direction: column; gap: 6px; }
     #field-chips:empty { display: none; }
+    .field-chip-wrap, .related-field-selection {
+      display: flex; flex-direction: column; align-items: flex-start; gap: 4px;
+    }
     .field-chip {
       display: flex; align-items: center; gap: 6px;
       background: #388bfd18; border: 1px solid #388bfd44; border-radius: 14px;
@@ -484,7 +491,7 @@
       color: #6e7681; font-size: 10px; text-transform: uppercase;
       letter-spacing: .05em;
     }
-    .related-file-fields { display: flex; flex-wrap: wrap; gap: 4px; }
+    .related-file-fields { display: flex; flex-direction: column; gap: 6px; }
     .related-field-chip {
       background: #388bfd18; border: 1px solid #388bfd44; border-radius: 12px;
       padding: 2px 7px; font-size: 10.5px; color: #79c0ff;
@@ -493,6 +500,21 @@
       background: none; border: none; color: #6e9dc9; cursor: pointer;
       padding: 0 0 0 3px; font-size: 12px; line-height: 1;
     }
+    .array-expansion-options {
+      display: flex; flex-direction: column; gap: 3px; margin-left: 8px;
+      padding: 5px 7px; border-left: 2px solid #30363d;
+      font-size: 10.5px; color: #8b949e;
+    }
+    .array-expansion-options > span {
+      color: #6e7681; font-size: 9.5px; text-transform: uppercase;
+      letter-spacing: .04em;
+    }
+    .array-expansion-options label {
+      display: flex; align-items: center; gap: 5px; cursor: pointer;
+      color: #c9d1d9; user-select: none;
+    }
+    .array-expansion-options input { margin: 0; accent-color: #388bfd; }
+    .array-expansion-options small { color: #6e7681; font-size: 9.5px; }
     #btn-add-related-file {
       align-self: flex-start; font-size: 11.5px; padding: 5px 9px;
       border-radius: 5px; background: #21262d; border: 1px solid #30363d;
@@ -724,7 +746,24 @@ AWS_SESSION_TOKEN=IQoJb3...</pre>
             <div class="field"><label for="agent-buildings">Building ID</label><input type="text" id="agent-buildings" placeholder="e.g. 10238, 10287 — blank for all" autocomplete="off" /></div>
           </div>
         </details>
-        <button id="btn-run-availability" disabled>Run Availability Agent</button>
+        <div id="agent-run-actions">
+          <button id="btn-run-availability" disabled>Run Availability Agent</button>
+          <button id="btn-stop-availability" hidden>Stop and generate CSV</button>
+        </div>
+      </div>
+      <div id="agent-index-status">
+        <span class="dot"></span>
+        <span id="agent-index-text"></span>
+        <select id="agent-index-percent" aria-label="Re-index building percentage">
+          <option value="1">1% of buildings</option>
+          <option value="5">5% of buildings</option>
+          <option value="10">10% of buildings</option>
+          <option value="25">25% of buildings</option>
+          <option value="50">50% of buildings</option>
+          <option value="100" selected>100% of buildings</option>
+        </select>
+        <button id="btn-agent-companion" hidden>Build Voyager companion</button>
+        <button id="btn-agent-index">Re-index</button>
       </div>
       <div id="availability-summary"></div>
       <div id="availability-results"><div class="pane-msg">Choose an integration to analyze availability</div></div>
@@ -773,7 +812,7 @@ AWS_SESSION_TOKEN=IQoJb3...</pre>
 
         <!-- Fields mode -->
         <div class="field search-by-pane" id="pane-fields">
-          <label for="sel-field-schema">Fields</label>
+          <label for="sel-field-schema">Fields or objects</label>
           <select id="sel-field-schema" disabled>
             <option value="">Select an integration and file first</option>
           </select>
@@ -785,9 +824,9 @@ AWS_SESSION_TOKEN=IQoJb3...</pre>
           </div>
           <div id="field-chips"></div>
           <span class="field-hint">
-            Fields picked from the dropdown are scoped to one object type, so
-            picking two never mixes up values from different things. Fields typed
-            manually match the name wherever it occurs.
+            Select an entire object to include all of its known scalar fields,
+            or select individual fields. Dropdown selections stay scoped to one
+            object type; manually typed names match wherever they occur.
           </span>
           <label id="unique-toggle">
             <input type="checkbox" id="input-unique" />
@@ -801,6 +840,7 @@ AWS_SESSION_TOKEN=IQoJb3...</pre>
             </button>
             <span class="field-hint">
               Join each file to the primary file by building and matching fields.
+              Choose an inner, left outer, right outer, or full outer join.
               Related fields are added with a filename prefix.
             </span>
           </div>
@@ -822,7 +862,7 @@ AWS_SESSION_TOKEN=IQoJb3...</pre>
               <input type="text" id="input-asof"
                      placeholder="YYYY-MM-DDTHH:MM (UTC) or paste a snapshot-viewer link"
                      autocomplete="off" spellcheck="false" />
-              <span class="field-hint" id="asof-hint">Uses each building's latest snapshot</span>
+              <span class="field-hint" id="asof-hint">Uses latest syncs created within the past 24 hours</span>
             </div>
             <div id="db-filters">
               <div class="field">
@@ -837,7 +877,18 @@ AWS_SESSION_TOKEN=IQoJb3...</pre>
                        placeholder="e.g. 10238, 10287 — blank for all"
                        autocomplete="off" spellcheck="false" />
               </div>
+              <div class="field">
+                <label for="input-result-limit">Maximum results <span class="field-optional">(optional)</span></label>
+                <input type="number" id="input-result-limit" min="1" max="200000"
+                       step="1" placeholder="e.g. 500" autocomplete="off" />
+                <span class="field-hint" id="result-limit-hint">Defaults to 500 text matches</span>
+              </div>
             </div>
+            <label class="agent-toggle">
+              <input type="checkbox" id="input-include-students" />
+              <span>Include student housing buildings</span>
+            </label>
+            <span class="field-hint">Student housing is excluded by default.</span>
           </div>
         </details>
 

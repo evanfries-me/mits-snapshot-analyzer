@@ -29,14 +29,21 @@ const search = {
   availableFiles: [],
   availableFilesByIntegration: {},
   availableIntegrations: [],
-  relatedFiles: [],   // [{integration, filename, schema, primaryJoin, relatedJoin, fields}]
+  relatedFiles: [],   // [{integration, filename, schema, joinType, primaryJoin, relatedJoin, fields}]
   conditionGroups: [],
   org:         '',
   buildings:   '',
+  includeStudents: false,
+  resultLimit: '',
+  resultLimitValid: true,
   asOf:        '',     // raw text: blank, a datetime, or a pasted snapshot-viewer link
   asOfValid:   true,   // false blocks the search button; only matters when asOf is non-blank
   agentAsOfValid: true,
   agentLimitValid: true,
+  agentIndex:  null,
+  availabilityIntegrations: [],
+  availabilityJobId: null,
+  availabilityStopping: false,
   running:     false,
   indexing:    false,
   index:       null,   // { state, buildings, builtAt }
@@ -52,6 +59,7 @@ let csvTableToken = 0;
 let csvFilterTimer = null;
 
 const STALE_MS = 6 * 60 * 60 * 1000;   // index older than this is flagged stale
+const AGENT_INDEX_MAX_AGE_MS = 24 * 60 * 60 * 1000;
 let filenamesToken = 0;                // guards against out-of-order responses
 let schemaToken     = 0;               // guards field-schema fetches the same way
 
@@ -89,6 +97,9 @@ window.addEventListener('DOMContentLoaded', () => {
   });
   document.getElementById('btn-run-search').addEventListener('click', runSearch);
   document.getElementById('btn-run-availability').addEventListener('click', runAvailabilityAgent);
+  document.getElementById('btn-stop-availability').addEventListener('click', stopAvailabilityAgent);
+  document.getElementById('btn-agent-index').addEventListener('click', buildAgentIndex);
+  document.getElementById('btn-agent-companion').addEventListener('click', buildAgentCompanionIndex);
   document.getElementById('btn-index').addEventListener('click', buildIndex);
 
   // Search By toggle
@@ -119,12 +130,12 @@ window.addEventListener('DOMContentLoaded', () => {
   document.getElementById('sel-field-schema').addEventListener('change', e => {
     const opt = e.target.selectedOptions[0];
     if (!opt || !opt.value) return;
-    const { name, path, pathLabel } = JSON.parse(opt.value);
-    const dup = search.fields.some(f => f.name === name && f.path === path);
+    const selection = JSON.parse(opt.value);
     e.target.value = '';   // reset to placeholder regardless — picking always "consumes" the choice
-    if (dup) return;
-    search.fields.push({ name, path, pathLabel });
+    if (!addSchemaSelection(search.fields, selection, search.schema && search.schema.data)) return;
+    reconcileJoinSelections();
     renderFieldChips();
+    renderRelatedFiles();
     syncSearchButton();
   });
 
@@ -132,13 +143,21 @@ window.addEventListener('DOMContentLoaded', () => {
     const btn = e.target.closest('[data-remove-index]');
     if (!btn) return;
     search.fields.splice(Number(btn.dataset.removeIndex), 1);
+    reconcileJoinSelections();
     renderFieldChips();
+    renderRelatedFiles();
     syncSearchButton();
+  });
+  document.getElementById('field-chips').addEventListener('change', e => {
+    if (!e.target.matches('[data-expand-primary-array]')) return;
+    const selection = search.fields[Number(e.target.dataset.selectionIndex)];
+    if (!selection || selection.kind !== 'object') return;
+    toggleArrayExpansion(selection, e.target.dataset.expandPrimaryArray, e.target.checked);
   });
 
   document.getElementById('btn-add-related-file').addEventListener('click', () => {
     search.relatedFiles.push({ integration: search.integration, filename: '', schema: null, primaryJoin: null,
-      relatedJoin: null, fields: [] });
+      relatedJoin: null, joinType: 'left', fields: [] });
     renderRelatedFiles();
     syncSearchButton();
   });
@@ -207,7 +226,8 @@ window.addEventListener('DOMContentLoaded', () => {
     const removeField = e.target.closest('[data-remove-related-field]');
     if (removeField) {
       const rel = search.relatedFiles[Number(removeField.dataset.relatedIndex)];
-      if (rel) rel.fields.splice(Number(removeField.dataset.fieldIndex), 1);
+      if (rel) rel.fields.splice(Number(removeField.dataset.removeRelatedField), 1);
+      if (rel) reconcileJoinSelection(rel, 'relatedJoin', rel.fields);
       renderRelatedFiles();
       syncSearchButton();
     }
@@ -218,11 +238,17 @@ window.addEventListener('DOMContentLoaded', () => {
     const index = Number(card.dataset.relatedIndex);
     const rel = search.relatedFiles[index];
     if (!rel) return;
-    if (e.target.matches('[data-related-filename]')) {
+    if (e.target.matches('[data-expand-related-array]')) {
+      const selection = rel.fields[Number(e.target.dataset.selectionIndex)];
+      if (selection && selection.kind === 'object') {
+        toggleArrayExpansion(selection, e.target.dataset.expandRelatedArray, e.target.checked);
+      }
+    } else if (e.target.matches('[data-related-filename]')) {
       rel.filename = e.target.value;
       rel.schema = null;
       rel.primaryJoin = null;
       rel.relatedJoin = null;
+      rel.joinType = 'left';
       rel.fields = [];
       renderRelatedFiles();
       if (rel.filename) loadRelatedSchema(index);
@@ -232,6 +258,7 @@ window.addEventListener('DOMContentLoaded', () => {
       rel.schema = null;
       rel.primaryJoin = null;
       rel.relatedJoin = null;
+      rel.joinType = 'left';
       rel.fields = [];
       renderRelatedFiles();
       loadRelatedFileNames(index);
@@ -241,15 +268,18 @@ window.addEventListener('DOMContentLoaded', () => {
     } else if (e.target.matches('[data-related-join]')) {
       rel.relatedJoin = JSON.parse(e.target.value);
       syncSearchButton();
+    } else if (e.target.matches('[data-join-type]')) {
+      rel.joinType = e.target.value;
+      syncSearchButton();
     } else if (e.target.matches('[data-related-field]')) {
       if (e.target.value) {
-        const field = JSON.parse(e.target.value);
-        if (!rel.fields.some(f => f.name === field.name && f.path === field.path)) {
-          rel.fields.push(field);
-        }
+        const selection = JSON.parse(e.target.value);
         e.target.value = '';
-        renderRelatedFiles();
-        syncSearchButton();
+        if (addSchemaSelection(rel.fields, selection, rel.schema)) {
+          reconcileJoinSelection(rel, 'relatedJoin', rel.fields);
+          renderRelatedFiles();
+          syncSearchButton();
+        }
       }
     }
   });
@@ -264,12 +294,19 @@ window.addEventListener('DOMContentLoaded', () => {
   document.getElementById('input-buildings').addEventListener('input', e => {
     search.buildings = e.target.value;
   });
+  document.getElementById('input-include-students').addEventListener('change', e => {
+    search.includeStudents = e.target.checked;
+  });
+  document.getElementById('input-result-limit').addEventListener('input', e => {
+    search.resultLimit = e.target.value;
+    renderSearchLimitFeedback();
+  });
   document.getElementById('input-asof').addEventListener('input', e => {
     search.asOf = e.target.value;
     renderAsOfFeedback();
     syncSearchButton();
   });
-  document.getElementById('agent-sel-integration').addEventListener('change', syncAvailabilityButton);
+  document.getElementById('agent-sel-integration').addEventListener('change', onAgentIntegrationChange);
   document.getElementById('agent-show-unknown').addEventListener('change', syncAvailabilityButton);
   document.getElementById('agent-sel-org').addEventListener('change', syncAvailabilityButton);
   document.getElementById('agent-buildings').addEventListener('input', syncAvailabilityButton);
@@ -458,6 +495,7 @@ async function loadIntegrations() {
     sel.innerHTML = '<option value="">Select an integration…</option>' +
       data.integrations.map(n => `<option value="${esc(n)}">${esc(n)}</option>`).join('');
     const supported = data.availabilityIntegrations || [];
+    search.availabilityIntegrations = supported;
     document.getElementById('agent-sel-integration').innerHTML =
       '<option value="">Select an integration…</option>' +
       '<option value="__all__">All integrations</option>' +
@@ -782,10 +820,10 @@ function renderAsOfFeedback() {
 
   if (!search.asOf.trim()) {
     hint.className   = 'field-hint';
-    hint.textContent = "Uses each building's latest snapshot";
+    hint.textContent = "Uses latest syncs created within the past 24 hours";
   } else if (parsed.ok) {
     hint.className   = 'field-hint ok';
-    hint.textContent = `→ ${fmtDateUTC(parsed.dt.toISOString())} UTC`;
+    hint.textContent = `→ latest sync in the 24 hours before ${fmtDateUTC(parsed.dt.toISOString())} UTC`;
   } else {
     hint.className   = 'field-hint err';
     hint.textContent = parsed.error;
@@ -804,6 +842,7 @@ function setSearchBy(mode) {
   document.getElementById('pane-fields').classList.toggle('active', mode === 'fields');
   document.getElementById('btn-run-search').textContent =
     mode === 'fields' ? 'Generate CSV' : 'Search latest snapshots';
+  renderSearchLimitFeedback();
   syncSearchButton();
 
   // Schema fetching does real GETs, so it's deferred until Fields mode is
@@ -853,25 +892,31 @@ async function loadFieldSchema() {
 function renderFieldSchemaOptions(data) {
   const sel  = document.getElementById('sel-field-schema');
   const hint = document.getElementById('field-schema-hint');
+  const structured = data.structuredCompatible ?? data.jsonCompatible;
 
-  if (!data.jsonCompatible || !data.objectTypes.length) {
+  if (!structured || !data.objectTypes.length) {
     sel.innerHTML = '<option value="">No field list available for this format</option>';
     sel.disabled = true;
-    hint.textContent = data.jsonCompatible
+    hint.textContent = structured
       ? 'No fields found in the sampled files — type a field name manually below'
-      : "This file isn't JSON — type a field name manually below";
+      : "This file isn't structured JSON or XML — type a field name manually below";
     return;
   }
 
-  sel.innerHTML = '<option value="">Pick a known field…</option>' + data.objectTypes.map(ot => {
+  sel.innerHTML = '<option value="">Pick a field or entire object…</option>' + data.objectTypes.map(ot => {
+    const objectValue = JSON.stringify({ kind: 'object', path: ot.path, pathLabel: ot.label });
+    const objectFieldCount = schemaObjectFields(ot).length;
     const options = ot.fields.map(f => {
       const value = JSON.stringify({ name: f.name, path: ot.path, pathLabel: ot.label });
       return `<option value='${esc(value)}'>${esc(f.name)}</option>`;
     }).join('');
-    return `<optgroup label="${esc(ot.label)} (${ot.count.toLocaleString()})">${options}</optgroup>`;
+    return `<optgroup label="${esc(ot.label)} (${ot.count.toLocaleString()})">` +
+      `<option value='${esc(objectValue)}'>All fields from ${esc(ot.label)} (${objectFieldCount})</option>` +
+      options + `</optgroup>`;
   }).join('');
   sel.disabled = false;
-  hint.textContent = `From a sample of ${data.sampleSize} building${data.sampleSize !== 1 ? 's' : ''} — ` +
+  const format = data.format ? `${data.format.toUpperCase()} · ` : '';
+  hint.textContent = `${format}From a sample of ${data.sampleSize} building${data.sampleSize !== 1 ? 's' : ''} — ` +
     'a field the sample missed can still be typed manually below';
   renderRelatedFiles();
   renderConditionGroups();
@@ -906,13 +951,17 @@ function clearFieldSelections() {
 function renderFieldChips() {
   const box = document.getElementById('field-chips');
   box.innerHTML = search.fields.map((f, i) => `
-    <span class="field-chip${f.path ? '' : ' manual'}"
-          title="${f.path ? `Scoped to ${esc(f.pathLabel)}` : 'Manually typed — matches this name wherever it occurs'}">
-      <span class="chip-order">${i + 1}</span>
-      <span>${esc(f.name)}</span>
-      ${f.path ? `<span class="chip-path">${esc(f.pathLabel)}</span>` : ''}
-      <button type="button" data-remove-index="${i}" title="Remove">×</button>
-    </span>
+    <div class="field-chip-wrap">
+      <span class="field-chip${f.path ? '' : ' manual'}"
+          title="${f.kind === 'object' ? `All known scalar fields scoped to ${esc(f.pathLabel)}` :
+            f.path ? `Scoped to ${esc(f.pathLabel)}` : 'Manually typed — matches this name wherever it occurs'}">
+        <span class="chip-order">${i + 1}</span>
+        <span>${f.kind === 'object' ? `All fields (${f.fieldCount})` : esc(f.name)}</span>
+        ${f.path ? `<span class="chip-path">${esc(f.pathLabel)}</span>` : ''}
+        <button type="button" data-remove-index="${i}" title="Remove">×</button>
+      </span>
+      ${renderArrayExpansionOptions(f, i, 'primary')}
+    </div>
   `).join('');
 }
 
@@ -929,6 +978,89 @@ function schemaFields(data) {
   return out;
 }
 
+function schemaObject(data, path) {
+  return ((data && data.objectTypes) || []).find(type => type.path === path);
+}
+
+function schemaObjectFields(objectType) {
+  return (objectType && (objectType.objectFields || objectType.fields)) || [];
+}
+
+function schemaObjectArrays(objectType) {
+  return (objectType && objectType.arrays) || [];
+}
+
+function toggleArrayExpansion(selection, path, enabled) {
+  selection.expandArrays = selection.expandArrays || [];
+  if (enabled && !selection.expandArrays.includes(path)) selection.expandArrays.push(path);
+  if (!enabled) selection.expandArrays = selection.expandArrays.filter(item => item !== path);
+}
+
+function renderArrayExpansionOptions(selection, selectionIndex, scope) {
+  if (selection.kind !== 'object' || !(selection.arrays || []).length) return '';
+  const attr = scope === 'primary' ? 'data-expand-primary-array' : 'data-expand-related-array';
+  return `<div class="array-expansion-options">
+    <span>Expand one-element arrays:</span>
+    ${selection.arrays.map(array => `
+      <label title="Expanded only when this array has exactly one entry; larger arrays are flagged">
+        <input type="checkbox" ${attr}="${esc(array.path)}" data-selection-index="${selectionIndex}"
+          ${(selection.expandArrays || []).includes(array.path) ? 'checked' : ''} />
+        <span>${esc(array.label)} <small>(${array.fields.length} fields)</small></span>
+      </label>`).join('')}
+  </div>`;
+}
+
+function addSchemaSelection(target, selection, schema) {
+  if (selection.kind === 'object') {
+    const objectType = schemaObject(schema, selection.path);
+    const objectFields = schemaObjectFields(objectType);
+    if (!objectFields.length) return false;
+    if (target.some(item => item.kind === 'object' && item.path === selection.path)) return false;
+    // The object selection supersedes individual fields already selected from
+    // that same object; keeping both would duplicate CSV columns.
+    for (let i = target.length - 1; i >= 0; i--) {
+      if (target[i].kind !== 'object' && target[i].path === selection.path) target.splice(i, 1);
+    }
+    target.push({
+      ...selection,
+      fieldCount: objectFields.length,
+      arrays: schemaObjectArrays(objectType),
+      expandArrays: [],
+    });
+    return true;
+  }
+  if (target.some(item =>
+      (item.kind === 'object' && item.path === selection.path) ||
+      (item.name === selection.name && item.path === selection.path))) return false;
+  target.push(selection);
+  return true;
+}
+
+function expandFieldSelections(selections, schema) {
+  const expanded = [];
+  const seen = new Set();
+  for (const selection of selections) {
+    const fields = selection.kind === 'object'
+      ? schemaObjectFields(schemaObject(schema, selection.path)).map(field => ({
+          name: field.name, path: selection.path, pathLabel: selection.pathLabel,
+        }))
+      : [selection];
+    for (const field of fields) {
+      const key = `${field.name}\u0000${field.path || ''}`;
+      if (!seen.has(key)) { seen.add(key); expanded.push(field); }
+    }
+  }
+  return expanded;
+}
+
+function arrayExpansionRequests(selections) {
+  return selections.flatMap(selection => selection.kind === 'object'
+    ? (selection.expandArrays || []).map(arrayPath => ({
+        objectPath: selection.path, arrayPath,
+      }))
+    : []);
+}
+
 function schemaFieldOptions(data, placeholder, selected) {
   const fields = schemaFields(data);
   return `<option value="">${esc(placeholder)}</option>` + fields.map(field => {
@@ -939,11 +1071,57 @@ function schemaFieldOptions(data, placeholder, selected) {
   }).join('');
 }
 
+function selectionPaths(selections) {
+  return new Set(selections.map(item => item.path ?? null));
+}
+
+function reconcileJoinSelection(rel, key, selections) {
+  const join = rel[key];
+  if (!join || !selections.length) return;
+  const paths = selectionPaths(selections);
+  if (paths.size !== 1 || !paths.has(join.path ?? null)) rel[key] = null;
+}
+
+function reconcileJoinSelections() {
+  for (const rel of search.relatedFiles) {
+    reconcileJoinSelection(rel, 'primaryJoin', search.fields);
+    reconcileJoinSelection(rel, 'relatedJoin', rel.fields);
+  }
+}
+
+function scopedSchemaFieldOptions(data, placeholder, selected, selections) {
+  const paths = selectionPaths(selections);
+  const restrict = selections.length > 0 && paths.size === 1;
+  const fields = schemaFields(data).filter(field =>
+    !restrict || paths.has(field.path ?? null));
+  return `<option value="">${esc(placeholder)}</option>` + fields.map(field => {
+    const value = JSON.stringify(field);
+    const isSelected = selected && selected.name === field.name && selected.path === field.path;
+    return `<option value='${esc(value)}'${isSelected ? ' selected' : ''}>` +
+      `${esc(field.name)} · ${esc(field.pathLabel)}</option>`;
+  }).join('');
+}
+
+function schemaOutputOptions(data, placeholder) {
+  const objects = (data && data.objectTypes) || [];
+  return `<option value="">${esc(placeholder)}</option>` + objects.map(type => {
+    const objectValue = JSON.stringify({kind: 'object', path: type.path, pathLabel: type.label});
+    const objectFieldCount = schemaObjectFields(type).length;
+    const fieldOptions = (type.fields || []).map(field => {
+      const value = JSON.stringify({name: field.name, path: type.path, pathLabel: type.label});
+      return `<option value='${esc(value)}'>${esc(field.name)}</option>`;
+    }).join('');
+    return `<optgroup label="${esc(type.label)} (${type.count.toLocaleString()})">` +
+      `<option value='${esc(objectValue)}'>All fields from ${esc(type.label)} (${objectFieldCount})</option>` +
+      fieldOptions + `</optgroup>`;
+  }).join('');
+}
+
 function renderRelatedFiles() {
   const box = document.getElementById('related-files');
   const primarySchema = search.schema && search.schema.data;
-  const allowed = new Set(search.integration === 'RentCafe'
-    ? ['Voyager', 'UnitEditor'] : ['UnitEditor']);
+  const allowed = new Set([search.integration, 'UnitEditor']);
+  if (search.integration === 'RentCafe') allowed.add('Voyager');
   const integrations = search.availableIntegrations.filter(i => allowed.has(i));
 
   box.innerHTML = search.relatedFiles.map((rel, i) => {
@@ -954,7 +1132,7 @@ function renderRelatedFiles() {
         `<option value="${esc(f)}"${f === rel.filename ? ' selected' : ''}>${esc(f)}</option>`).join('');
     const ready = rel.filename && rel.schema;
     const fieldOptions = ready
-      ? schemaFieldOptions(rel.schema, 'Add a field from this file…') :
+      ? schemaOutputOptions(rel.schema, 'Add a field or entire object…') :
         '<option value="">Select a related file first</option>';
     return `<div class="related-file-card" data-related-index="${i}">
       <div class="related-file-head">
@@ -966,18 +1144,30 @@ function renderRelatedFiles() {
         <button type="button" class="related-file-remove" data-remove-related-file="${i}" title="Remove">×</button>
       </div>
       ${ready ? `
+        <span class="field-label">Join type</span>
+        <select data-join-type>
+          <option value="inner"${rel.joinType === 'inner' ? ' selected' : ''}>Inner join — matching rows only</option>
+          <option value="left"${(rel.joinType || 'left') === 'left' ? ' selected' : ''}>Left outer join — all primary rows</option>
+          <option value="right"${rel.joinType === 'right' ? ' selected' : ''}>Right outer join — all secondary rows</option>
+          <option value="full"${rel.joinType === 'full' ? ' selected' : ''}>Full outer join — all rows from both files</option>
+        </select>
         <span class="field-label">Join fields</span>
         <select data-primary-join ${primarySchema ? '' : 'disabled'}>
-          ${schemaFieldOptions(primarySchema, 'Primary file field…', rel.primaryJoin)}
+          ${scopedSchemaFieldOptions(primarySchema, 'Primary file field…', rel.primaryJoin, search.fields)}
         </select>
         <select data-related-join>
-          ${schemaFieldOptions(rel.schema, 'Related file field…', rel.relatedJoin)}
+          ${scopedSchemaFieldOptions(rel.schema, 'Related file field…', rel.relatedJoin, rel.fields)}
         </select>
+        <span class="field-hint">Join fields are limited to the selected output object on each side.</span>
         <select data-related-field>${fieldOptions}</select>
         <div class="related-file-fields">
-          ${rel.fields.map((f, j) => `<span class="related-field-chip">${esc(f.name)}
-            <button type="button" data-remove-related-field="${j}" data-related-index="${i}">×</button>
-          </span>`).join('')}
+          ${rel.fields.map((f, j) => `<div class="related-field-selection">
+            <span class="related-field-chip">${f.kind === 'object'
+              ? `All fields (${f.fieldCount}) · ${esc(f.pathLabel)}` : esc(f.name)}
+              <button type="button" data-remove-related-field="${j}" data-related-index="${i}">×</button>
+            </span>
+            ${renderArrayExpansionOptions(f, j, 'related')}
+          </div>`).join('')}
         </div>
       ` : (rel.filename ? '<span class="field-hint">Loading fields…</span>' : '')}
     </div>`;
@@ -1072,7 +1262,8 @@ function renderConditionGroups() {
 
 function syncSearchButton() {
   const base = search.integration && search.fileName
-               && search.asOfValid && !search.running && !search.indexing;
+               && search.asOfValid && search.resultLimitValid
+               && !search.running && !search.indexing;
   const ready = base && (search.searchBy === 'fields'
     ? search.fields.length > 0 && search.relatedFiles.every(rel =>
         rel.filename && rel.schema && rel.primaryJoin && rel.relatedJoin && rel.fields.length > 0) &&
@@ -1080,6 +1271,29 @@ function syncSearchButton() {
         group.conditions.every(condition => condition.field && condition.value !== ''))
     : search.text.trim());
   document.getElementById('btn-run-search').disabled = !ready;
+}
+
+function renderSearchLimitFeedback() {
+  const input = document.getElementById('input-result-limit');
+  const hint = document.getElementById('result-limit-hint');
+  if (!input || !hint) return;
+  const raw = input.value.trim();
+  if (!raw) {
+    search.resultLimitValid = true;
+    hint.className = 'field-hint';
+    hint.textContent = search.searchBy === 'fields'
+      ? 'Defaults to the 200,000-row CSV safety limit'
+      : 'Defaults to 500 text matches';
+  } else if (/^[1-9]\d*$/.test(raw) && Number(raw) <= 200000) {
+    search.resultLimitValid = true;
+    hint.className = 'field-hint ok';
+    hint.textContent = `Stops after ${Number(raw).toLocaleString()} result${Number(raw) !== 1 ? 's' : ''}`;
+  } else {
+    search.resultLimitValid = false;
+    hint.className = 'field-hint err';
+    hint.textContent = 'Enter a whole number from 1 to 200,000';
+  }
+  syncSearchButton();
 }
 
 // ── Job polling ───────────────────────────────────────────────────────────────
@@ -1157,20 +1371,27 @@ async function runSearch() {
     mode:        search.searchBy,
     org:         search.org,
     buildings:   search.buildings,
+    includeStudents: search.includeStudents,
+    limit:        search.resultLimit.trim(),
     asOf:        search.asOf,
   };
   // Manual (no-path) entries go as bare strings; schema-picked ones carry
   // their path so the server matches the exact object type shown, not just
   // the name — the server accepts either shape per field.
   if (fieldsMode) {
-    body.fields = search.fields.map(f => f.path ? { name: f.name, path: f.path } : f.name);
+    body.fields = expandFieldSelections(search.fields, search.schema && search.schema.data)
+      .map(f => f.path ? { name: f.name, path: f.path } : f.name);
+    body.arrayExpansions = arrayExpansionRequests(search.fields);
     body.unique = search.unique;
     body.relatedFiles = search.relatedFiles.map(rel => ({
       integration: rel.integration,
       filename: rel.filename,
       primaryJoin: rel.primaryJoin,
       relatedJoin: rel.relatedJoin,
-      fields: rel.fields,
+      joinType: rel.joinType || 'left',
+      fields: expandFieldSelections(rel.fields, rel.schema)
+        .map(f => f.path ? { name: f.name, path: f.path } : f.name),
+      arrayExpansions: arrayExpansionRequests(rel.fields),
     }));
     body.conditions = search.conditionGroups.map(group => ({
       logic: group.logic,
@@ -1221,6 +1442,221 @@ async function runSearch() {
   }
 }
 
+async function onAgentIntegrationChange() {
+  search.agentIndex = null;
+  renderAgentIndexStatus();
+  syncAvailabilityButton();
+  await refreshAgentIndexStatus();
+}
+
+function agentIndexState(integration, data) {
+  if (!data || data.state !== 'ready' || !data.builtAt || !Number(data.buildings || 0)) {
+    return {integration, state: 'none', buildings: data?.buildings || 0};
+  }
+  const age = Math.max(0, Date.now() - data.builtAt * 1000);
+  return {...data, integration, age,
+          state: age > AGENT_INDEX_MAX_AGE_MS ? 'stale' : 'ready'};
+}
+
+async function refreshAgentIndexStatus() {
+  const selected = document.getElementById('agent-sel-integration').value;
+  if (!selected) {
+    search.agentIndex = null;
+    renderAgentIndexStatus();
+    syncAvailabilityButton();
+    return;
+  }
+  const integrations = selected === '__all__'
+    ? search.availabilityIntegrations : [selected];
+  try {
+    const states = await Promise.all(integrations.map(async integration => {
+      const response = await fetch(`/api/index/status?integration=${encodeURIComponent(integration)}`);
+      const data = await response.json();
+      return agentIndexState(integration, data);
+    }));
+    if (document.getElementById('agent-sel-integration').value !== selected) return;
+    const needsRefresh = states.filter(item => item.state !== 'ready');
+    const missing = states.filter(item => item.state === 'none');
+    if (selected === '__all__') {
+      search.agentIndex = {
+        state: missing.length ? 'none' : (needsRefresh.length ? 'stale' : 'ready'),
+        states,
+        needsRefresh: needsRefresh.map(item => item.integration),
+        missing: missing.map(item => item.integration),
+        buildings: states.reduce((sum, item) => sum + Number(item.buildings || 0), 0),
+      };
+    } else {
+      search.agentIndex = {
+        ...states[0],
+        needsRefresh: needsRefresh.map(item => item.integration),
+        missing: missing.map(item => item.integration),
+      };
+      // The primary index determines whether the agent can run. Render it
+      // immediately; companion metadata is optional and must never leave the
+      // entire panel stuck at "Checking index freshness…".
+      renderAgentIndexStatus();
+      syncAvailabilityButton();
+      if (selected === 'RentCafe') {
+        const controller = new AbortController();
+        const timeout = setTimeout(() => controller.abort(), 5000);
+        try {
+          const response = await fetch('/api/index/status?integration=YardiVoyager', {
+            signal: controller.signal,
+          });
+          if (!response.ok) throw new Error('Companion status unavailable');
+          const data = await response.json();
+          if (document.getElementById('agent-sel-integration').value !== selected) return;
+          search.agentIndex.companion = agentIndexState('YardiVoyager', data);
+        } catch {
+          if (document.getElementById('agent-sel-integration').value === selected) {
+            search.agentIndex.companion = {integration: 'YardiVoyager', state: 'none', buildings: 0};
+          }
+        } finally {
+          clearTimeout(timeout);
+        }
+      }
+    }
+  } catch {
+    if (document.getElementById('agent-sel-integration').value !== selected) return;
+    search.agentIndex = {state: 'none', needsRefresh: integrations, missing: integrations};
+  }
+  renderAgentIndexStatus();
+  syncAvailabilityButton();
+}
+
+function renderAgentIndexStatus() {
+  const bar = document.getElementById('agent-index-status');
+  const text = document.getElementById('agent-index-text');
+  const btn = document.getElementById('btn-agent-index');
+  const percent = document.getElementById('agent-index-percent');
+  const companionBtn = document.getElementById('btn-agent-companion');
+  const selected = document.getElementById('agent-sel-integration').value;
+  companionBtn.hidden = true;
+  if (!selected) {
+    bar.className = '';
+    return;
+  }
+  const idx = search.agentIndex;
+  bar.className = `show ${idx?.state || 'none'}`;
+  if (!idx) {
+    text.textContent = 'Checking index freshness…';
+    btn.textContent = 'Re-index';
+  } else if (selected === '__all__') {
+    const total = search.availabilityIntegrations.length;
+    const expired = idx.needsRefresh || [];
+    const missing = idx.missing || [];
+    if (missing.length) {
+      text.textContent = `Index required for ${missing.length} of ${total} integrations: ${missing.join(', ')}`;
+      btn.textContent = 'Re-index all';
+    } else if (expired.length) {
+      text.textContent = `${expired.length} of ${total} indexes are over 24 hours old · latest indexes can still be used`;
+      btn.textContent = 'Re-index all';
+    } else {
+      text.textContent = `All ${total} integration indexes are current · ${idx.buildings.toLocaleString()} buildings`;
+      btn.textContent = 'Re-index all';
+    }
+  } else if (idx.state === 'ready') {
+    const sample = Number(idx.stats?.samplePercent || 100);
+    text.textContent = `Indexed ${Number(idx.buildings || 0).toLocaleString()} buildings${sample < 100 ? ` · ${sample}% sample` : ''} · ${fmtAge(idx.age)} ago`;
+    btn.textContent = 'Re-index';
+  } else if (idx.state === 'stale') {
+    text.textContent = `Last indexed ${fmtAge(idx.age)} ago · latest index will be used`;
+    btn.textContent = 'Re-index';
+  } else {
+    text.textContent = 'Not indexed · index required to run';
+    btn.textContent = 'Re-index';
+  }
+  // Index maintenance must remain available even if the status request is
+  // delayed or fails. With no metadata, buildAgentIndex safely does a build.
+  btn.disabled = search.indexing || search.running;
+  percent.disabled = search.indexing || search.running;
+  if (selected === 'RentCafe' && idx && idx.state !== 'none') {
+    const companion = idx.companion;
+    companionBtn.hidden = false;
+    if (!companion || companion.state === 'none') {
+      companionBtn.textContent = 'Build Voyager companion';
+      companionBtn.title = 'Index recent Voyager snapshots for the buildings in this RentCafe index';
+    } else {
+      companionBtn.textContent = companion.state === 'stale'
+        ? 'Refresh Voyager companion'
+        : `Voyager: ${Number(companion.buildings || 0).toLocaleString()} buildings`;
+      companionBtn.title = `${fmtAge(companion.age)} ago · click to rebuild for the current RentCafe building scope`;
+    }
+    companionBtn.disabled = search.indexing || search.running || !idx;
+  }
+}
+
+async function buildAgentCompanionIndex() {
+  const selected = document.getElementById('agent-sel-integration').value;
+  if (selected !== 'RentCafe' || search.indexing || search.running) return;
+  search.indexing = true;
+  renderAgentIndexStatus();
+  syncAvailabilityButton();
+  const results = document.getElementById('availability-results');
+  results.innerHTML = '<div class="pane-msg">Building Voyager companion index for current RentCafe buildings…</div>';
+  try {
+    const response = await fetch('/api/index/companion', {
+      method: 'POST', headers: {'Content-Type': 'application/json'},
+      body: JSON.stringify({integration: 'RentCafe'}),
+    });
+    const data = await response.json();
+    if (!response.ok || data.error) throw new Error(data.message || data.error || 'Could not build Voyager companion index');
+    const result = await pollJob(data.jobId, 'Building Voyager companion index');
+    const unavailable = Number(result?.unavailableWithin24Hours || 0);
+    results.innerHTML = `<div class="pane-msg">Voyager companion index ready · ${Number(result?.buildings || 0).toLocaleString()} buildings${unavailable ? ` · ${unavailable.toLocaleString()} without a Voyager sync in the last 24 hours` : ''}.</div>`;
+  } catch (error) {
+    results.innerHTML = `<div class="pane-msg">Voyager companion index failed: ${esc(error.message)}</div>`;
+  } finally {
+    search.indexing = false;
+    hideProgress();
+    await refreshAgentIndexStatus();
+    renderAgentIndexStatus();
+    syncAvailabilityButton();
+  }
+}
+
+async function buildAgentIndex() {
+  const selected = document.getElementById('agent-sel-integration').value;
+  if (!selected || search.indexing || search.running) return;
+  const integrations = selected === '__all__'
+    ? search.availabilityIntegrations
+    : [selected];
+  const samplePercent = Number(document.getElementById('agent-index-percent').value || 100);
+  const referenceTime = document.getElementById('agent-asof').value.trim();
+  search.indexing = true;
+  renderAgentIndexStatus();
+  syncAvailabilityButton();
+  const results = document.getElementById('availability-results');
+  try {
+    const rebuilt = [];
+    for (const [position, integration] of integrations.entries()) {
+      results.innerHTML = `<div class="pane-msg">Re-indexing ${esc(integration)} at ${samplePercent}% (${position + 1} of ${integrations.length})…</div>`;
+      const response = await fetch('/api/index/build', {
+        method: 'POST', headers: {'Content-Type': 'application/json'},
+        body: JSON.stringify({integration, samplePercent, referenceTime}),
+      });
+      const data = await response.json();
+      if (!response.ok || data.error) throw new Error(data.error || `Could not index ${integration}`);
+      rebuilt.push({integration, result: await pollJob(
+        data.jobId, `Indexing ${integration} · ${samplePercent}% sample`)});
+    }
+    const empty = rebuilt.filter(item => !Number(item.result?.buildings || 0));
+    if (empty.length) {
+      results.innerHTML = `<div class="pane-msg">Re-indexing completed, but no current snapshots were found for: ${esc(empty.map(item => item.integration).join(', '))}. The Availability Agent remains unavailable for those integrations.</div>`;
+    } else {
+      results.innerHTML = '<div class="pane-msg">Re-indexing complete. The Availability Agent is ready to run.</div>';
+    }
+  } catch (error) {
+    results.innerHTML = `<div class="pane-msg">Index maintenance failed: ${esc(error.message)}</div>`;
+  } finally {
+    search.indexing = false;
+    hideProgress();
+    await refreshAgentIndexStatus();
+    renderAgentIndexStatus();
+    syncAvailabilityButton();
+  }
+}
+
 function renderAgentAsOfFeedback() {
   const raw = document.getElementById('agent-asof').value;
   const hint = document.getElementById('agent-asof-hint');
@@ -1228,10 +1664,10 @@ function renderAgentAsOfFeedback() {
   search.agentAsOfValid = parsed.ok;
   if (!raw.trim()) {
     hint.className = 'field-hint';
-    hint.textContent = "Uses latest syncs created within the past 24 hours";
+    hint.textContent = 'Uses latest syncs created within the past 24 hours';
   } else if (parsed.ok) {
     hint.className = 'field-hint ok';
-    hint.textContent = `→ ${fmtDateUTC(parsed.dt.toISOString())} UTC`;
+    hint.textContent = `→ latest sync in the 24 hours before ${fmtDateUTC(parsed.dt.toISOString())} UTC`;
   } else {
     hint.className = 'field-hint err';
     hint.textContent = parsed.error;
@@ -1259,9 +1695,37 @@ function renderAgentLimitFeedback() {
 }
 
 function syncAvailabilityButton() {
+  const idx = search.agentIndex;
+  const indexReady = idx && (idx.state === 'ready' || idx.state === 'stale');
   const ready = document.getElementById('agent-sel-integration').value &&
-    search.agentAsOfValid && search.agentLimitValid && !search.running && !search.indexing;
+    indexReady && search.agentAsOfValid && search.agentLimitValid &&
+    !search.running && !search.indexing;
   document.getElementById('btn-run-availability').disabled = !ready;
+  const stop = document.getElementById('btn-stop-availability');
+  stop.hidden = !search.running || !search.availabilityJobId;
+  stop.disabled = search.availabilityStopping;
+  stop.textContent = search.availabilityStopping
+    ? 'Finalizing collected data…' : 'Stop and generate CSV';
+}
+
+async function stopAvailabilityAgent() {
+  if (!search.availabilityJobId || search.availabilityStopping) return;
+  search.availabilityStopping = true;
+  syncAvailabilityButton();
+  try {
+    const response = await fetch('/api/job/stop', {
+      method: 'POST', headers: {'Content-Type': 'application/json'},
+      body: JSON.stringify({id: search.availabilityJobId}),
+    });
+    const data = await response.json();
+    if (!response.ok || data.error) throw new Error(data.error || 'Could not stop availability job');
+    showProgress('Stop requested · generating CSV from collected data…');
+  } catch (error) {
+    search.availabilityStopping = false;
+    syncAvailabilityButton();
+    document.getElementById('availability-results').innerHTML =
+      `<div class="pane-msg">Could not stop: ${esc(error.message)}</div>`;
+  }
 }
 
 async function runAvailabilityAgent() {
@@ -1269,6 +1733,7 @@ async function runAvailabilityAgent() {
   const btn = document.getElementById('btn-run-availability');
   const original = btn.textContent;
   btn.textContent = 'Starting…';
+  renderAgentIndexStatus();
   syncAvailabilityButton();
   const results = document.getElementById('availability-results');
   const summary = document.getElementById('availability-summary');
@@ -1301,23 +1766,15 @@ async function runAvailabilityAgent() {
         if (!connectData.ok) throw new Error(connectData.error || 'Not connected');
         continue;
       }
-      if (!(res.status === 409 || data.error === 'no-index')) break;
-
-      // Availability can be the first feature used for an integration. Build
-      // its persistent index here, then retry the same request automatically.
-      results.innerHTML = `<div class="pane-msg">Building the ${esc(integration)} index before analyzing availability…</div>`;
-      const indexRes = await fetch('/api/index/build', {
-        method: 'POST', headers: {'Content-Type': 'application/json'},
-        body: JSON.stringify({integration}),
-      });
-      const indexData = await indexRes.json();
-      if (indexData.error) throw new Error(indexData.error);
-      await pollJob(indexData.jobId, `Indexing ${integration}`);
+      break;
     }
     if (data.error && (data.error === 'no-index' || data.error.includes('index'))) {
       throw new Error(data.message || data.error);
     }
     if (data.error) throw new Error(data.error);
+    search.availabilityJobId = data.jobId;
+    search.availabilityStopping = false;
+    syncAvailabilityButton();
     btn.textContent = 'Running…';
     results.innerHTML = '<div class="pane-msg">Availability analysis is running. Progress is shown below the mode panels.</div>';
     const result = await pollJob(data.jobId, 'Evaluating availability');
@@ -1328,8 +1785,11 @@ async function runAvailabilityAgent() {
     results.innerHTML = `<div class="pane-msg">Error: ${esc(e.message)}</div>`;
   } finally {
     search.running = false;
+    search.availabilityJobId = null;
+    search.availabilityStopping = false;
     btn.textContent = original;
     hideProgress();
+    await refreshAgentIndexStatus();
     syncAvailabilityButton();
   }
 }
@@ -1518,13 +1978,16 @@ function renderAvailabilityResult(data) {
   if (data.showUnknown) bits.push('showing unknown mappings only');
   if (data.includeStudents === false) bits.push('student communities excluded');
   if (data.includeApplications === false) bits.push('Applications-launched communities excluded');
+  if (data.supplementalUnits) bits.push(`${data.supplementalUnits.toLocaleString()} Voyager-only unit${data.supplementalUnits !== 1 ? 's' : ''} added as Lease Signed`);
+  if (data.supplementalErrors) bits.push(`${data.supplementalErrors.toLocaleString()} Voyager supplement${data.supplementalErrors !== 1 ? 's' : ''} unreadable`);
+  if (data.waitFiltered) bits.push(`${data.waitFiltered.toLocaleString()} unit${data.waitFiltered !== 1 ? 's' : ''} with “wait” in the name excluded`);
+  if (data.stopped) bits.push('stopped early; CSV contains collected data');
   if (data.limit) bits.push(data.limited ? `limited to ${Number(data.limit).toLocaleString()}` : `limit ${Number(data.limit).toLocaleString()} not reached`);
   if (data.asOf) bits.push(`as of ${fmtDateUTC(data.asOf)} UTC`);
   if (data.errors) bits.push(`${data.errors} unreadable`);
-  if (data.noSnapshot) bits.push(`${data.noSnapshot} had no snapshot that old`);
-  if (data.staleLatest) bits.push(`${data.staleLatest.toLocaleString()} latest sync${data.staleLatest !== 1 ? 's' : ''} older than 24 hours excluded`);
+  if (data.noSnapshot) bits.push(`${data.noSnapshot} had no snapshot in the preceding 24-hour window`);
   if (data.failedIntegrations?.length) bits.push(`failed: ${data.failedIntegrations.join(', ')}`);
-  if (data.skippedIntegrations?.length) bits.push(`skipped after limit: ${data.skippedIntegrations.join(', ')}`);
+  if (data.skippedIntegrations?.length) bits.push(`${data.stopped ? 'skipped after stop' : 'skipped after limit'}: ${data.skippedIntegrations.join(', ')}`);
   if (data.filterNote) bits.push(data.filterNote);
   if (data.rolloutError) bits.push('rollout lookup unavailable');
   if (data.enrichError) bits.push('building details unavailable');
@@ -1704,9 +2167,11 @@ function renderSearchResults(data) {
     `${data.searched.toLocaleString()} of ${data.buildings.toLocaleString()} buildings searched`,
   ];
   if (data.asOf)        bits.push(`as of ${fmtDateUTC(data.asOf)} UTC`);
+  if (data.staleLatest) bits.push(`${data.staleLatest.toLocaleString()} latest sync${data.staleLatest !== 1 ? 's' : ''} older than ${data.freshnessHours || 24} hours excluded`);
   if (data.org)         bits.push(`org filter on`);
-  if (data.noSnapshot)  bits.push(`${data.noSnapshot.toLocaleString()} had no snapshot that old`);
-  if (data.truncated)   bits.push(`showing first ${data.matches.length}`);
+  if (data.includeStudents === false) bits.push('student housing excluded');
+  if (data.noSnapshot)  bits.push(`${data.noSnapshot.toLocaleString()} had no snapshot in the preceding 24-hour window`);
+  if (data.truncated)   bits.push(`result limit reached (${data.matches.length.toLocaleString()})`);
   if (data.errors)      bits.push(`${data.errors} unreadable`);
   if (data.filterNote)  bits.push(data.filterNote);
   if (data.enrichError) bits.push('building details unavailable');
@@ -1715,8 +2180,11 @@ function renderSearchResults(data) {
   if (data.enrichCredentialIssue) showSnowflakeCredentialPrompt(data.enrichError);
 
   if (!data.matches.length) {
+    const scope = data.freshnessHours && !data.asOf
+      ? ` from a latest sync created within the past ${data.freshnessHours} hours`
+      : '';
     results.innerHTML =
-      `<div class="pane-msg">No snapshot contains “${esc(data.text)}”</div>`;
+      `<div class="pane-msg">No snapshot${scope} contains “${esc(data.text)}”</div>`;
     return;
   }
 
@@ -1761,10 +2229,12 @@ function renderFieldsResult(data) {
     `${data.searched.toLocaleString()} of ${data.buildings.toLocaleString()} buildings searched`,
   ];
   if (data.asOf)        bits.push(`as of ${fmtDateUTC(data.asOf)} UTC`);
+  if (data.staleLatest) bits.push(`${data.staleLatest.toLocaleString()} latest sync${data.staleLatest !== 1 ? 's' : ''} older than ${data.freshnessHours || 24} hours excluded`);
   if (data.org)         bits.push(`org filter on`);
+  if (data.includeStudents === false) bits.push('student housing excluded');
   if (data.unique)      bits[0] = `${data.rowCount.toLocaleString()} unique row${data.rowCount !== 1 ? 's' : ''}`;
-  if (data.noSnapshot)  bits.push(`${data.noSnapshot.toLocaleString()} had no snapshot that old`);
-  if (data.truncated)   bits.push(`capped at ${data.rowCount.toLocaleString()} rows`);
+  if (data.noSnapshot)  bits.push(`${data.noSnapshot.toLocaleString()} had no snapshot in the preceding 24-hour window`);
+  if (data.truncated)   bits.push(`result limit reached (${data.rowCount.toLocaleString()} rows)`);
   if (data.errors)      bits.push(`${data.errors} unreadable`);
   if (data.filterNote)  bits.push(data.filterNote);
   if (data.enrichError) bits.push('building details unavailable');
@@ -1773,7 +2243,10 @@ function renderFieldsResult(data) {
   if (data.enrichCredentialIssue) showSnowflakeCredentialPrompt(data.enrichError);
 
   if (!data.rowCount) {
-    results.innerHTML = `<div class="pane-msg">None of the searched snapshots had a value for ` +
+    const scope = data.freshnessHours && !data.asOf
+      ? ` created within the past ${data.freshnessHours} hours`
+      : '';
+    results.innerHTML = `<div class="pane-msg">None of the searched snapshots${scope} had a value for ` +
       `${data.fields.map(f => `“${esc(f)}”`).join(', ')}</div>`;
     renderFieldsPreview(data);
     return;

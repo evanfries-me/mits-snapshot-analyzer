@@ -14,7 +14,8 @@ Connects via .env file or AWS environment variables.
 
 from flask import Flask, request, jsonify, send_from_directory
 from flask_cors import CORS
-from concurrent.futures import ThreadPoolExecutor, TimeoutError as FutureTimeoutError
+from concurrent.futures import (ThreadPoolExecutor, TimeoutError as FutureTimeoutError,
+                                wait, FIRST_COMPLETED)
 from datetime import datetime, timedelta, timezone
 from botocore.config import Config
 from botocore.exceptions import ClientError
@@ -23,6 +24,7 @@ import snowflake_db
 import boto3
 import csv
 import gzip as gzip_module
+import hashlib
 import json
 import os
 import re
@@ -30,6 +32,7 @@ import threading
 import time
 import urllib.parse
 import uuid
+import xml.etree.ElementTree as ET
 
 load_dotenv()
 
@@ -48,6 +51,8 @@ SAMPLE_SIZE   = 150 # buildings sampled to populate the file-name dropdown
 RESULT_CAP    = 500 # max matches returned to the client
 SNIPPET_PAD   = 70  # chars of context on each side of a match
 ENRICH_TIMEOUT = 20 # seconds before Snowflake enrichment is abandoned
+DEFAULT_SEARCH_LOOKBACK_HOURS = 24
+AVAILABILITY_INDEX_MAX_AGE = 24 * 60 * 60
 ENV_PATH        = os.path.join(os.path.dirname(os.path.abspath(__file__)), '.env')
 
 EXPORT_DIR      = os.path.join(os.path.dirname(os.path.abspath(__file__)), 'exports')
@@ -66,6 +71,7 @@ CUTOFF_DAYS = (2, 30, 365)
 
 _connected = False
 _availability_rules_cache = None
+_availability_rules_cache_mtime = None
 
 # ── Shared boto3 client ───────────────────────────────────────────────────────
 _BOTO_CONFIG = Config(
@@ -132,14 +138,63 @@ def _allowed_related_integrations(primary: str) -> set:
 
 
 _VOYAGER_CANONICAL_FILES = ('AllUnits_Login', 'AvailableUnits_Login')
+_VOYAGER_INTEGRATIONS = {
+    'Voyager', 'YardiVoyager', 'PricingAvailsSourceType.YardiVoyager',
+}
+
+# The legacy Voyager root is empty. Current Voyager snapshots live in
+# YardiVoyager; the indexer removes buildings represented in RentCafe's current
+# index, because those are RentCafe-priced communities where Voyager is only a
+# secondary source.
+_AVAILABILITY_SOURCE_INTEGRATIONS = {
+    'Voyager': 'YardiVoyager',
+}
+
+
+def _availability_source_integration(integration: str) -> str:
+    return _AVAILABILITY_SOURCE_INTEGRATIONS.get(integration, integration)
+
+
+def _availability_index_exclusions(integration: str, window_end) -> set:
+    """Current primary-source communities excluded from virtual integrations."""
+    if integration != 'Voyager':
+        return set()
+    rentcafe = _index_load('RentCafe') or {}
+    cutoff = window_end - timedelta(hours=24)
+    excluded = set()
+    for entity, entity_data in (rentcafe.get('entities') or {}).items():
+        try:
+            if cutoff < _snapshot_dt(entity_data[0]) <= window_end:
+                excluded.add(entity)
+        except (TypeError, ValueError, IndexError):
+            continue
+    return excluded
+
+# Several integrations append a property/external ID between the logical file
+# name and its content extension. Keep the rule shape-based rather than tied to
+# today's integration list so newly-added integrations with the same convention
+# are consolidated automatically. Five digits avoids treating ordinary version
+# suffixes such as `_2` as external IDs; UUID and long-hex forms cover ResMan
+# and other opaque identifiers.
+_EXTERNAL_ID_FILE_RE = re.compile(
+    r'^(?P<base>.+)_(?:'
+    r'[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}'
+    r'|\d{5,}'
+    r'|[0-9a-f]{24,}'
+    r')\.(?:json|xml|csv|txt)(?:\.gz)?$',
+    re.IGNORECASE,
+)
 
 
 def _canonical_file_name(integration: str, file_name: str) -> str:
-    """Collapse Voyager's per-variant file names to stable UI names."""
-    if integration == 'Voyager':
+    """Collapse per-property filename variants to one stable logical name."""
+    if integration in _VOYAGER_INTEGRATIONS:
         for base in _VOYAGER_CANONICAL_FILES:
             if file_name == base or file_name.startswith(base + '_') or file_name.startswith(base + '.'):
                 return base
+    external_id_match = _EXTERNAL_ID_FILE_RE.fullmatch(file_name)
+    if external_id_match:
+        return external_id_match.group('base')
     return file_name
 
 
@@ -201,6 +256,23 @@ def _parse_cutoff(raw: str):
     return dt if dt.tzinfo else dt.replace(tzinfo=timezone.utc)
 
 
+def _parse_result_limit(raw):
+    """Return an optional positive whole-number result cap."""
+    if raw in (None, ''):
+        return None
+    if isinstance(raw, bool):
+        raise ValueError('limit must be a positive integer')
+    if isinstance(raw, int):
+        value = raw
+    elif isinstance(raw, str) and re.fullmatch(r'[1-9]\d*', raw.strip()):
+        value = int(raw.strip())
+    else:
+        raise ValueError('limit must be a positive integer')
+    if value <= 0 or value > CSV_ROW_CAP:
+        raise ValueError(f'limit must be between 1 and {CSV_ROW_CAP:,}')
+    return value
+
+
 def _snapshot_dt(snapshot_name: str):
     """'snapshot-2026-08-19T15:55:41.157032Z' -> UTC-aware datetime."""
     iso = snapshot_name[len('snapshot-'):] if snapshot_name.startswith('snapshot-') else snapshot_name
@@ -208,17 +280,22 @@ def _snapshot_dt(snapshot_name: str):
     return dt if dt.tzinfo else dt.replace(tzinfo=timezone.utc)
 
 
-def _snapshot_prefix_before(entity_prefix: str, cutoff: datetime):
+def _snapshot_prefix_before(entity_prefix: str, cutoff: datetime,
+                            lookback_hours: int = 24):
     """
-    Latest snapshot-* prefix at or before `cutoff`, or None if the building has
-    no snapshot that old. CommonPrefixes come back from S3 in ascending
-    lexicographic order, which matches chronological order for these ISO-named
-    snapshots — so once one past the cutoff is seen, every later one will be
-    too, and we can stop paging immediately instead of scanning the rest of
-    the building's history.
+    Latest snapshot-* prefix in the window ending at `cutoff`, or None when no
+    snapshot exists within `lookback_hours` before it. CommonPrefixes sort in
+    chronological order because snapshot names use ISO timestamps.
     """
     client = s3()
+    lower_bound = cutoff - timedelta(hours=lookback_hours)
     kwargs = {'Bucket': BUCKET, 'Delimiter': '/', 'Prefix': entity_prefix, 'MaxKeys': PAGE_SIZE}
+    # Seek immediately before the lower boundary so dated searches do not
+    # traverse a building's full snapshot history.
+    seek = (lower_bound - timedelta(microseconds=1)).astimezone(timezone.utc)
+    kwargs['StartAfter'] = (
+        f'{entity_prefix}snapshot-'
+        f'{seek.isoformat(timespec="microseconds").replace("+00:00", "Z")}')
     best_name, best_prefix = None, None
     while True:
         resp = client.list_objects_v2(**kwargs)
@@ -228,10 +305,10 @@ def _snapshot_prefix_before(entity_prefix: str, cutoff: datetime):
                 ts = _snapshot_dt(name)
             except Exception:
                 continue
-            if ts <= cutoff:
+            if lower_bound <= ts <= cutoff:
                 if best_name is None or name > best_name:
                     best_name, best_prefix = name, cp['Prefix']
-            else:
+            elif ts > cutoff:
                 return best_prefix
         if not resp.get('IsTruncated'):
             break
@@ -338,19 +415,23 @@ def _index_load(integration: str):
         return None
 
 
-def _index_save(integration: str, entities: dict, stats: dict):
+def _index_write(integration: str, payload: dict):
+    """Atomically replace one compressed index payload."""
     os.makedirs(INDEX_DIR, exist_ok=True)
-    payload = {
-        'integration': integration,
-        'builtAt':     time.time(),
-        'entities':    entities,
-        'stats':       stats,
-    }
     tmp = _index_path(integration) + '.tmp'
     with gzip_module.open(tmp, 'wt', encoding='utf-8') as fh:
         json.dump(payload, fh)
     os.replace(tmp, _index_path(integration))
     return payload
+
+
+def _index_save(integration: str, entities: dict, stats: dict):
+    return _index_write(integration, {
+        'integration': integration,
+        'builtAt':     time.time(),
+        'entities':    entities,
+        'stats':       stats,
+    })
 
 
 def _index_meta(integration: str):
@@ -362,8 +443,20 @@ def _index_meta(integration: str):
         'state':     'ready',
         'buildings': len(data.get('entities', {})),
         'builtAt':   data.get('builtAt'),
+        'filteredAt': data.get('filteredAt'),
         'stats':     data.get('stats', {}),
     }
+
+
+def _availability_index_freshness(integration: str):
+    """Return whether an Availability Agent index exists and is under 24h old."""
+    meta = _index_meta(integration)
+    built_at = meta.get('builtAt')
+    if meta.get('state') != 'ready' or not isinstance(built_at, (int, float)):
+        return 'missing', meta
+    age = max(0, time.time() - built_at)
+    meta['ageSeconds'] = age
+    return ('fresh' if age <= AVAILABILITY_INDEX_MAX_AGE else 'stale'), meta
 
 
 # ── Background jobs ───────────────────────────────────────────────────────────
@@ -434,6 +527,7 @@ def _job_new(kind: str, integration: str, total: int = 0) -> str:
             'status': 'running', 'done': 0, 'total': total,
             'started': time.time(), 'finished': None,
             'error': None, 'result': None, 'note': '',
+            'stopRequested': False,
         }
         # keep the map small
         if len(_jobs) > 25:
@@ -457,6 +551,11 @@ def _job_get(job_id: str):
         return dict(job) if job else None
 
 
+def _job_stop_requested(job_id: str) -> bool:
+    job = _job_get(job_id)
+    return bool(job and job.get('stopRequested'))
+
+
 def _running_job_for(kind: str, integration: str):
     with _jobs_lock:
         for job in _jobs.values():
@@ -466,31 +565,70 @@ def _running_job_for(kind: str, integration: str):
     return None
 
 
-def _run_index_job(job_id: str, integration: str):
+def _run_index_job(job_id: str, integration: str, sample_percent: int = 100,
+                   reference_time=None):
     try:
-        buildings = _list_buildings(integration)
-        _job_update(job_id, total=len(buildings), note='Finding latest snapshots…')
+        source_integration = _availability_source_integration(integration)
+        discovered_buildings = _list_buildings(source_integration)
+        window_end = reference_time or datetime.now(timezone.utc)
+        excluded_entities = _availability_index_exclusions(integration, window_end)
+        all_buildings = [entity for entity in discovered_buildings
+                         if entity not in excluded_entities]
+        sample_size = (len(all_buildings) * sample_percent + 99) // 100
+        if all_buildings and sample_size == 0:
+            sample_size = 1
+        buildings = sorted(
+            all_buildings,
+            key=lambda entity: hashlib.sha256(
+                f'{source_integration}:{entity}'.encode('utf-8')).digest())[:sample_size]
+        recent_cutoff = window_end - timedelta(hours=24)
+        window_label = (f'the 24 hours before {window_end.isoformat()}'
+                        if reference_time else 'the past 24 hours')
+        _job_update(job_id, total=len(buildings),
+                    note=(f'Finding snapshots created in {window_label} · '
+                          f'{sample_percent}% sample ({len(buildings):,} of '
+                          f'{len(all_buildings):,} eligible buildings)…'))
 
-        stamps   = _cutoff_stamps()
+        # Seek directly to the 24-hour boundary and deliberately avoid the
+        # historical fallback. A building with no snapshot after this point
+        # does not belong in a newly-built index.
+        stamps = [recent_cutoff.strftime('%Y-%m-%dT%H:%M:%S')]
         entities = {}
-        missing  = 0
+        excluded = 0
         lock     = threading.Lock()
         counter  = {'n': 0}
 
         def work(entity):
-            nonlocal missing
+            nonlocal excluded
             try:
-                found = _discover(integration, entity, stamps)
+                if reference_time:
+                    entity_prefix = f'{ROOT}{source_integration}/{entity}/'
+                    snapshot_prefix = _snapshot_prefix_before(
+                        entity_prefix, reference_time)
+                    if snapshot_prefix:
+                        snapshot = snapshot_prefix[len(entity_prefix):].rstrip('/')
+                        found = (entity, snapshot,
+                                 _snapshot_files(entity_prefix, snapshot))
+                    else:
+                        found = None
+                else:
+                    found = _discover(source_integration, entity, stamps,
+                                      full_fallback=False)
             except Exception:
                 found = None
             with lock:
                 counter['n'] += 1
                 if counter['n'] % 25 == 0:
                     _job_update(job_id, done=counter['n'])
-                if found:
+                try:
+                    is_recent = bool(
+                        found and recent_cutoff < _snapshot_dt(found[1]) <= window_end)
+                except (TypeError, ValueError):
+                    is_recent = False
+                if is_recent:
                     entities[found[0]] = [found[1], found[2]]
                 else:
-                    missing += 1
+                    excluded += 1
 
         if buildings:
             with ThreadPoolExecutor(max_workers=INDEX_WORKERS) as pool:
@@ -498,14 +636,102 @@ def _run_index_job(job_id: str, integration: str):
 
         _job_update(job_id, done=len(buildings), note='Saving index…')
         payload = _index_save(integration, entities, {
-            'buildings': len(buildings),
+            'buildings': len(all_buildings),
+            'discoveredBuildings': len(discovered_buildings),
+            'excludedRentCafeSecondary': len(excluded_entities),
+            'sourceIntegration': source_integration,
+            'samplePercent': sample_percent,
+            'sampledBuildings': len(buildings),
+            'referenceTime': reference_time.isoformat() if reference_time else None,
             'indexed':   len(entities),
-            'missing':   missing,
+            'excludedOutside24Hours': excluded,
             'seconds':   round(time.time() - _job_get(job_id)['started'], 1),
         })
         _job_update(job_id, status='done', finished=time.time(),
-                    result={'buildings': len(entities), 'missing': missing,
+                    result={'buildings': len(entities),
+                            'samplePercent': sample_percent,
+                            'excludedRentCafeSecondary': len(excluded_entities),
+                            'sourceIntegration': source_integration,
+                            'sampledBuildings': len(buildings),
+                            'referenceTime': reference_time.isoformat() if reference_time else None,
+                            'excludedOutside24Hours': excluded,
                             'builtAt': payload['builtAt']})
+    except Exception as e:
+        _job_update(job_id, status='error', error=str(e), finished=time.time())
+
+
+def _run_companion_index_job(job_id: str, primary_integration: str,
+                             companion_integration: str):
+    """Build a 24h companion index for only the primary index's buildings."""
+    try:
+        _job_update(job_id, note=f'Loading {primary_integration} building scope…')
+        primary_data = _index_load(primary_integration)
+        if not isinstance(primary_data, dict):
+            raise RuntimeError(
+                f'No index for {primary_integration}; build its index first')
+        primary_entities = primary_data.get('entities') or {}
+        cutoff = datetime.now(timezone.utc) - timedelta(hours=24)
+        candidates = []
+        for entity, entity_data in primary_entities.items():
+            try:
+                if _snapshot_dt(entity_data[0]) > cutoff:
+                    candidates.append(entity)
+            except (TypeError, ValueError, IndexError):
+                pass
+        candidates.sort()
+        _job_update(
+            job_id, total=len(candidates),
+            note=(f'Finding {companion_integration} snapshots for '
+                  f'{len(candidates):,} {primary_integration} buildings…'))
+
+        stamps = [cutoff.strftime('%Y-%m-%dT%H:%M:%S')]
+        entities = {}
+        unavailable = 0
+        counter = {'n': 0}
+        lock = threading.Lock()
+
+        def work(entity):
+            nonlocal unavailable
+            try:
+                found = _discover(companion_integration, entity, stamps,
+                                  full_fallback=False)
+            except Exception:
+                found = None
+            try:
+                is_recent = bool(found and _snapshot_dt(found[1]) > cutoff)
+            except (TypeError, ValueError):
+                is_recent = False
+            with lock:
+                counter['n'] += 1
+                if is_recent:
+                    entities[found[0]] = [found[1], found[2]]
+                else:
+                    unavailable += 1
+                if counter['n'] % 25 == 0:
+                    _job_update(
+                        job_id, done=counter['n'],
+                        note=(f'Indexed {len(entities):,} companion buildings · '
+                              f'{unavailable:,} without a recent Voyager sync'))
+
+        if candidates:
+            with ThreadPoolExecutor(max_workers=INDEX_WORKERS) as pool:
+                list(pool.map(work, candidates))
+
+        _job_update(job_id, done=len(candidates), note='Saving companion index…')
+        payload = _index_save(companion_integration, entities, {
+            'companionFor': primary_integration,
+            'candidateBuildings': len(candidates),
+            'indexed': len(entities),
+            'unavailableWithin24Hours': unavailable,
+            'seconds': round(time.time() - _job_get(job_id)['started'], 1),
+        })
+        _job_update(job_id, status='done', finished=time.time(), result={
+            'integration': companion_integration,
+            'companionFor': primary_integration,
+            'buildings': len(entities),
+            'unavailableWithin24Hours': unavailable,
+            'builtAt': payload['builtAt'],
+        })
     except Exception as e:
         _job_update(job_id, status='error', error=str(e), finished=time.time())
 
@@ -692,7 +918,55 @@ def _walk_json(node, path: tuple, visit):
     elif isinstance(node, list):
         for item in node:
             if isinstance(item, (dict, list)):
-                _walk_json(item, path + ('[]',), visit)
+                    _walk_json(item, path + ('[]',), visit)
+
+
+def _xml_name(tag: str) -> str:
+    """Return an XML element/attribute's local name without its namespace."""
+    return tag.rsplit('}', 1)[-1].split(':')[-1]
+
+
+def _xml_value(element):
+    """Convert an XML element to the dict/list/scalar shape used by JSON paths.
+
+    Attributes are prefixed with ``@`` so they cannot collide with child tags,
+    and mixed-content text is exposed as ``#text``. Repeated sibling tags
+    become lists, which gives MITS records such as Floorplan and ILS_Unit the
+    same stable ``[]`` path semantics as JSON arrays.
+    """
+    children = list(element)
+    attributes = {f'@{_xml_name(key)}': value for key, value in element.attrib.items()}
+    text = (element.text or '').strip()
+
+    if not children:
+        if not attributes:
+            return text
+        if text:
+            attributes['#text'] = text
+        return attributes
+
+    result = dict(attributes)
+    grouped = {}
+    for child in children:
+        grouped.setdefault(_xml_name(child.tag), []).append(_xml_value(child))
+    for name, values in grouped.items():
+        result[name] = values if len(values) > 1 else values[0]
+    if text:
+        result['#text'] = text
+    return result
+
+
+def _parse_structured_body(body: str):
+    """Parse JSON or XML into one common tree; return (tree, format)."""
+    try:
+        return json.loads(body), 'json'
+    except (json.JSONDecodeError, TypeError):
+        pass
+    try:
+        root = ET.fromstring(body)
+    except (ET.ParseError, TypeError):
+        return None, None
+    return {_xml_name(root.tag): _xml_value(root)}, 'xml'
 
 
 def _detect_dynamic_parents(walks: list):
@@ -804,6 +1078,52 @@ def _infer_dynamic_parents(walks: list, max_iterations: int = 6) -> set:
     return dynamic
 
 
+def _array_item_fields(items: list) -> set:
+    """Known paths within one array item, stopping at nested arrays.
+
+    Nested dicts are flattened with dotted paths. A nested list is retained as
+    a JSON-valued leaf here; it can be expanded separately when its containing
+    object type is selected.
+    """
+    fields = set()
+
+    def visit(value, prefix=()):
+        if isinstance(value, dict):
+            for key, child in value.items():
+                child_path = prefix + (key,)
+                if isinstance(child, dict):
+                    visit(child, child_path)
+                else:
+                    fields.add(child_path)
+        elif prefix:
+            fields.add(prefix)
+
+    for item in items:
+        if isinstance(item, dict):
+            visit(item)
+        else:
+            fields.add(('value',))
+    return fields
+
+
+def _arrays_below_object(d: dict):
+    """Yield arrays reachable from an object without crossing another array."""
+    found = []
+
+    def visit(value, prefix=()):
+        if not isinstance(value, dict):
+            return
+        for key, child in value.items():
+            child_path = prefix + (key,)
+            if isinstance(child, list):
+                found.append((child_path, child))
+            elif isinstance(child, dict):
+                visit(child, child_path)
+
+    visit(d)
+    return found
+
+
 def build_field_schema(bodies: list) -> dict:
     """
     bodies: raw (already decompressed) file contents from a sample of
@@ -813,28 +1133,44 @@ def build_field_schema(bodies: list) -> dict:
     """
     walks = []
     parsed_count = 0
+    formats = set()
     for file_idx, body in enumerate(bodies):
-        try:
-            doc = json.loads(body)
-        except (json.JSONDecodeError, TypeError):
+        doc, body_format = _parse_structured_body(body)
+        if doc is None:
             continue
         parsed_count += 1
+        formats.add(body_format)
         _walk_json(doc, (), lambda path, d, fi=file_idx: walks.append((fi, path, d)))
 
     if parsed_count == 0:
-        return {'objectTypes': [], 'dynamicParents': [], 'jsonCompatible': False}
+        return {'objectTypes': [], 'dynamicParents': [], 'jsonCompatible': False,
+                'structuredCompatible': False, 'format': None}
 
     dynamic_parents = _infer_dynamic_parents(walks)
 
-    groups = {}   # rewritten_path -> {'fields': {name: sample}, 'count': n, 'files': set()}
+    groups = {}   # rewritten_path -> sampled field inventory + occurrence metadata
     for file_idx, path, d in walks:
         rp = _rewrite_path(path, dynamic_parents)
-        g = groups.setdefault(rp, {'fields': {}, 'count': 0, 'files': set()})
+        g = groups.setdefault(rp, {
+            'fields': {}, 'objectFields': set(), 'arrays': {},
+            'count': 0, 'files': set(),
+        })
         g['count'] += 1
         g['files'].add(file_idx)
         for k, v in d.items():
+            g['objectFields'].add(k)
             if not isinstance(v, (dict, list)) and k not in g['fields']:
                 g['fields'][k] = _csv_cell(v)   # scalars only — nested values are their own object type
+        for array_path, items in _arrays_below_object(d):
+            array = g['arrays'].setdefault(array_path, {
+                'fields': set(), 'seen': 0, 'single': 0, 'multiple': 0,
+            })
+            array['seen'] += 1
+            if len(items) == 1:
+                array['single'] += 1
+            elif len(items) > 1:
+                array['multiple'] += 1
+            array['fields'].update(_array_item_fields(items))
 
     object_types = [
         {
@@ -843,15 +1179,35 @@ def build_field_schema(bodies: list) -> dict:
             'count':  g['count'],
             'files':  len(g['files']),
             'fields': [{'name': k, 'sample': v} for k, v in sorted(g['fields'].items())],
+            # Whole-object extraction includes every direct property. Nested
+            # dict/list values are preserved as JSON cells by _csv_cell,
+            # while the individual-field dropdown remains scalar-only.
+            'objectFields': [{'name': k} for k in sorted(g['objectFields'])],
+            'arrays': [
+                {
+                    'path': '.'.join(array_path),
+                    'label': ' › '.join(array_path),
+                    'fields': [{'path': '.'.join(field_path)}
+                               for field_path in sorted(array['fields'])],
+                    'seen': array['seen'],
+                    'single': array['single'],
+                    'multiple': array['multiple'],
+                }
+                for array_path, array in sorted(g['arrays'].items())
+            ],
         }
-        for path, g in groups.items() if g['fields']   # a container with no scalar fields isn't useful to expose
+        for path, g in groups.items() if g['objectFields']
     ]
     object_types.sort(key=lambda o: -o['count'])
 
     return {
         'objectTypes':     object_types,
         'dynamicParents':  [_path_to_str(p) for p in dynamic_parents],
+        # jsonCompatible remains true for backward compatibility with older
+        # clients where it means "has a navigable structured schema".
         'jsonCompatible':  True,
+        'structuredCompatible': True,
+        'format':           next(iter(formats)) if len(formats) == 1 else 'mixed',
         'filesParsed':     parsed_count,
     }
 
@@ -954,6 +1310,120 @@ def _normalize_join_specs(raw_join, label: str):
     return specs[0]
 
 
+def _validate_join_object_scope(join_spec: dict, output_specs: list, label: str):
+    """Require joined output fields to come from the join key's object.
+
+    Path-scoped extraction creates one row per object instance. Joining a key
+    from a parent Unit object to fields from a child unitSpace object (or vice
+    versa) loses their parent/child identity and can cross-match equal unit
+    numbers from different properties. All fields on one joined side must
+    therefore share the join field's exact structural path. Schema-free manual
+    fields remain supported when both the fields and join key are unscoped.
+    """
+    mismatched = [spec for spec in output_specs
+                  if spec.get('path') != join_spec.get('path')]
+    if mismatched:
+        join_path = _humanize_path(_str_to_path(join_spec.get('path'))) \
+            if join_spec.get('path') else 'manual/unscoped fields'
+        bad_paths = sorted({
+            _humanize_path(_str_to_path(spec.get('path')))
+            if spec.get('path') else 'manual/unscoped fields'
+            for spec in mismatched
+        })
+        raise ValueError(
+            f'{label} must come from the same object as every selected field. '
+            f'The join field is scoped to {join_path}; incompatible output: '
+            f'{", ".join(bad_paths)}. Select the parent object and expand its '
+            f'child array instead of joining a parent key to child-object rows.')
+
+
+def _normalize_array_expansion_requests(raw, label='arrayExpansions'):
+    if raw is None:
+        return []
+    if not isinstance(raw, list):
+        raise ValueError(f'{label} must be a list')
+    normalized, seen = [], set()
+    for index, item in enumerate(raw, 1):
+        if not isinstance(item, dict):
+            raise ValueError(f'{label} item {index} must be an object')
+        object_path = item.get('objectPath')
+        array_path = item.get('arrayPath')
+        if not isinstance(object_path, str) or not isinstance(array_path, str) or not array_path:
+            raise ValueError(f'{label} item {index} needs objectPath and arrayPath')
+        key = (object_path, array_path)
+        if key not in seen:
+            seen.add(key)
+            normalized.append({'objectPath': object_path, 'arrayPath': array_path})
+    return normalized
+
+
+def _safe_column_path(path: str) -> str:
+    return re.sub(r'[^A-Za-z0-9]+', '__', path).strip('_') or 'array'
+
+
+def _resolve_array_expansions(schema: dict, requests: list):
+    """Resolve client array choices against the sampled server-side schema."""
+    objects = {item.get('path', ''): item for item in schema.get('objectTypes', [])}
+    expansions = []
+    for request in requests:
+        object_type = objects.get(request['objectPath'])
+        if not object_type:
+            raise ValueError(f"unknown object path {request['objectPath']!r}")
+        array = next((item for item in object_type.get('arrays', [])
+                      if item.get('path') == request['arrayPath']), None)
+        if not array:
+            raise ValueError(
+                f"unknown array {request['arrayPath']!r} for object {request['objectPath']!r}")
+        base = _safe_column_path(request['arrayPath'])
+        fields = []
+        for field in array.get('fields', []):
+            field_path = field.get('path', '')
+            if field_path:
+                fields.append({
+                    'path': field_path,
+                    'column': f'{base}__{_safe_column_path(field_path)}',
+                })
+        expansions.append({
+            **request,
+            'countColumn': f'{base}__array_count',
+            'statusColumn': f'{base}__expansion_status',
+            'fields': fields,
+        })
+    return expansions
+
+
+def _nested_value(value, path: str):
+    current = value
+    for segment in path.split('.') if path else []:
+        if not isinstance(current, dict) or segment not in current:
+            return None
+        current = current[segment]
+    return current
+
+
+def _apply_array_expansions(rows: list, expansions: list):
+    """Flatten opted-in arrays only when they contain exactly one item."""
+    for row in rows:
+        for expansion in expansions:
+            value = _nested_value(row, expansion['arrayPath'])
+            if not isinstance(value, list):
+                count, status, item = 0, 'missing', None
+            elif len(value) == 0:
+                count, status, item = 0, 'empty', None
+            elif len(value) == 1:
+                count, status, item = 1, 'expanded', value[0]
+            else:
+                count, status, item = len(value), 'multiple', None
+            row[expansion['countColumn']] = count
+            row[expansion['statusColumn']] = status
+            for field in expansion['fields']:
+                row[field['column']] = (
+                    item if field['path'] == 'value' and not isinstance(item, dict)
+                    else _nested_value(item, field['path']) if isinstance(item, dict)
+                    else None)
+    return rows
+
+
 def _normalize_related_files(raw_related: list, primary_integration: str = ''):
     """Validate and normalize related-file join definitions from the API."""
     if raw_related is None:
@@ -981,12 +1451,19 @@ def _normalize_related_files(raw_related: list, primary_integration: str = ''):
                                              f'primaryJoin for {filename!r}')
         related_join = _normalize_join_specs(item.get('relatedJoin'),
                                              f'relatedJoin for {filename!r}')
+        join_type = item.get('joinType', 'left')
+        if join_type not in {'inner', 'left', 'right', 'full'}:
+            raise ValueError(
+                f'joinType for {filename!r} must be inner, left, right, or full')
         normalized.append({
             'integration': rel_integration,
             'filename': _canonical_file_name(rel_integration, filename.strip()),
             'primaryJoin': primary_join,
             'relatedJoin': related_join,
+            'joinType': join_type,
             'fields': fields,
+            'arrayExpansionRequests': _normalize_array_expansion_requests(
+                item.get('arrayExpansions'), f'arrayExpansions for {filename!r}'),
         })
     return normalized
 
@@ -1103,9 +1580,8 @@ def _extract_rows_v2(body: str, specs: list, dynamic_parents: set):
         if s['path']:
             by_path.setdefault(s['path'], []).append(s)
 
-    try:
-        doc = json.loads(body)
-    except (json.JSONDecodeError, TypeError):
+    doc, _body_format = _parse_structured_body(body)
+    if doc is None:
         # No structure available at all — everything falls back to the
         # positional zip, keyed by name; paths are meaningless without a tree.
         name_to_columns = {}
@@ -1173,7 +1649,7 @@ def _resolve_org_building_filter(org: str, building_filter: str,
             if metadata_allowed is not None:
                 allowed = metadata_allowed if allowed is None else (allowed & metadata_allowed)
         except Exception as e:
-            # Availability remains useful without optional Snowflake filters;
+            # Search remains useful without optional Snowflake filters;
             # surface the reason in the summary instead of failing the S3 job.
             notes.append(str(e))
     return allowed, ' · '.join(dict.fromkeys(notes))
@@ -1190,20 +1666,36 @@ def _build_targets(entities: dict, integration: str, file_name: str, allowed, as
     whether it had that file in whatever snapshot existed as of the cutoff.
     """
     file_name = _canonical_file_name(integration, file_name)
+    stale_latest = 0
+    freshness_cutoff = (
+        datetime.now(timezone.utc) - timedelta(hours=DEFAULT_SEARCH_LOOKBACK_HOURS)
+        if as_of is None else None
+    )
     if as_of is None:
-        targets = [
-            (entity, snapshot, f'{ROOT}{integration}/{entity}/{snapshot}/{actual_file}')
-            for entity, (snapshot, files) in entities.items()
-            for actual_file in [_file_variant(files, integration, file_name)]
-            if actual_file and (allowed is None or entity in allowed)
-        ]
+        targets = []
+        for entity, (snapshot, files) in entities.items():
+            if allowed is not None and entity not in allowed:
+                continue
+            try:
+                created_at = _snapshot_dt(snapshot)
+            except (TypeError, ValueError):
+                created_at = None
+            if created_at is None or created_at < freshness_cutoff:
+                stale_latest += 1
+                continue
+            actual_file = _file_variant(files, integration, file_name)
+            if actual_file:
+                targets.append(
+                    (entity, snapshot,
+                     f'{ROOT}{integration}/{entity}/{snapshot}/{actual_file}')
+                )
     else:
         targets = [
             (entity, None, None) for entity in entities
             if allowed is None or entity in allowed
         ]
     targets.sort()
-    return targets
+    return targets, stale_latest
 
 
 def _fetch_text(key: str) -> str:
@@ -1249,7 +1741,8 @@ def _enrich_with_snowflake(job_id: str, entity_list: list):
 
 
 def _run_search_job(job_id: str, integration: str, file_name: str, text: str,
-                    org: str = '', building_filter: str = '', as_of=None):
+                    org: str = '', building_filter: str = '', as_of=None,
+                    include_students: bool = False, max_results: int | None = None):
     try:
         data = _index_load(integration)
         if not data:
@@ -1260,9 +1753,11 @@ def _run_search_job(job_id: str, integration: str, file_name: str, text: str,
         # organization or building id cuts the GET count proportionally.
         if org:
             _job_update(job_id, note='Filtering by organization…')
-        allowed, filter_note = _resolve_org_building_filter(org, building_filter)
+        allowed, filter_note = _resolve_org_building_filter(
+            org, building_filter, exclude_students=not include_students)
 
-        targets = _build_targets(entities, integration, file_name, allowed, as_of)
+        targets, stale_latest = _build_targets(
+            entities, integration, file_name, allowed, as_of)
         _job_update(job_id, total=len(targets),
                    note=(f'Resolving snapshots as of {as_of.isoformat()}…'
                          if as_of else 'Reading snapshots…'))
@@ -1272,9 +1767,13 @@ def _run_search_job(job_id: str, integration: str, file_name: str, text: str,
         no_snapshot = 0   # buildings with no snapshot at/before the cutoff
         lock    = threading.Lock()
         counter = {'n': 0}
+        result_limit = max_results or RESULT_CAP
+        limit_reached = threading.Event()
 
         def probe(target):
             nonlocal errors, no_snapshot
+            if limit_reached.is_set():
+                return
             entity, snapshot, key = target
 
             if as_of is not None:
@@ -1326,8 +1825,10 @@ def _run_search_job(job_id: str, integration: str, file_name: str, text: str,
                 }
             with lock:
                 counter['n'] += 1
-                if hit:
+                if hit and len(matches) < result_limit:
                     matches.append(hit)
+                    if len(matches) >= result_limit:
+                        limit_reached.set()
                 if counter['n'] % 25 == 0:
                     _job_update(job_id, done=counter['n'], note=f'{len(matches)} found')
 
@@ -1336,7 +1837,7 @@ def _run_search_job(job_id: str, integration: str, file_name: str, text: str,
                 list(pool.map(probe, targets))
 
         matches.sort(key=lambda m: m['entity'])
-        shown = matches[:RESULT_CAP]
+        shown = matches
 
         meta, cmap, enrich_error = _enrich_with_snowflake(job_id, [m['entity'] for m in shown])
         if meta:
@@ -1351,19 +1852,24 @@ def _run_search_job(job_id: str, integration: str, file_name: str, text: str,
                     'fields':  {k: v for k, v in row.items() if v is not None},
                 }
 
-        _job_update(job_id, done=len(targets), status='done', finished=time.time(),
+        _job_update(job_id, done=counter['n'], status='done', finished=time.time(),
                     result={
                         'integration': integration,
                         'fileName':    file_name,
                         'text':        text,
                         'org':         org,
+                        'includeStudents': include_students,
+                        'resultLimit': max_results,
                         'asOf':        as_of.isoformat() if as_of else None,
-                        'searched':    len(targets),
+                        'searched':    counter['n'],
                         'buildings':   len(entities),
                         'noSnapshot':  no_snapshot,
+                        'staleLatest': stale_latest,
+                        'freshnessHours': (DEFAULT_SEARCH_LOOKBACK_HOURS
+                                           if as_of is None else None),
                         'matchCount':  len(matches),
                         'matches':     shown,
-                        'truncated':   len(matches) > RESULT_CAP,
+                        'truncated':   limit_reached.is_set(),
                         'errors':      errors,
                         'filterNote':  filter_note,
                         'enrichError': enrich_error,
@@ -1428,9 +1934,61 @@ def _write_export_csv(job_id: str, columns: list, rows: list, have_building_cols
     return path
 
 
+def _join_related_rows(left_rows: list, right_rows: list, rel: dict,
+                       conditions: list) -> list:
+    """Join extracted object rows using SQL outer-join semantics.
+
+    Empty join values never match, consistent with SQL NULL behavior. When a
+    key occurs more than once on either side, every matching combination is
+    emitted. Right/full joins synthesize an empty left row for an unmatched
+    secondary object so its selected fields still appear in the export.
+    """
+    join_type = rel.get('joinType', 'left')
+    rel_index = rel['index']
+    by_join = {}
+    for index, right_row in enumerate(right_rows):
+        join_value = _csv_cell(right_row.get(rel['joinColumn']))
+        if join_value:
+            by_join.setdefault(join_value, []).append((index, right_row))
+
+    matched_right = set()
+    joined = []
+
+    def merge(left_row, right_row):
+        merged = dict(left_row)
+        for source_col, out_col in rel['outputColumns']:
+            merged[out_col] = right_row.get(source_col) if right_row else None
+        for group in conditions:
+            for condition in group['conditions']:
+                if condition['sourceIndex'] == rel_index:
+                    merged[condition['mergeColumn']] = (
+                        right_row.get(condition['column']) if right_row else None)
+        joined.append(merged)
+
+    primary_join_col = rel['primaryJoinColumn']
+    for left_row in left_rows:
+        join_value = _csv_cell(left_row.get(primary_join_col))
+        matches = by_join.get(join_value, []) if join_value else []
+        if matches:
+            for right_index, right_row in matches:
+                matched_right.add(right_index)
+                merge(left_row, right_row)
+        elif join_type in {'left', 'full'}:
+            merge(left_row, None)
+
+    if join_type in {'right', 'full'}:
+        for right_index, right_row in enumerate(right_rows):
+            if right_index not in matched_right:
+                merge({}, right_row)
+
+    return joined
+
+
 def _run_fields_job(job_id: str, integration: str, file_name: str, raw_field_specs: list,
                     org: str = '', building_filter: str = '', as_of=None,
-                    unique: bool = False, raw_related_files: list | None = None,
+                    include_students: bool = False, max_results: int | None = None,
+                    unique: bool = False, raw_array_expansions: list | None = None,
+                    raw_related_files: list | None = None,
                     raw_conditions: list | None = None):
     try:
         _cleanup_old_exports()
@@ -1438,8 +1996,18 @@ def _run_fields_job(job_id: str, integration: str, file_name: str, raw_field_spe
         specs = _normalize_field_specs(raw_field_specs)
         if not specs:
             raise RuntimeError('at least one field is required')
+        primary_array_requests = _normalize_array_expansion_requests(
+            raw_array_expansions or [])
         related_files = _normalize_related_files(raw_related_files or [], integration)
         conditions = _normalize_conditions(raw_conditions or [], integration, related_files)
+
+        for rel in related_files:
+            _validate_join_object_scope(
+                rel['primaryJoin'], specs,
+                f'Primary join field for {rel["filename"]!r}')
+            _validate_join_object_scope(
+                rel['relatedJoin'], rel['fields'],
+                f'Related join field for {rel["filename"]!r}')
 
         # Join fields are extracted alongside the displayed primary fields,
         # then removed from the output unless the user selected them too.
@@ -1453,6 +2021,15 @@ def _run_fields_job(job_id: str, integration: str, file_name: str, raw_field_spe
         # field, so use the columns from the combined normalization everywhere.
         specs = [primary_by_key[(s['name'], s['path'])] for s in specs]
         columns = [s['column'] for s in specs]
+        primary_schema = _get_field_schema(integration, file_name) \
+            if primary_array_requests else None
+        primary_array_expansions = _resolve_array_expansions(
+            primary_schema, primary_array_requests) if primary_schema else []
+        for expansion in primary_array_expansions:
+            columns.extend([
+                expansion['countColumn'], expansion['statusColumn'],
+                *[field['column'] for field in expansion['fields']],
+            ])
         for rel in related_files:
             rel['primaryJoinColumn'] = primary_by_key[
                 (rel['primaryJoin']['name'], rel['primaryJoin']['path'])]['column']
@@ -1468,6 +2045,7 @@ def _run_fields_job(job_id: str, integration: str, file_name: str, raw_field_spe
         related_columns = []
         for rel in related_files:
             rel_index = len(related_extract)
+            rel['index'] = rel_index
             prefix = re.sub(r'[^A-Za-z0-9]+', '_', rel['filename']).strip('_') or 'related'
             if rel['integration'] != integration:
                 source_prefix = re.sub(r'[^A-Za-z0-9]+', '_', rel['integration']).strip('_')
@@ -1489,6 +2067,19 @@ def _run_fields_job(job_id: str, integration: str, file_name: str, raw_field_spe
                 out_col = f'{prefix}__{source_col}'
                 rel['outputColumns'].append((source_col, out_col))
                 related_columns.append(out_col)
+            rel_schema = _get_field_schema(rel['integration'], rel['filename']) \
+                if rel['arrayExpansionRequests'] else None
+            rel['arrayExpansions'] = _resolve_array_expansions(
+                rel_schema, rel['arrayExpansionRequests']) if rel_schema else []
+            for expansion in rel['arrayExpansions']:
+                expansion_columns = [
+                    expansion['countColumn'], expansion['statusColumn'],
+                    *[field['column'] for field in expansion['fields']],
+                ]
+                for source_col in expansion_columns:
+                    out_col = f'{prefix}__{source_col}'
+                    rel['outputColumns'].append((source_col, out_col))
+                    related_columns.append(out_col)
             for group in conditions:
                 for condition in group['conditions']:
                     if condition['sourceIndex'] == rel_index:
@@ -1526,9 +2117,50 @@ def _run_fields_job(job_id: str, integration: str, file_name: str, raw_field_spe
 
         if org:
             _job_update(job_id, note='Filtering by organization…')
-        allowed, filter_note = _resolve_org_building_filter(org, building_filter)
+        allowed, filter_note = _resolve_org_building_filter(
+            org, building_filter, exclude_students=not include_students)
 
-        targets = _build_targets(entities, integration, file_name, allowed, as_of)
+        targets, stale_latest = _build_targets(
+            entities, integration, file_name, allowed, as_of)
+        # A right/full join may have buildings that exist only in the
+        # secondary integration/file. Add those buildings without issuing any
+        # listing calls: the integration indexes already contain the latest
+        # snapshot and filename inventory needed for the default search.
+        outer_related = [r for r in related_extract
+                         if r['joinType'] in {'right', 'full'}]
+        search_buildings = set(entities)
+        for rel in outer_related:
+            search_buildings.update(related_entities.get(rel['integration'], {}))
+        target_by_entity = {target[0]: target for target in targets}
+        stale_outer = set()
+        if outer_related:
+            freshness_cutoff = (
+                datetime.now(timezone.utc) - timedelta(hours=DEFAULT_SEARCH_LOOKBACK_HOURS)
+                if as_of is None else None
+            )
+            for rel in outer_related:
+                for entity, (rel_snapshot, rel_files) in related_entities.get(
+                        rel['integration'], {}).items():
+                    if entity in target_by_entity or (
+                            allowed is not None and entity not in allowed):
+                        continue
+                    if as_of is None:
+                        rel_actual = _file_variant(
+                            rel_files, rel['integration'], rel['filename'])
+                        if not rel_actual:
+                            continue
+                        try:
+                            rel_created_at = _snapshot_dt(rel_snapshot)
+                        except (TypeError, ValueError):
+                            rel_created_at = None
+                        if rel_created_at is None or rel_created_at < freshness_cutoff:
+                            stale_outer.add((rel['integration'], entity, rel['filename']))
+                            continue
+                        target_by_entity[entity] = (entity, rel_snapshot, None)
+                    else:
+                        target_by_entity[entity] = (entity, None, None)
+            targets = sorted(target_by_entity.values())
+            stale_latest += len(stale_outer)
         _job_update(job_id, total=len(targets),
                    note=(f'Resolving snapshots as of {as_of.isoformat()}…'
                          if as_of else 'Reading snapshots…'))
@@ -1540,6 +2172,8 @@ def _run_fields_job(job_id: str, integration: str, file_name: str, raw_field_spe
         lock         = threading.Lock()
         counter      = {'n': 0}
         cap_hit      = {'flag': False}
+        row_limit    = max_results or CSV_ROW_CAP
+        permit_secondary_only = bool(outer_related)
 
         def probe(target):
             nonlocal errors, no_snapshot
@@ -1551,40 +2185,46 @@ def _run_fields_job(job_id: str, integration: str, file_name: str, raw_field_spe
                 entity_prefix = f'{ROOT}{integration}/{entity}/'
                 snap_prefix = _snapshot_prefix_before(entity_prefix, as_of)
                 if not snap_prefix:
+                    key = None
+                    snapshot = None
+                else:
+                    snapshot = snap_prefix[len(entity_prefix):].rstrip('/')
+                    actual_file = _file_variant(
+                        _snapshot_files(entity_prefix, snapshot), integration, file_name)
+                    key = snap_prefix + actual_file if actual_file else None
+                if key is None and not permit_secondary_only:
                     with lock:
                         no_snapshot += 1
                         counter['n'] += 1
                     return
-                snapshot = snap_prefix[len(entity_prefix):].rstrip('/')
-                actual_file = _file_variant(_snapshot_files(entity_prefix, snapshot), integration, file_name)
-                if not actual_file:
+
+            if key:
+                try:
+                    body = _fetch_text(key)
+                    rows = _extract_rows_v2(body, primary_extract_specs, dynamic_parents)
+                    _apply_array_expansions(rows, primary_array_expansions)
+                except ClientError as e:
+                    if e.response.get('Error', {}).get('Code') in ('NoSuchKey', '404'):
+                        if not permit_secondary_only:
+                            with lock:
+                                counter['n'] += 1
+                            return
+                        rows = []
+                    else:
+                        with lock:
+                            errors += 1
+                            counter['n'] += 1
+                        return
+                except Exception:
                     with lock:
-                        no_snapshot += 1
+                        errors += 1
                         counter['n'] += 1
                     return
-                key = snap_prefix + actual_file
+            else:
+                rows = []
 
-            try:
-                body = _fetch_text(key)
-            except ClientError as e:
-                if e.response.get('Error', {}).get('Code') in ('NoSuchKey', '404'):
-                    with lock:
-                        counter['n'] += 1
-                    return
-                with lock:
-                    errors += 1
-                    counter['n'] += 1
-                return
-            except Exception:
-                with lock:
-                    errors += 1
-                    counter['n'] += 1
-                return
-
-            rows = _extract_rows_v2(body, primary_extract_specs, dynamic_parents)
-
-            # Read related files from the same building and snapshot. A
-            # missing related file behaves like a left join with blank fields.
+            # Read related files for the same building. The selected SQL join
+            # type determines whether missing/unmatched rows are retained.
             for rel in related_extract:
                 rel_entity_data = related_entities.get(rel['integration'], {}).get(entity)
                 rel_key = None
@@ -1599,38 +2239,23 @@ def _run_fields_job(job_id: str, integration: str, file_name: str, raw_field_spe
                                 rel['integration'], rel['filename'])
                             if rel_actual:
                                 rel_key = rel_snap_prefix + rel_actual
+                                if snapshot is None:
+                                    snapshot = rel_snapshot
                     else:
                         rel_snapshot = rel_entity_data[0]
                         rel_actual = _file_variant(rel_entity_data[1], rel['integration'], rel['filename'])
                         if rel_actual:
                             rel_key = f'{ROOT}{rel["integration"]}/{entity}/{rel_snapshot}/{rel_actual}'
+                            if snapshot is None:
+                                snapshot = rel_snapshot
                 try:
                     rel_body = _fetch_text(rel_key) if rel_key else None
                     rel_rows = _extract_rows_v2(rel_body, rel['extractSpecs'],
                                                 rel['dynamicParents'])
+                    _apply_array_expansions(rel_rows, rel['arrayExpansions'])
                 except Exception:
                     rel_rows = []
-                by_join = {}
-                for rel_row in rel_rows:
-                    join_value = _csv_cell(rel_row.get(rel['joinColumn']))
-                    if join_value:
-                        by_join.setdefault(join_value, []).append(rel_row)
-
-                expanded = []
-                primary_join_col = rel['primaryJoinColumn']
-                for primary_row in rows:
-                    matches = by_join.get(_csv_cell(primary_row.get(primary_join_col))) or [None]
-                    for match in matches:
-                        merged = dict(primary_row)
-                        for source_col, out_col in rel['outputColumns']:
-                            merged[out_col] = match.get(source_col) if match else None
-                        for group in conditions:
-                            for condition in group['conditions']:
-                                if condition['sourceIndex'] == rel_index:
-                                    merged[condition['mergeColumn']] = (
-                                        match.get(condition['column']) if match else None)
-                        expanded.append(merged)
-                rows = expanded
+                rows = _join_related_rows(rows, rel_rows, rel, conditions)
 
             # Conditions are evaluated after all joins so a filter can refer
             # to either the primary row or a matched related row.
@@ -1662,7 +2287,7 @@ def _run_fields_job(job_id: str, integration: str, file_name: str, raw_field_spe
                         r['_entity']   = entity
                         r['_snapshot'] = snapshot
                         all_rows.append(r)
-                        if len(all_rows) >= CSV_ROW_CAP:
+                        if len(all_rows) >= row_limit:
                             cap_hit['flag'] = True
                             break
                 if counter['n'] % 25 == 0:
@@ -1711,17 +2336,22 @@ def _run_fields_job(job_id: str, integration: str, file_name: str, raw_field_spe
             for r in all_rows[:FIELDS_PREVIEW]
         ]
 
-        _job_update(job_id, done=len(targets), status='done', finished=time.time(),
+        _job_update(job_id, done=counter['n'], status='done', finished=time.time(),
                     result={
                         'integration':  integration,
                         'fileName':     file_name,
                         'fields':       columns,
                         'org':          org,
+                        'includeStudents': include_students,
+                        'resultLimit':  max_results,
                         'unique':       unique,
                         'asOf':         as_of.isoformat() if as_of else None,
-                        'searched':     len(targets),
-                        'buildings':    len(entities),
+                        'searched':     counter['n'],
+                        'buildings':    len(search_buildings),
                         'noSnapshot':   no_snapshot,
+                        'staleLatest':  stale_latest,
+                        'freshnessHours': (DEFAULT_SEARCH_LOOKBACK_HOURS
+                                           if as_of is None else None),
                         'rowCount':     len(all_rows),
                         'buildingColumns': have_building_cols,
                         'csvFields':     ['building', 'snapshot', 'building_name', 'org_id',
@@ -1739,13 +2369,26 @@ def _run_fields_job(job_id: str, integration: str, file_name: str, raw_field_spe
             'fileName': file_name,
             'org': org,
             'buildings': building_filter,
+            'includeStudents': include_students,
+            'resultLimit': max_results,
             'asOf': as_of.isoformat() if as_of else None,
             'unique': unique,
             'fields': columns,
             'relatedFiles': [
-                {'integration': rel['integration'], 'filename': rel['filename']}
+                {'integration': rel['integration'], 'filename': rel['filename'],
+                 'joinType': rel['joinType'],
+                 'primaryJoin': {
+                     'name': rel['primaryJoin']['name'],
+                     'path': rel['primaryJoin']['path'],
+                 },
+                 'relatedJoin': {
+                     'name': rel['relatedJoin']['name'],
+                     'path': rel['relatedJoin']['path'],
+                 },
+                 'arrayExpansions': rel.get('arrayExpansionRequests', [])}
                 for rel in related_files
             ],
+            'arrayExpansions': primary_array_requests,
             'conditionCount': sum(len(group.get('conditions', [])) for group in conditions),
         })
     except Exception as e:
@@ -1755,10 +2398,13 @@ def _run_fields_job(job_id: str, integration: str, file_name: str, raw_field_spe
 # ── Availability Agent ───────────────────────────────────────────────────────
 
 def _availability_rules():
-    global _availability_rules_cache
-    if _availability_rules_cache is None:
+    global _availability_rules_cache, _availability_rules_cache_mtime
+    mtime = os.stat(AVAILABILITY_RULES_PATH).st_mtime_ns
+    if (_availability_rules_cache is None or
+            _availability_rules_cache_mtime != mtime):
         with open(AVAILABILITY_RULES_PATH, 'r', encoding='utf-8') as fh:
             _availability_rules_cache = json.load(fh)
+        _availability_rules_cache_mtime = mtime
     return _availability_rules_cache
 
 
@@ -1798,7 +2444,12 @@ def _availability_value(row: dict, field: str):
         seen.add(marker)
         if isinstance(value, dict):
             for key, nested in value.items():
-                if str(key).casefold() == wanted:
+                # Extracted rows deliberately include None placeholders for
+                # requested fields that are absent at that object level. Do
+                # not let such a placeholder mask the real value inside a
+                # nested settings object (for example RentCafe's
+                # apartmentSettings.monthsAvailabilityRestrictedTo).
+                if str(key).casefold() == wanted and nested is not None:
                     return nested
             for nested in value.values():
                 found = find(nested)
@@ -1829,7 +2480,66 @@ def _availability_key(row: dict, candidates: list):
     return None
 
 
-def _availability_extract(body: str, fields: list):
+def _availability_voyager_units(body: str, fields: list) -> list:
+    """Extract one coherent row per MITS ILS_Unit XML element."""
+    try:
+        root = ET.fromstring(body)
+    except (ET.ParseError, TypeError, ValueError):
+        return []
+    rows = []
+    wanted = {str(field): str(field).lstrip('@') for field in fields}
+    for unit in root.iter():
+        if unit.tag.rsplit('}', 1)[-1] != 'ILS_Unit':
+            continue
+        row = {'_group': 'ILS_Unit'}
+        for field, local in wanted.items():
+            if field.startswith('@'):
+                value = next((value for key, value in unit.attrib.items()
+                              if key.rsplit('}', 1)[-1] == local), None)
+            else:
+                value = None
+                for descendant in unit.iter():
+                    if descendant is unit or descendant.tag.rsplit('}', 1)[-1] != local:
+                        continue
+                    value = (descendant.text or '').strip() or None
+                    if value is None:
+                        if (local == 'MadeReadyDate' and
+                                all(descendant.attrib.get(part) for part in
+                                    ('Year', 'Month', 'Day'))):
+                            date_parts = {
+                                part: str(descendant.attrib[part]).strip()
+                                for part in ('Year', 'Month', 'Day')
+                            }
+                            if all(value == '0' for value in date_parts.values()):
+                                # Voyager emits 0/0/0 for a made-ready date
+                                # that is deliberately unset. Keep the normal
+                                # date value empty, but retain this distinction
+                                # so availability rules can exclude the unit.
+                                row['__made_ready_date_all_zero'] = True
+                            try:
+                                value = datetime(
+                                    int(date_parts['Year']),
+                                    int(date_parts['Month']),
+                                    int(date_parts['Day']),
+                                ).date().isoformat()
+                            except (TypeError, ValueError):
+                                value = None
+                    if value is None:
+                        # MITS values such as EffectiveRent are represented as
+                        # attributes; Min is the unit-level effective value.
+                        value = (descendant.attrib.get('Min') or
+                                 descendant.attrib.get('Value') or
+                                 descendant.attrib.get('Max'))
+                    if value is not None:
+                        break
+            row[field] = value
+        rows.append(row)
+    return rows
+
+
+def _availability_extract(body: str, fields: list, voyager_units: bool = False):
+    if voyager_units:
+        return _availability_voyager_units(body, fields)
     specs = _normalize_field_specs([{'name': field} for field in fields])
     return _extract_rows_v2(body, specs, set()) if specs else []
 
@@ -1877,6 +2587,12 @@ def _availability_when(values: dict, clause: dict):
     op = clause.get('op')
     expected = clause.get('value', '')
     text = _csv_cell(actual).strip()
+    # Availability rules describe the state represented by a snapshot. Use
+    # that snapshot's UTC calendar date so historical/as-of results do not
+    # change when the same file is evaluated on a later day. Fall back to the
+    # current UTC date for callers that do not provide snapshot context.
+    reference_date = _availability_date(values.get('__current_date'))
+    reference_date = reference_date or datetime.now(timezone.utc).date()
     if op == 'missing':
         return actual is None or text == ''
     if op == 'truthy':
@@ -1916,14 +2632,14 @@ def _availability_when(values: dict, clause: dict):
             days = float(expected)
         except (TypeError, ValueError):
             return False
-        return bool(date and date > datetime.now(timezone.utc).date() + timedelta(days=days))
+        return bool(date and date > reference_date + timedelta(days=days))
     if op == 'future_or_equal_days':
         date = _availability_date(actual)
         try:
             days = float(expected)
         except (TypeError, ValueError):
             return False
-        return bool(date and date >= datetime.now(timezone.utc).date() + timedelta(days=days))
+        return bool(date and date >= reference_date + timedelta(days=days))
     if op == 'future_by_field_days':
         date = _availability_date(actual)
         try:
@@ -1932,10 +2648,10 @@ def _availability_when(values: dict, clause: dict):
         except (TypeError, ValueError):
             return False
         return bool(date and days > 0 and
-                    date > datetime.now(timezone.utc).date() + timedelta(days=days))
+                    date > reference_date + timedelta(days=days))
     if op == 'future':
         date = _availability_date(actual)
-        return bool(date and date > datetime.now(timezone.utc).date())
+        return bool(date and date > reference_date)
     if op in ('equals', 'not_equals', 'contains', 'not_contains'):
         return _condition_value_matches(actual, {'equals': 'eq', 'not_equals': 'ne',
                                                   'contains': 'contains', 'not_contains': 'not_contains'}[op],
@@ -1966,9 +2682,18 @@ def _availability_predict(rule: dict, values: dict):
     direct_predicted, direct_reason = predicted, reason
     override_reason = None
     for override in rule.get('overrides') or []:
+        # Overrides are exclusion rules: they may only remove a unit from
+        # availability by mapping it to Lease Signed (stage 9). Renovating and
+        # other non-9 outcomes belong in the explicit direct rules instead.
+        try:
+            override_stage = int(override['stage'])
+        except (KeyError, TypeError, ValueError):
+            continue
+        if override_stage != 9:
+            continue
         clauses = override.get('when') or []
         if clauses and all(_availability_when(values, clause) for clause in clauses):
-            predicted = int(override['stage'])
+            predicted = override_stage
             override_reason = override.get('reason') or f"Override: {predicted}"
             # Direct mapping wins when it already explains the final stage.
             if direct_predicted != predicted:
@@ -2010,6 +2735,148 @@ def _availability_keys(row: dict, candidates: list):
     return keys
 
 
+def _availability_unit_key(row: dict, rule: dict,
+                           phase_prefix_values: set | None = None):
+    """Derive the integration's persisted building_unique_id from its rule."""
+    config = rule.get('unit_key') or {}
+    parts = []
+    phase_fields = config.get('phase_prefix_when_multiple') or []
+    if phase_fields and len(phase_prefix_values or ()) > 1:
+        phase_value = next((_availability_value(row, field)
+                            for field in phase_fields
+                            if _availability_value(row, field) is not None and
+                            str(_availability_value(row, field)).strip()), None)
+        if phase_value is None:
+            return None
+        parts.append(str(phase_value).strip())
+    for candidates in config.get('components') or []:
+        value = next((_availability_value(row, field)
+                      for field in candidates
+                      if _availability_value(row, field) is not None and
+                      str(_availability_value(row, field)).strip()), None)
+        if value is None:
+            return None
+        parts.append(str(value).strip())
+    return '-'.join(parts).casefold() if parts else None
+
+
+def _availability_wait_unit(row: dict, rule: dict) -> bool:
+    """Exclude placeholder/wait-list unit names without inspecting status text."""
+    for field in rule.get('unit_name_fields') or []:
+        value = _availability_value(row, field)
+        if value is not None and 'wait' in str(value).casefold():
+            return True
+    return False
+
+
+def _availability_file_property_code(filename: str, candidates: list):
+    """Extract a property-code suffix such as AllUnits_Login_utbanhil.xml.gz."""
+    for candidate in candidates or []:
+        if filename.startswith(candidate + '_'):
+            suffix = filename[len(candidate) + 1:]
+            return suffix.split('.', 1)[0].strip() or None
+    return None
+
+
+def _availability_supplemental_rows(body: str, config: dict,
+                                    primary_rows: list) -> list:
+    """Return source units whose external ids are absent from the primary feed.
+
+    RentCafe is the first consumer: Voyager Unit Identification/@IDType is the
+    same identifier exposed as RentCafe voyagerApartmentId, while @IDValue is
+    the human unit name used to join unit_details.
+    """
+    primary_id_field = config.get('primary_id_field')
+    supplemental_id_field = config.get('supplemental_id_field')
+    supplemental_name_field = config.get('supplemental_name_field')
+    if not all((primary_id_field, supplemental_id_field,
+                supplemental_name_field)):
+        return []
+
+    existing_ids = {
+        str(value).strip().casefold()
+        for row in primary_rows
+        for value in [_availability_value(row, primary_id_field)]
+        if value is not None and str(value).strip()
+    }
+    output_name_field = config.get('output_name_field') or 'unit_number'
+    existing_names = {
+        str(value).strip().casefold()
+        for row in primary_rows
+        for value in [_availability_value(row, output_name_field)]
+        if value is not None and str(value).strip()
+    }
+    seen = set(existing_ids)
+    seen_names = set(existing_names)
+    output = []
+    row_type_field = config.get('row_type_field')
+    row_type_value = str(config.get('row_type_value') or '').strip().casefold()
+    for source_row in _availability_extract(body, config.get('fields') or []):
+        if row_type_field:
+            actual_type = _availability_value(source_row, row_type_field)
+            if str(actual_type or '').strip().casefold() != row_type_value:
+                continue
+        source_id = _availability_value(source_row, supplemental_id_field)
+        source_name = _availability_value(source_row, supplemental_name_field)
+        normalized_id = str(source_id or '').strip().casefold()
+        normalized_name = str(source_name or '').strip().casefold()
+        # Some RentCafe rows omit voyagerApartmentId even though the unit is
+        # present. Unit numbers are unique within a building, so IDValue/name
+        # is the safe fallback that prevents the same physical unit from being
+        # re-added as a synthetic Lease Signed Voyager unit.
+        if (not normalized_id or normalized_id in seen or not normalized_name or
+                normalized_name in seen_names):
+            continue
+        seen.add(normalized_id)
+        seen_names.add(normalized_name)
+        output.append({
+            output_name_field: source_name,
+            primary_id_field: source_id,
+            config.get('output_status_field') or 'status':
+                config.get('output_status_value'),
+            '__supplemental_unit': True,
+        })
+    return output
+
+
+def _availability_supplemental_target(entity: str, primary_snapshot: str,
+                                      as_of, config: dict,
+                                      indexed_entities: dict):
+    """Resolve the supplemental file, preferring its existing on-disk index."""
+    integrations = config.get('integrations') or []
+    files = config.get('files') or []
+    if as_of is None:
+        for related_integration in integrations:
+            entity_data = indexed_entities.get(related_integration, {}).get(entity)
+            if not entity_data:
+                continue
+            snapshot, snapshot_files = entity_data
+            actual = _availability_first_file(
+                snapshot_files, related_integration, files)
+            if actual:
+                return related_integration, snapshot, actual
+
+    cutoff = as_of or _availability_snapshot_datetime(primary_snapshot)
+    for related_integration in integrations:
+        entity_prefix = f'{ROOT}{related_integration}/{entity}/'
+        if cutoff is not None:
+            snapshot_prefix = _snapshot_prefix_before(entity_prefix, cutoff)
+            if not snapshot_prefix:
+                continue
+            snapshot = snapshot_prefix[len(entity_prefix):].rstrip('/')
+        else:
+            snapshot = _latest_snapshot_seeked(
+                entity_prefix, _cutoff_stamps(), full_fallback=True)
+            if not snapshot:
+                continue
+        snapshot_files = _snapshot_files(entity_prefix, snapshot)
+        actual = _availability_first_file(
+            snapshot_files, related_integration, files)
+        if actual:
+            return related_integration, snapshot, actual
+    return None
+
+
 def _write_availability_csv(job_id: str, rows: list, fieldnames: list):
     os.makedirs(EXPORT_DIR, exist_ok=True)
     path = os.path.join(EXPORT_DIR, f'{job_id}.csv')
@@ -2028,24 +2895,51 @@ def _run_availability_job(job_id: str, integration: str, org: str = '',
                           include_students: bool = True,
                           include_applications: bool = True,
                           max_results: int | None = None,
-                          record_history: bool = True):
+                          record_history: bool = True,
+                          stop_job_id: str | None = None):
     try:
+        control_job_id = stop_job_id or job_id
+        _job_update(job_id, note=f'Loading {integration} index…')
         rules = _availability_rules().get('integrations', {}).get(integration)
         if not rules:
             raise RuntimeError(f'Availability Agent does not support {integration}')
         data = _index_load(integration)
         if not data:
             raise RuntimeError(f'No index for {integration}; build its index first')
+        source_integration = _availability_source_integration(integration)
         entities = data.get('entities', {})
+        filter_bits = []
+        if org:
+            filter_bits.append('organization')
+        if building_filter:
+            filter_bits.append('building')
+        if not include_students:
+            filter_bits.append('student-community exclusion')
+        if not include_applications:
+            filter_bits.append('Applications exclusion')
+        _job_update(
+            job_id,
+            note=('Applying ' + ', '.join(filter_bits) + ' filters…'
+                  if filter_bits else 'Preparing building scope…'))
         allowed, filter_note = _resolve_org_building_filter(
             org, building_filter,
             exclude_students=not include_students,
             exclude_applications=not include_applications)
         primary_candidates = rules.get('primary') or []
+        supplemental_config = rules.get('supplemental_units') or {}
+        supplemental_indexes = {}
+        for related_integration in supplemental_config.get('integrations') or []:
+            related_data = _index_load(related_integration)
+            supplemental_indexes[related_integration] = (
+                (related_data or {}).get('entities', {})
+                if isinstance(related_data, dict) else {})
+        limit_note = f' for a {max_results:,}-unit limit' if max_results else ''
+        _job_update(job_id, note=f'Selecting indexed buildings{limit_note}…')
         targets = []
         stale_latest = 0
-        freshness_cutoff = (datetime.now(timezone.utc) - timedelta(days=1)) \
-            if as_of is None else None
+        freshness_cutoff = (
+            datetime.now(timezone.utc) - timedelta(hours=24)
+            if as_of is None else None)
         for entity, (snapshot, files) in entities.items():
             if allowed is not None and entity not in allowed:
                 continue
@@ -2054,23 +2948,26 @@ def _run_availability_job(job_id: str, integration: str, org: str = '',
                 if created_at is None or created_at < freshness_cutoff:
                     stale_latest += 1
                     continue
-            actual = _availability_first_file(files, integration, primary_candidates)
+            actual = _availability_first_file(files, source_integration, primary_candidates)
             if actual:
                 targets.append((entity, snapshot, actual, files))
             elif as_of is not None:
                 targets.append((entity, None, None, []))
         targets.sort()
-        _job_update(job_id, total=len(targets), note='Reading availability snapshots…')
+        _job_update(job_id, total=len(targets),
+                    note=f'Selected {len(targets):,} candidate buildings…')
 
         rollout_configs = rules.get('rollouts') or {}
         rollout_names = list(rollout_configs)
+        building_fields = rules.get('building_fields') or []
         rollout_values = {}
         rollout_error = None
         metadata_checked = False
         meta = None
         cmap = None
         enrich_error = None
-        if rollout_names and targets:
+        if ((rollout_names or building_fields) and targets and
+                not _job_stop_requested(control_job_id)):
             target_times = {
                 entity: (as_of or _availability_snapshot_datetime(snapshot)
                          or datetime.now(timezone.utc))
@@ -2082,21 +2979,22 @@ def _run_availability_job(job_id: str, integration: str, org: str = '',
             meta, cmap, enrich_error = _enrich_with_snowflake(
                 job_id, list(target_times))
             metadata_checked = True
-            org_ids = {}
-            if enrich_error:
-                rollout_error = f'organization lookup unavailable: {enrich_error}'
-            elif meta and cmap and cmap.get('org'):
-                org_ids = {
-                    entity: detail.get(cmap['org'])
-                    for entity, detail in meta.items()
-                }
-            try:
-                rollout_values = snowflake_db.rollout_variants(
-                    list(target_times), rollout_names, target_times, org_ids)
-            except Exception as e:
-                # Keep the run usable, but mark rollout state unknown so a
-                # rollout-dependent override is not applied speculatively.
-                rollout_error = str(e) if not rollout_error else f'{rollout_error}; {e}'
+            if rollout_names:
+                org_ids = {}
+                if enrich_error:
+                    rollout_error = f'organization lookup unavailable: {enrich_error}'
+                elif meta and cmap and cmap.get('org'):
+                    org_ids = {
+                        entity: detail.get(cmap['org'])
+                        for entity, detail in meta.items()
+                    }
+                try:
+                    rollout_values = snowflake_db.rollout_variants(
+                        list(target_times), rollout_names, target_times, org_ids)
+                except Exception as e:
+                    # Keep the run usable, but mark rollout state unknown so a
+                    # rollout-dependent override is not applied speculatively.
+                    rollout_error = str(e) if not rollout_error else f'{rollout_error}; {e}'
 
         source_fields = {'primary': list(dict.fromkeys((rules.get('fields') or []) +
                                                         (rules.get('primary_key') or [])))}
@@ -2109,17 +3007,20 @@ def _run_availability_job(job_id: str, integration: str, org: str = '',
         actual_key = rules.get('actual_key') or []
         all_rows = []
         errors = 0
+        supplemental_errors = 0
+        supplemental_units = 0
+        wait_filtered = 0
         no_snapshot = 0
         counter = {'n': 0}
         cap_hit = {'flag': False}
         lock = threading.Lock()
 
         def probe(target):
-            nonlocal errors, no_snapshot
-            if cap_hit['flag']:
+            nonlocal errors, no_snapshot, supplemental_errors, supplemental_units, wait_filtered
+            if cap_hit['flag'] or _job_stop_requested(control_job_id):
                 return
             entity, snapshot, primary_actual, snapshot_files = target
-            entity_prefix = f'{ROOT}{integration}/{entity}/'
+            entity_prefix = f'{ROOT}{source_integration}/{entity}/'
             if as_of is not None:
                 snap_prefix = _snapshot_prefix_before(entity_prefix, as_of)
                 if not snap_prefix:
@@ -2129,38 +3030,94 @@ def _run_availability_job(job_id: str, integration: str, org: str = '',
                     return
                 snapshot = snap_prefix[len(entity_prefix):].rstrip('/')
                 snapshot_files = _snapshot_files(entity_prefix, snapshot)
-                primary_actual = _availability_first_file(snapshot_files, integration, primary_candidates)
+                primary_actual = _availability_first_file(
+                    snapshot_files, source_integration, primary_candidates)
                 if not primary_actual:
                     with lock:
                         no_snapshot += 1
                         counter['n'] += 1
                     return
-            primary_s3_key = f'{ROOT}{integration}/{entity}/{snapshot}/{primary_actual}'
+            primary_s3_key = f'{ROOT}{source_integration}/{entity}/{snapshot}/{primary_actual}'
             try:
                 primary_body = _fetch_text(primary_s3_key)
-                primary_rows = _availability_extract(primary_body, source_fields['primary'])
+                primary_rows = _availability_extract(
+                    primary_body, source_fields['primary'],
+                    voyager_units=integration == 'Voyager')
+                file_property_code = _availability_file_property_code(
+                    primary_actual, primary_candidates)
+                if file_property_code:
+                    for row in primary_rows:
+                        row['__file_property_code'] = file_property_code
+                rentcafe_codes = {
+                    str(code).strip()
+                    for row in primary_rows
+                    for code in [_availability_value(row, 'voyagerPropertyCode')]
+                    if code is not None and str(code).strip()
+                } if integration == 'RentCafe' else set()
+                phase_fields = (rules.get('unit_key') or {}).get(
+                    'phase_prefix_when_multiple') or []
+                phase_prefix_values = {
+                    str(value).strip().casefold()
+                    for row in primary_rows
+                    for field in phase_fields
+                    for value in [_availability_value(row, field)]
+                    if value is not None and str(value).strip()
+                }
                 source_rows = {}
                 for source in source_configs:
                     actual_source = _availability_file_variant(
-                        snapshot_files, integration, source['file'])
+                        snapshot_files, source_integration, source['file'])
                     if actual_source:
                         source_body = _fetch_text(
-                            f'{ROOT}{integration}/{entity}/{snapshot}/{actual_source}')
+                            f'{ROOT}{source_integration}/{entity}/{snapshot}/{actual_source}')
                         source_rows[source['file']] = _availability_extract(
-                            source_body, source_fields[source['file']])
+                            source_body, source_fields[source['file']],
+                            voyager_units=(integration == 'Voyager' and
+                                           source['file'].startswith(
+                                               ('AllUnits_Login', 'AvailableUnits_Login'))))
                     else:
                         source_rows[source['file']] = []
                 actual_actual = _availability_first_file(
-                    snapshot_files, integration, rules.get('actual') or [])
+                    snapshot_files, source_integration, rules.get('actual') or [])
                 actual_rows = []
                 if actual_actual:
-                    actual_body = _fetch_text(f'{ROOT}{integration}/{entity}/{snapshot}/{actual_actual}')
+                    actual_body = _fetch_text(
+                        f'{ROOT}{source_integration}/{entity}/{snapshot}/{actual_actual}')
                     actual_rows = _availability_extract(actual_body, actual_fields)
             except Exception:
                 with lock:
                     errors += 1
                     counter['n'] += 1
                 return
+
+            added_supplemental = []
+            if supplemental_config:
+                try:
+                    supplemental_target = _availability_supplemental_target(
+                        entity, snapshot, as_of, supplemental_config,
+                        supplemental_indexes)
+                    if supplemental_target:
+                        related_integration, related_snapshot, related_file = supplemental_target
+                        supplemental_body = _fetch_text(
+                            f'{ROOT}{related_integration}/{entity}/'
+                            f'{related_snapshot}/{related_file}')
+                        added_supplemental = _availability_supplemental_rows(
+                            supplemental_body, supplemental_config, primary_rows)
+                        # Voyager's supplemental row does not carry the
+                        # RentCafe property code. It is safe to inherit only
+                        # when this building has one code; multi-code/CLO
+                        # buildings would otherwise recreate the collision
+                        # that building_unique_id is designed to prevent.
+                        if len(rentcafe_codes) == 1:
+                            sole_code = next(iter(rentcafe_codes))
+                            for row in added_supplemental:
+                                row['voyagerPropertyCode'] = sole_code
+                        primary_rows.extend(added_supplemental)
+                except Exception:
+                    # The primary RentCafe analysis is still useful if the
+                    # optional Voyager supplement is temporarily unreadable.
+                    with lock:
+                        supplemental_errors += 1
 
             actual_by_key = {}
             for row in actual_rows:
@@ -2178,6 +3135,7 @@ def _run_availability_job(job_id: str, integration: str, org: str = '',
                 source_by_key[source['file']] = keyed
 
             produced = []
+            seen_unit_keys = set()
             for primary_row in primary_rows:
                 if cap_hit['flag']:
                     break
@@ -2188,18 +3146,67 @@ def _run_availability_job(job_id: str, integration: str, org: str = '',
                     # Do not turn those non-unit records into unexplained
                     # availability rows.
                     continue
+                if _availability_wait_unit(primary_row, rules):
+                    with lock:
+                        wait_filtered += 1
+                    continue
                 primary_keys = _availability_keys(primary_row, primary_key)
-                unit_key = primary_keys[0] if primary_keys else None
-                actual_row = next((actual_by_key[key] for key in primary_keys
-                                   if key in actual_by_key), {})
-                # unit_details is the canonical physical-unit feed. The
-                # Availability Agent must never emit API-only, amenity, or
-                # other primary-feed records that are absent from it.
+                unit_key = _availability_unit_key(
+                    primary_row, rules, phase_prefix_values)
+                # A canonical external identity may occur more than once in a
+                # raw feed. Retain the first row and its status deterministically.
+                if unit_key in seen_unit_keys:
+                    continue
+                if unit_key:
+                    seen_unit_keys.add(unit_key)
+                actual_row = actual_by_key.get(unit_key, {})
+                if integration == 'RentCafe':
+                    # For a true single-property building, ILSUnit.external_id
+                    # is the bare apartmentName. This fallback is deliberately
+                    # forbidden when multiple Voyager property codes exist.
+                    if not actual_row and len(rentcafe_codes) == 1:
+                        name = (_availability_value(primary_row, 'apartmentName') or
+                                _availability_value(primary_row, 'ApartmentName'))
+                        name_key = str(name).strip().casefold() if name is not None else ''
+                        actual_row = actual_by_key.get(name_key, {})
+                    # Supplemental Voyager units on a multi-code building do
+                    # not identify which RentCafe code owns them, so they
+                    # cannot form a guaranteed building_unique_id.
+                    if not unit_key:
+                        actual_row = {}
+                elif integration == 'Voyager' and not actual_row:
+                    # Current Voyager unit-details snapshots persist a bare
+                    # ILS unit external_id for a single property file, even
+                    # though the canonical identity is property-unit. Use the
+                    # bare value only when this snapshot exposes one Voyager
+                    # property code; otherwise it is ambiguous.
+                    property_codes = {
+                        code for file_name in snapshot_files
+                        for code in [_availability_file_property_code(
+                            file_name, primary_candidates)]
+                        if code
+                    }
+                    if len(property_codes) == 1:
+                        bare_id = _availability_value(primary_row, '@IDValue')
+                        if bare_id is not None:
+                            actual_row = actual_by_key.get(
+                                str(bare_id).strip().casefold(), {})
+                # unit_details is the canonical post-filter physical-unit
+                # feed. Never emit raw API records — including supplemental
+                # cross-integration units — when that unit was filtered out
+                # before unit_details was produced.
                 if not actual_row:
                     continue
                 values = dict(primary_row)
+                snapshot_datetime = _availability_snapshot_datetime(snapshot)
+                if snapshot_datetime is not None:
+                    values['__current_date'] = snapshot_datetime.date().isoformat()
                 for key, value in primary_row.items():
                     values[f'primary__{key}'] = value
+                building_detail = (meta or {}).get(entity, {})
+                for field in building_fields:
+                    values[f'__building__{field}'] = _availability_value(
+                        building_detail, field)
                 for rollout_name, rollout_config in rollout_configs.items():
                     if rollout_error:
                         variant = '__unknown__'
@@ -2239,6 +3246,7 @@ def _run_availability_job(job_id: str, integration: str, org: str = '',
                     continue
                 output = {
                     '_entity': entity, '_snapshot': snapshot,
+                    '_supplemental': bool(primary_row.get('__supplemental_unit')),
                     'unit_key': unit_key or '',
                     'Actual Availability': actual_stage,
                     'Predicted Availability': predicted,
@@ -2273,22 +3281,100 @@ def _run_availability_job(job_id: str, integration: str, org: str = '',
                     if remaining <= 0:
                         cap_hit['flag'] = True
                     else:
-                        all_rows.extend(produced[:remaining])
+                        selected = produced[:remaining]
+                        all_rows.extend(selected)
+                        supplemental_units += sum(
+                            1 for row in selected if row.get('_supplemental'))
                         if len(all_rows) >= max_results:
                             cap_hit['flag'] = True
                 else:
                     all_rows.extend(produced)
+                    supplemental_units += sum(
+                        1 for row in produced if row.get('_supplemental'))
                 counter['n'] += 1
-                if counter['n'] % 10 == 0:
-                    _job_update(job_id, done=counter['n'], note=f'{len(all_rows)} units evaluated')
 
         if targets:
             with ThreadPoolExecutor(max_workers=SEARCH_WORKERS) as pool:
-                list(pool.map(probe, targets))
+                target_iter = iter(targets)
+                pending = set()
+                initial_workers = (SEARCH_WORKERS if max_results is None else
+                                   max(1, min(8, max_results, SEARCH_WORKERS)))
+                active_workers = initial_workers
+                _job_update(
+                    job_id, done=0,
+                    note=(f'Reading availability snapshots · starting with '
+                          f'{initial_workers} concurrent building '
+                          f'read{"s" if initial_workers != 1 else ""}…'))
+
+                def fill_workers():
+                    while (len(pending) < active_workers and not cap_hit['flag'] and
+                           not _job_stop_requested(control_job_id)):
+                        try:
+                            pending.add(pool.submit(probe, next(target_iter)))
+                        except StopIteration:
+                            break
+
+                fill_workers()
+                limit_note_shown = False
+                while pending:
+                    completed, pending = wait(pending, return_when=FIRST_COMPLETED)
+                    # Surface worker exceptions instead of silently losing a
+                    # probe and leaving the progress state unexplained.
+                    for future in completed:
+                        future.result()
+                    stop_requested = _job_stop_requested(control_job_id)
+                    if cap_hit['flag'] or stop_requested:
+                        for future in pending:
+                            future.cancel()
+                        pending = {future for future in pending if not future.cancelled()}
+                        if pending:
+                            limit_note_shown = True
+                            _job_update(
+                                job_id, done=counter['n'],
+                                note=((f'Stop requested at {len(all_rows):,} units · '
+                                       if stop_requested else
+                                       f'Result limit reached at {len(all_rows):,} units · ') +
+                                      f'finishing {len(pending)} in-flight '
+                                      f'building read{"s" if len(pending) != 1 else ""}…'))
+                    else:
+                        if max_results is not None and counter['n'] >= 4:
+                            # Estimate how many concurrent buildings are still
+                            # useful from the observed unit yield. Zero/very
+                            # low-yield filters ramp toward full concurrency;
+                            # high-yield integrations stay small and avoid
+                            # dozens of unnecessary S3/Voyager reads.
+                            remaining_rows = max(0, max_results - len(all_rows))
+                            observed_yield = len(all_rows) / max(1, counter['n'])
+                            estimated_buildings = int(
+                                remaining_rows / max(observed_yield, .25) + .999)
+                            active_workers = min(
+                                SEARCH_WORKERS,
+                                max(initial_workers, estimated_buildings))
+                        fill_workers()
+                        if max_results is not None:
+                            _job_update(
+                                job_id, done=counter['n'],
+                                note=(f'{len(all_rows):,} of {max_results:,} units '
+                                      f'collected · {counter["n"]:,} buildings '
+                                      f'checked · {active_workers} concurrent reads'))
+                        elif counter['n'] and counter['n'] % 10 == 0:
+                            _job_update(
+                                job_id, done=counter['n'],
+                                note=(f'{len(all_rows):,} units evaluated · '
+                                      f'{counter["n"]:,} buildings checked'))
+
+                stopped = _job_stop_requested(control_job_id)
+                if cap_hit['flag'] or limit_note_shown or stopped:
+                    _job_update(job_id, done=counter['n'], total=counter['n'],
+                                note=((f'Stop requested · finalizing {len(all_rows):,} units…')
+                                      if stopped else
+                                      f'Result limit reached · finalizing {len(all_rows):,} units…'))
 
         distinct_entities = sorted({row['_entity'] for row in all_rows})
-        if not metadata_checked:
+        if not metadata_checked and distinct_entities:
+            _job_update(job_id, done=counter['n'], note='Loading building details…')
             meta, cmap, enrich_error = _enrich_with_snowflake(job_id, distinct_entities)
+        _job_update(job_id, done=counter['n'], note='Preparing CSV columns…')
         fieldnames = ['building', 'snapshot', 'building_name', 'org_id', 'org_name', 'snapshot link',
                       'unit_key', 'Actual Availability', 'Predicted Availability', 'Availability Reason']
         fieldnames.extend(f'rollout__{name}' for name in rollout_names)
@@ -2306,18 +3392,24 @@ def _run_availability_job(job_id: str, integration: str, org: str = '',
             org_name_col = cmap.get('org_name') if cmap else None
             row['org_name'] = (detail.get(org_name_col, '') if org_name_col else '') or detail.get('ORGANIZATION_NAME', '')
             row['snapshot link'] = _snapshot_link(building, row['_snapshot'], row.get('org_id'))
+        _job_update(job_id, done=counter['n'], note=f'Writing {len(all_rows):,} CSV rows…')
         _write_availability_csv(job_id, all_rows, fieldnames)
+        _job_update(job_id, done=counter['n'], note='Finalizing result preview…')
         preview = [{field: _csv_cell(row.get(field)) for field in fieldnames} for row in all_rows[:FIELDS_PREVIEW]]
-        _job_update(job_id, done=len(targets), status='done', finished=time.time(), result={
+        _job_update(job_id, done=counter['n'], status='done', finished=time.time(), result={
             'integration': integration, 'asOf': as_of.isoformat() if as_of else None,
-            'searched': len(targets), 'buildings': len(entities), 'rowCount': len(all_rows),
+            'searched': counter['n'], 'buildings': len(entities), 'rowCount': len(all_rows),
             'unknownCount': sum(1 for row in all_rows
                                 if row.get('Predicted Availability') != row.get('Actual Availability')),
             'staleLatest': stale_latest,
-            'freshnessHours': 24 if freshness_cutoff is not None else None,
+            'freshnessHours': 24 if as_of is None else None,
             'limit': max_results, 'limited': bool(max_results is not None and cap_hit['flag']),
+            'stopped': _job_stop_requested(control_job_id),
             'includeStudents': include_students,
             'includeApplications': include_applications,
+            'supplementalUnits': supplemental_units,
+            'supplementalErrors': supplemental_errors,
+            'waitFiltered': wait_filtered,
             'showUnknown': show_unknown, 'fields': fieldnames, 'preview': preview,
             'noSnapshot': no_snapshot, 'errors': errors, 'filterNote': filter_note,
             'enrichError': enrich_error,
@@ -2334,6 +3426,9 @@ def _run_availability_job(job_id: str, integration: str, org: str = '',
                 'showUnknown': show_unknown,
                 'includeStudents': include_students,
                 'includeApplications': include_applications,
+                'supplementalUnits': supplemental_units,
+                'supplementalErrors': supplemental_errors,
+                'waitFiltered': wait_filtered,
                 'limit': max_results,
             })
     except Exception as e:
@@ -2358,6 +3453,7 @@ def _run_availability_batch_job(job_id: str, integrations: list, org: str = '',
         combined_fields = []
         searched = buildings = unknown = errors = no_snapshot = 0
         stale_latest = 0
+        supplemental_units = supplemental_errors = wait_filtered = 0
         notes = []
         failed = []
         skipped = []
@@ -2369,6 +3465,11 @@ def _run_availability_batch_job(job_id: str, integrations: list, org: str = '',
                     combined_fields.append(field)
 
         for position, integration in enumerate(integrations, start=1):
+            if _job_stop_requested(job_id):
+                skipped = integrations[position - 1:]
+                _job_update(job_id, done=position - 1,
+                            note=f'Stop requested · finalizing {len(combined_rows):,} rows')
+                break
             if max_results is not None and len(combined_rows) >= max_results:
                 skipped = integrations[position - 1:]
                 _job_update(job_id, done=position - 1,
@@ -2376,22 +3477,11 @@ def _run_availability_batch_job(job_id: str, integrations: list, org: str = '',
                 break
 
             if not _index_load(integration):
-                _job_update(job_id, done=position - 1,
-                            note=f'Indexing {integration}…')
-                index_job = _running_job_for('index', integration)
-                if not index_job:
-                    index_job = _job_new('index', integration)
-                    _run_index_job(index_job, integration)
-                while True:
-                    index_state = _job_get(index_job)
-                    if not index_state or index_state['status'] != 'running':
-                        break
-                    time.sleep(.2)
-                if not _index_load(integration):
-                    failed.append(integration)
-                    errors += 1
-                    _job_update(job_id, done=position, note=f'{integration} index failed')
-                    continue
+                failed.append(integration)
+                errors += 1
+                _job_update(job_id, done=position,
+                            note=f'{integration} index unavailable')
+                continue
 
             if max_results is None:
                 remaining = None
@@ -2407,7 +3497,7 @@ def _run_availability_batch_job(job_id: str, integrations: list, org: str = '',
                         note=f'Checking {integration}…')
             _run_availability_job(
                 child_id, integration, org, building_filter, as_of, show_unknown,
-                include_students, include_applications, remaining, False)
+                include_students, include_applications, remaining, False, job_id)
             child = _job_get(child_id) or {}
             if child.get('status') != 'done' or not child.get('result'):
                 failed.append(integration)
@@ -2425,6 +3515,9 @@ def _run_availability_batch_job(job_id: str, integrations: list, org: str = '',
             errors += result.get('errors') or 0
             no_snapshot += result.get('noSnapshot') or 0
             stale_latest += result.get('staleLatest') or 0
+            supplemental_units += result.get('supplementalUnits') or 0
+            supplemental_errors += result.get('supplementalErrors') or 0
+            wait_filtered += result.get('waitFiltered') or 0
             if result.get('filterNote'):
                 notes.append(f'{integration}: {result["filterNote"]}')
             if result.get('rolloutError'):
@@ -2453,6 +3546,9 @@ def _run_availability_batch_job(job_id: str, integrations: list, org: str = '',
                         'rowCount': len(combined_rows), 'unknownCount': unknown,
                         'staleLatest': stale_latest,
                         'freshnessHours': 24 if as_of is None else None,
+                        'supplementalUnits': supplemental_units,
+                        'supplementalErrors': supplemental_errors,
+                        'waitFiltered': wait_filtered,
                         'showUnknown': show_unknown, 'fields': combined_fields,
                         'preview': preview, 'noSnapshot': no_snapshot,
                         'errors': errors, 'filterNote': ' · '.join(dict.fromkeys(notes)),
@@ -2464,6 +3560,7 @@ def _run_availability_batch_job(job_id: str, integrations: list, org: str = '',
                         'limit': max_results,
                         'limited': bool(max_results is not None and
                                         len(combined_rows) >= max_results),
+                        'stopped': _job_stop_requested(job_id),
                         'includeStudents': include_students,
                         'includeApplications': include_applications,
                         'downloadUrl': f'/api/search/csv/{job_id}',
@@ -2475,6 +3572,9 @@ def _run_availability_batch_job(job_id: str, integrations: list, org: str = '',
             'showUnknown': show_unknown,
             'includeStudents': include_students,
             'includeApplications': include_applications,
+            'supplementalUnits': supplemental_units,
+            'supplementalErrors': supplemental_errors,
+            'waitFiltered': wait_filtered,
             'limit': max_results,
         })
     except Exception as e:
@@ -2730,15 +3830,51 @@ def index_build():
     integration = _safe_integration(body.get('integration', ''))
     if not integration:
         return jsonify({'error': 'integration required'}), 400
+    try:
+        sample_percent = int(body.get('samplePercent', 100))
+    except (TypeError, ValueError):
+        return jsonify({'error': 'samplePercent must be a whole number'}), 400
+    if sample_percent < 1 or sample_percent > 100:
+        return jsonify({'error': 'samplePercent must be between 1 and 100'}), 400
+    try:
+        reference_time = _parse_cutoff(
+            str(body.get('referenceTime') or '').strip())
+    except ValueError as e:
+        return jsonify({'error': str(e)}), 400
 
     existing = _running_job_for('index', integration)
     if existing:
         return jsonify({'jobId': existing, 'alreadyRunning': True})
 
     job_id = _job_new('index', integration)
-    threading.Thread(target=_run_index_job, args=(job_id, integration),
+    threading.Thread(target=_run_index_job,
+                     args=(job_id, integration, sample_percent, reference_time),
                      daemon=True).start()
     return jsonify({'jobId': job_id})
+
+
+@app.route('/api/index/companion', methods=['POST'])
+def index_companion():
+    if not _connected:
+        return jsonify({'error': 'Not connected'}), 401
+
+    body = request.get_json(silent=True) or {}
+    primary = _safe_integration(body.get('integration', ''))
+    if primary != 'RentCafe':
+        return jsonify({'error': 'Voyager companion indexing requires RentCafe'}), 400
+    if not _index_load(primary):
+        return jsonify({'error': 'no-index',
+                        'message': 'Build the RentCafe index first'}), 409
+
+    companion = 'YardiVoyager'
+    existing = _running_job_for('index', companion)
+    if existing:
+        return jsonify({'jobId': existing, 'alreadyRunning': True})
+
+    job_id = _job_new('index', companion)
+    threading.Thread(target=_run_companion_index_job,
+                     args=(job_id, primary, companion), daemon=True).start()
+    return jsonify({'jobId': job_id, 'integration': companion})
 
 
 @app.route('/api/search', methods=['POST'])
@@ -2753,6 +3889,14 @@ def search():
     org         = (body.get('org') or '').strip()
     buildings   = (body.get('buildings') or '').strip()
     as_of_raw   = (body.get('asOf') or '').strip()
+    include_students = body.get('includeStudents', False)
+
+    if not isinstance(include_students, bool):
+        return jsonify({'error': 'includeStudents must be a boolean'}), 400
+    try:
+        max_results = _parse_result_limit(body.get('limit'))
+    except ValueError as e:
+        return jsonify({'error': str(e)}), 400
 
     if mode not in ('text', 'fields'):
         return jsonify({'error': f'unknown mode {mode!r}'}), 400
@@ -2789,8 +3933,18 @@ def search():
             return jsonify({'error': 'at least one field is required'}), 400
 
         try:
+            primary_array_expansions = _normalize_array_expansion_requests(
+                body.get('arrayExpansions') or [])
             related_files = _normalize_related_files(body.get('relatedFiles') or [], integration)
             conditions = _normalize_conditions(body.get('conditions') or [], integration, related_files)
+            normalized_output_fields = _normalize_field_specs(raw_fields)
+            for rel in related_files:
+                _validate_join_object_scope(
+                    rel['primaryJoin'], normalized_output_fields,
+                    f'Primary join field for {rel["filename"]!r}')
+                _validate_join_object_scope(
+                    rel['relatedJoin'], rel['fields'],
+                    f'Related join field for {rel["filename"]!r}')
         except ValueError as e:
             return jsonify({'error': str(e)}), 400
         if any(rel['filename'] == file_name for rel in related_files):
@@ -2805,7 +3959,9 @@ def search():
         job_id = _job_new('fields', integration)
         threading.Thread(target=_run_fields_job,
                          args=(job_id, integration, file_name, raw_fields, org, buildings, as_of,
-                               unique, related_files, body.get('conditions') or []),
+                               include_students, max_results, unique,
+                               primary_array_expansions, related_files,
+                               body.get('conditions') or []),
                          daemon=True).start()
         return jsonify({'jobId': job_id, 'asOf': as_of.isoformat() if as_of else None})
 
@@ -2815,7 +3971,8 @@ def search():
 
     job_id = _job_new('search', integration)
     threading.Thread(target=_run_search_job,
-                     args=(job_id, integration, file_name, text, org, buildings, as_of),
+                     args=(job_id, integration, file_name, text, org, buildings, as_of,
+                           include_students, max_results),
                      daemon=True).start()
     return jsonify({'jobId': job_id, 'asOf': as_of.isoformat() if as_of else None})
 
@@ -2830,8 +3987,19 @@ def availability_agent():
     run_all = integration == '__all__'
     if not run_all and integration not in supported:
         return jsonify({'error': 'Availability Agent does not support this integration'}), 400
-    if not run_all and not _index_load(integration):
-        return jsonify({'error': 'no-index', 'message': f'Build an index for {integration} first'}), 409
+    index_scope = sorted(supported) if run_all else [integration]
+    index_states = {
+        name: _availability_index_freshness(name)[0]
+        for name in index_scope
+    }
+    missing = [name for name, state in index_states.items()
+               if state == 'missing']
+    if missing:
+        return jsonify({
+            'error': 'index-required',
+            'message': 'Index required (not indexed: ' + ', '.join(missing) + ')',
+            'integrations': missing,
+        }), 409
     try:
         as_of = _parse_cutoff((body.get('asOf') or '').strip())
     except ValueError as e:
@@ -2841,18 +4009,14 @@ def availability_agent():
         return jsonify({'error': 'showUnknown must be a boolean'}), 400
     include_students = body.get('includeStudents', False)
     include_applications = body.get('includeApplications', False)
-    if not isinstance(include_students, bool) or not isinstance(include_applications, bool):
-        return jsonify({'error': 'includeStudents and includeApplications must be booleans'}), 400
-    raw_limit = body.get('limit')
-    if raw_limit in (None, ''):
-        max_results = None
-    else:
-        try:
-            max_results = int(raw_limit)
-        except (TypeError, ValueError):
-            return jsonify({'error': 'limit must be a positive integer'}), 400
-        if max_results <= 0 or max_results > CSV_ROW_CAP:
-            return jsonify({'error': f'limit must be between 1 and {CSV_ROW_CAP:,}'}), 400
+    if (not isinstance(include_students, bool) or
+            not isinstance(include_applications, bool)):
+        return jsonify({'error': ('includeStudents and includeApplications '
+                                  'must be booleans')}), 400
+    try:
+        max_results = _parse_result_limit(body.get('limit'))
+    except ValueError as e:
+        return jsonify({'error': str(e)}), 400
 
     job_kind = 'availability_batch' if run_all else 'availability'
     existing = _running_job_for(job_kind, integration)
@@ -3036,6 +4200,22 @@ def job_status():
     if not job:
         return jsonify({'error': 'unknown job'}), 404
     return jsonify(job)
+
+
+@app.route('/api/job/stop', methods=['POST'])
+def stop_job():
+    body = request.get_json(silent=True) or {}
+    job_id = str(body.get('id') or '')
+    job = _job_get(job_id)
+    if not job:
+        return jsonify({'error': 'unknown job'}), 404
+    if job.get('kind') not in ('availability', 'availability_batch'):
+        return jsonify({'error': 'only availability jobs can be stopped'}), 400
+    if job.get('status') != 'running':
+        return jsonify({'ok': True, 'alreadyFinished': True})
+    _job_update(job_id, stopRequested=True,
+                note='Stop requested · preparing the collected rows…')
+    return jsonify({'ok': True})
 
 
 @app.route('/api/snowflake/health')
