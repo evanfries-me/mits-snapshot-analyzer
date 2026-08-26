@@ -3475,11 +3475,20 @@ def _run_availability_job(job_id: str, integration: str, org: str = '',
                     pass
                 predicted = None
                 reason = None
-                if rules.get('predict_unit_details_only'):
+                # A wait-list/tour placeholder can appear directly in
+                # unit_details (Voyager's WAIT/WAITC/WAITTOUR) with no
+                # availability-feed counterpart. Evaluate it via the rules
+                # regardless of predict_unit_details_only so it gets a real,
+                # rules-driven reason instead of a blank "no matching rule" --
+                # the same outcome the sync issues probe already produces.
+                is_wait_unit = _availability_named_wait_unit(
+                    actual_row, actual_key + ['unit_number', 'unitNumber'])
+                if rules.get('predict_unit_details_only') or is_wait_unit:
                     values = dict(actual_row)
                     # No availability-feed row: primary fields are absent, not
                     # empty, so field tests over them must not fire.
                     values['__primary_row'] = False
+                    values['__wait_unit'] = is_wait_unit
                     values['__supplemental_snapshot_missing'] = not bool(
                         supplemental_targets)
                     values['__supplemental_unit_missing'] = bool(
@@ -4732,16 +4741,14 @@ def _run_sync_issues_analyze_job(job_id: str, syncs: list):
                     unit_key_parts = _availability_keys(actual_row, actual_key)
                     unit_key = str(unit_key_parts[0]) if unit_key_parts else None
 
-                    # unit_details is a PMS export, so a wait-list placeholder
-                    # can appear there directly (Voyager's WAIT/WAITUNIT) even
-                    # though it never reaches the availability feed. The
-                    # primary-side wait filter above only ever protects units
-                    # that come through the primary feed; a placeholder that
-                    # lives solely in the actual file needs its own check here
-                    # so it is excluded for every integration alike.
-                    if _availability_named_wait_unit(
-                            actual_row, actual_key + ['unit_number', 'unitNumber']):
-                        continue
+                    # unit_details is a PMS export, so a wait-list/tour
+                    # placeholder can appear there directly (Voyager's
+                    # WAIT/WAITC/WAITUNIT) with no availability-feed
+                    # counterpart. It is still a real row the sync marked
+                    # unavailable, so it is counted and classified via the
+                    # rules' own __wait_unit override below -- not skipped.
+                    is_wait_unit = _availability_named_wait_unit(
+                        actual_row, actual_key + ['unit_number', 'unitNumber'])
 
                     local_stage_9  += 1
                     local_analyzed += 1
@@ -4752,6 +4759,7 @@ def _run_sync_issues_analyze_job(job_id: str, syncs: list):
                     if p_row:
                         values = dict(p_row)
                         values['__primary_row'] = True
+                        values['__wait_unit'] = is_wait_unit
                         values['__current_date'] = ref_date.isoformat()
                         for k, v in p_row.items():
                             values[f'primary__{k}'] = v
@@ -4774,6 +4782,7 @@ def _run_sync_issues_analyze_job(job_id: str, syncs: list):
                         # unit_details with no availability-feed row at all.
                         values = dict(actual_row)
                         values['__primary_row'] = False
+                        values['__wait_unit'] = is_wait_unit
                         values['__current_date'] = ref_date.isoformat()
                         values['__supplemental_snapshot_missing'] = (
                             not bool(supplemental_targets))
