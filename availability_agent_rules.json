@@ -119,8 +119,7 @@
         {"stage": 9, "reason": "Retail unit", "when": [{"field": "UnitNumber", "op": "contains", "value": "retail"}]},
         {"stage": 9, "reason": "Future availability cutoff", "when": [{"field": "MadeReadyDate", "op": "future_days", "value": 365}]},
         {"stage": 9, "reason": "Invalid Rent", "when": [{"field": "__primary_row", "op": "truthy"}, {"field": "EffectiveRent", "op": "invalid_rent"}], "_source": "__primary_row: true only when this identity has a matching row in the raw primary availability feed for this integration; guards against a field that is absent (not present in the raw API response) being misread as an invalid value."},
-        {"stage": 9, "reason": "Invalid square footage", "when": [{"field": "RentSqFtCount", "op": "invalid_sqft"}]},
-        {"stage": 9, "reason": "Waitlist or Tour Placeholder Unit", "replace_reason": true, "when": [{"field": "__wait_unit", "op": "truthy"}], "_source": "__wait_unit: true when the raw PMS identity field named in unit_name_fields (e.g. Voyager's AllUnits_Login/AvailableUnits_Login @IDValue, RentCafe's apartmentName) contains the substring wait -- a tour-scheduling or waitlist placeholder the PMS itself tracks as a pseudo-unit in its raw feed."}
+        {"stage": 9, "reason": "Invalid square footage", "when": [{"field": "RentSqFtCount", "op": "invalid_sqft"}]}
       ]
     },
     "Entrata": {
@@ -146,8 +145,7 @@
       "overrides": [
         {"stage": 9, "reason": "Missing available date", "when": [{"any": [{"field": "Availability", "op": "truthy"}, {"field": "availabilityStatus", "op": "truthy"}]}, {"all": [{"field": "AvailableOn", "op": "missing"}, {"field": "availableDate", "op": "missing"}]}]},
         {"stage": 9, "reason": "Future availability cutoff", "when": [{"field": "__direct_stage", "op": "stage_in", "value": [0, 1]}, {"field": "AvailableOn", "op": "future_days", "value": 365}], "_source": "__direct_stage: the stage this integration's own direct/direct_rules mapping (declared above) assigns from the raw PMS status field, before any override runs -- not a separate input."},
-        {"stage": 9, "reason": "Invalid square footage", "when": [{"field": "Area", "op": "invalid_sqft"}]},
-        {"stage": 9, "reason": "Waitlist or Tour Placeholder Unit", "replace_reason": true, "when": [{"field": "__wait_unit", "op": "truthy"}], "_source": "__wait_unit: true when the raw PMS identity field named in unit_name_fields (e.g. Voyager's AllUnits_Login/AvailableUnits_Login @IDValue, RentCafe's apartmentName) contains the substring wait -- a tour-scheduling or waitlist placeholder the PMS itself tracks as a pseudo-unit in its raw feed."}
+        {"stage": 9, "reason": "Invalid square footage", "when": [{"field": "Area", "op": "invalid_sqft"}]}
       ]
     },
     "AppFolio": {
@@ -179,8 +177,7 @@
         {"stage": 9, "reason": "Missing Available Date", "when": [{"field": "AvailableOn", "op": "missing"}]},
         {"stage": 9, "reason": "Future Availability Cutoff: 1 Year", "when": [{"field": "__direct_stage", "op": "stage_in", "value": [0, 1]}, {"field": "AvailableOn", "op": "future_days", "value": 365}], "_source": "__direct_stage: the stage this integration's own direct/direct_rules mapping (declared above) assigns from the raw PMS status field, before any override runs -- not a separate input."},
         {"stage": 9, "reason": "Invalid Rent", "when": [{"all": [{"field": "ListedRent", "op": "invalid_rent"}, {"field": "MarketRent", "op": "invalid_rent"}]}]},
-        {"stage": 9, "reason": "Invalid Square Footage", "when": [{"field": "SquareFeet", "op": "invalid_sqft"}]},
-        {"stage": 9, "reason": "Waitlist or Tour Placeholder Unit", "replace_reason": true, "when": [{"field": "__wait_unit", "op": "truthy"}], "_source": "__wait_unit: true when the raw PMS identity field named in unit_name_fields (e.g. Voyager's AllUnits_Login/AvailableUnits_Login @IDValue, RentCafe's apartmentName) contains the substring wait -- a tour-scheduling or waitlist placeholder the PMS itself tracks as a pseudo-unit in its raw feed."}
+        {"stage": 9, "reason": "Invalid Square Footage", "when": [{"field": "SquareFeet", "op": "invalid_sqft"}]}
       ]
     },
     "ResMan": {
@@ -206,8 +203,7 @@
         {"stage": 9, "reason": "Future availability cutoff", "when": [{"field": "__direct_stage", "op": "stage_in", "value": [0, 1]}, {"field": "MadeReadyDate", "op": "future_days", "value": 365}], "_source": "__direct_stage: the stage this integration's own direct/direct_rules mapping (declared above) assigns from the raw PMS status field, before any override runs -- not a separate input."},
         {"stage": 9, "reason": "Unsupported or leased status", "when": [{"field": "UnitLeasedStatus", "op": "missing"}]},
         {"stage": 9, "reason": "Invalid Rent", "when": [{"field": "__primary_row", "op": "truthy"}, {"field": "EffectiveRent", "op": "invalid_rent"}], "_source": "__primary_row: true only when this identity has a matching row in the raw primary availability feed for this integration; guards against a field that is absent (not present in the raw API response) being misread as an invalid value."},
-        {"stage": 9, "reason": "Invalid square footage", "when": [{"field": "MinSquareFeet", "op": "invalid_sqft"}]},
-        {"stage": 9, "reason": "Waitlist or Tour Placeholder Unit", "replace_reason": true, "when": [{"field": "__wait_unit", "op": "truthy"}], "_source": "__wait_unit: true when the raw PMS identity field named in unit_name_fields (e.g. Voyager's AllUnits_Login/AvailableUnits_Login @IDValue, RentCafe's apartmentName) contains the substring wait -- a tour-scheduling or waitlist placeholder the PMS itself tracks as a pseudo-unit in its raw feed."}
+        {"stage": 9, "reason": "Invalid square footage", "when": [{"field": "MinSquareFeet", "op": "invalid_sqft"}]}
       ]
     },
     "EQR MRI": {
@@ -230,8 +226,7 @@
       "overrides": [
         {"stage": 9, "reason": "Missing made-ready date", "when": [{"field": "EarliestAvailable", "op": "missing"}, {"field": "MakeReadyDate", "op": "missing"}]},
         {"stage": 9, "reason": "Invalid Rent", "when": [{"field": "__primary_row", "op": "truthy"}, {"field": "HTPRent", "op": "invalid_rent"}], "_source": "__primary_row: true only when this identity has a matching row in the raw primary availability feed for this integration; guards against a field that is absent (not present in the raw API response) being misread as an invalid value."},
-        {"stage": 9, "reason": "Invalid square footage", "when": [{"field": "SquareFeet", "op": "invalid_sqft"}]},
-        {"stage": 9, "reason": "Waitlist or Tour Placeholder Unit", "replace_reason": true, "when": [{"field": "__wait_unit", "op": "truthy"}], "_source": "__wait_unit: true when the raw PMS identity field named in unit_name_fields (e.g. Voyager's AllUnits_Login/AvailableUnits_Login @IDValue, RentCafe's apartmentName) contains the substring wait -- a tour-scheduling or waitlist placeholder the PMS itself tracks as a pseudo-unit in its raw feed."}
+        {"stage": 9, "reason": "Invalid square footage", "when": [{"field": "SquareFeet", "op": "invalid_sqft"}]}
       ]
     },
     "AVB": {
@@ -248,8 +243,7 @@
       "overrides": [
         {"stage": 9, "reason": "Missing available date", "when": [{"field": "availableDateUnfurnished", "op": "missing"}, {"field": "availableDateFurnished", "op": "missing"}]},
         {"stage": 9, "reason": "Future availability cutoff", "when": [{"field": "availableDateUnfurnished", "op": "future_days", "value": 365}]},
-        {"stage": 9, "reason": "Invalid square footage", "when": [{"field": "squareFeet", "op": "invalid_sqft"}]},
-        {"stage": 9, "reason": "Waitlist or Tour Placeholder Unit", "replace_reason": true, "when": [{"field": "__wait_unit", "op": "truthy"}], "_source": "__wait_unit: true when the raw PMS identity field named in unit_name_fields (e.g. Voyager's AllUnits_Login/AvailableUnits_Login @IDValue, RentCafe's apartmentName) contains the substring wait -- a tour-scheduling or waitlist placeholder the PMS itself tracks as a pseudo-unit in its raw feed."}
+        {"stage": 9, "reason": "Invalid square footage", "when": [{"field": "squareFeet", "op": "invalid_sqft"}]}
       ]
     }
   }
