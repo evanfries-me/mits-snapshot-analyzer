@@ -342,6 +342,7 @@ window.addEventListener('DOMContentLoaded', () => {
   document.getElementById('agent-asof').addEventListener('input', renderAgentAsOfFeedback);
   document.getElementById('agent-include-students').addEventListener('change', syncAvailabilityButton);
   document.getElementById('agent-include-applications').addEventListener('change', syncAvailabilityButton);
+  document.getElementById('agent-include-not-launched-leasing').addEventListener('change', syncAvailabilityButton);
   document.getElementById('agent-limit').addEventListener('input', renderAgentLimitFeedback);
 
   // Preview actions + retry
@@ -1798,6 +1799,7 @@ async function runAvailabilityAgent() {
       showUnknown: document.getElementById('agent-show-unknown').checked,
       includeStudents: document.getElementById('agent-include-students').checked,
       includeApplications: document.getElementById('agent-include-applications').checked,
+      includeNotLaunchedOnLeasing: document.getElementById('agent-include-not-launched-leasing').checked,
       limit: document.getElementById('agent-limit').value.trim(),
       org: document.getElementById('agent-sel-org').value,
       buildings: document.getElementById('agent-buildings').value,
@@ -2029,6 +2031,7 @@ function renderAvailabilityResult(data) {
   if (data.showUnknown) bits.push('showing unknown mappings only');
   if (data.includeStudents === false) bits.push('student communities excluded');
   if (data.includeApplications === false) bits.push('Applications-launched communities excluded');
+  if (data.includeNotLaunchedOnLeasing === false) bits.push('communities not launched on Leasing excluded');
   if (data.supplementalUnits) bits.push(`${data.supplementalUnits.toLocaleString()} Voyager-only unit${data.supplementalUnits !== 1 ? 's' : ''} added as Lease Signed`);
   if (data.supplementalErrors) bits.push(`${data.supplementalErrors.toLocaleString()} Voyager supplement${data.supplementalErrors !== 1 ? 's' : ''} unreadable`);
   if (data.waitFiltered) bits.push(`${data.waitFiltered.toLocaleString()} unit${data.waitFiltered !== 1 ? 's' : ''} with “wait” in the name excluded`);

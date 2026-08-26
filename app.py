@@ -1679,7 +1679,8 @@ def _extract_rows_v2(body: str, specs: list, dynamic_parents: set):
 
 def _resolve_org_building_filter(org: str, building_filter: str,
                                  exclude_students: bool = False,
-                                 exclude_applications: bool = False):
+                                 exclude_applications: bool = False,
+                                 require_launched_on_leasing: bool = False):
     """Shared by every search mode: -> (allowed_entity_set_or_None, filter_note)."""
     allowed = None
     notes = []
@@ -1704,6 +1705,12 @@ def _resolve_org_building_filter(org: str, building_filter: str,
             # Search remains useful without optional Snowflake filters;
             # surface the reason in the summary instead of failing the S3 job.
             notes.append(str(e))
+    if require_launched_on_leasing:
+        try:
+            launched = snowflake_db.launched_on_leasing_building_ids()
+            allowed = launched if allowed is None else (allowed & launched)
+        except Exception as e:
+            notes.append(f'Leasing-launch filter unavailable: {e}')
     return allowed, ' · '.join(dict.fromkeys(notes))
 
 
@@ -2466,6 +2473,48 @@ def _availability_matching_files(files, integration: str, candidates: list):
     return matches
 
 
+def _availability_primary_files(files, integration: str, candidates: list) -> list:
+    """Every physical file for the first primary/actual candidate name that
+    has any match in this snapshot -- preferring an earlier candidate (e.g.
+    Voyager's AvailableUnits_Login over its AllUnits_Login fallback) but
+    taking every property-code variant of that chosen candidate, not just
+    one.
+
+    A single MITS building can be backed by more than one property on the
+    PMS side (RealPage's getunitlist_<site>.xml.gz, Voyager's
+    AvailableUnits_Login_<property>.xml.gz) -- each its own physical file.
+    Taking only the first (_availability_first_file) silently dropped every
+    unit belonging to the other properties.
+    """
+    for candidate in candidates or []:
+        matches = _availability_matching_files(files, integration, [candidate])
+        if matches:
+            return matches
+    return []
+
+
+def _availability_source_lookup(source_by_key: dict, source: dict,
+                                primary_row: dict, primary_key: list) -> dict:
+    """Look up a `sources` entry's enrichment row for `primary_row`.
+
+    Keyed by (file property code, join-key value) so a multi-property-code
+    source (RealPage's getallunits split by site, Voyager's AllUnits_Login
+    split by property) never crosses property boundaries -- the same local
+    UnitNumber/@IDValue can exist independently in more than one property
+    backing a single building. Integrations with no property-code concept
+    key everything under a None code, which is the pre-existing behavior.
+    """
+    keyed = source_by_key.get(source['file']) or {}
+    code = primary_row.get('__file_property_code')
+    source_keys = _availability_keys(
+        primary_row, source.get('primary_key') or primary_key)
+    related = next((keyed[(code, k)] for k in source_keys
+                    if (code, k) in keyed), None)
+    if related is None:
+        related = keyed.get((code, '__all__'))
+    return related or {}
+
+
 def _availability_value(row: dict, field: str):
     """Read a field from a row, including nested JSON stored as a string.
 
@@ -3072,6 +3121,7 @@ def _run_availability_job(job_id: str, integration: str, org: str = '',
                           show_unknown: bool = False,
                           include_students: bool = True,
                           include_applications: bool = True,
+                          include_not_launched_on_leasing: bool = True,
                           max_results: int | None = None,
                           record_history: bool = True,
                           stop_job_id: str | None = None):
@@ -3095,6 +3145,8 @@ def _run_availability_job(job_id: str, integration: str, org: str = '',
             filter_bits.append('student-community exclusion')
         if not include_applications:
             filter_bits.append('Applications exclusion')
+        if not include_not_launched_on_leasing:
+            filter_bits.append('not-launched-on-Leasing exclusion')
         _job_update(
             job_id,
             note=('Applying ' + ', '.join(filter_bits) + ' filters…'
@@ -3102,7 +3154,8 @@ def _run_availability_job(job_id: str, integration: str, org: str = '',
         allowed, filter_note = _resolve_org_building_filter(
             org, building_filter,
             exclude_students=not include_students,
-            exclude_applications=not include_applications)
+            exclude_applications=not include_applications,
+            require_launched_on_leasing=not include_not_launched_on_leasing)
         primary_candidates = rules.get('primary') or []
         actual_candidates = rules.get('actual') or []
         supplemental_config = rules.get('supplemental_units') or {}
@@ -3121,14 +3174,14 @@ def _run_availability_job(job_id: str, integration: str, org: str = '',
         for entity, (snapshot, files) in entities.items():
             if allowed is not None and entity not in allowed:
                 continue
-            primary_actual = _availability_first_file(
+            primary_files = _availability_primary_files(
                 files, source_integration, primary_candidates)
             unit_details_actual = _availability_first_file(
                 files, source_integration, actual_candidates)
             if unit_details_actual:
-                targets.append((entity, snapshot, primary_actual, files))
+                targets.append((entity, snapshot, primary_files, files))
             elif as_of is not None:
-                targets.append((entity, None, None, []))
+                targets.append((entity, None, [], []))
         targets.sort()
         _job_update(job_id, total=len(targets),
                     note=f'Selected {len(targets):,} candidate buildings…')
@@ -3195,7 +3248,7 @@ def _run_availability_job(job_id: str, integration: str, org: str = '',
             nonlocal errors, no_snapshot, supplemental_errors, supplemental_units, wait_filtered
             if cap_hit['flag'] or _job_stop_requested(control_job_id):
                 return
-            entity, snapshot, primary_actual, snapshot_files = target
+            entity, snapshot, primary_files, snapshot_files = target
             entity_prefix = f'{ROOT}{source_integration}/{entity}/'
             if as_of is not None:
                 snap_prefix = _snapshot_prefix_before(entity_prefix, as_of)
@@ -3206,7 +3259,7 @@ def _run_availability_job(job_id: str, integration: str, org: str = '',
                     return
                 snapshot = snap_prefix[len(entity_prefix):].rstrip('/')
                 snapshot_files = _snapshot_files(entity_prefix, snapshot)
-                primary_actual = _availability_first_file(
+                primary_files = _availability_primary_files(
                     snapshot_files, source_integration, primary_candidates)
             actual_actual = _availability_first_file(
                 snapshot_files, source_integration, actual_candidates)
@@ -3227,54 +3280,55 @@ def _run_availability_job(job_id: str, integration: str, org: str = '',
             primary_rows = []
             source_rows = {source['file']: [] for source in source_configs}
             raw_errors = 0
-            if primary_actual:
+            # A single MITS building can be backed by more than one PMS
+            # property (RealPage's getunitlist_<site>, Voyager's
+            # AvailableUnits_Login_<property>) -- read every variant, each
+            # tagged with its own property code so identities never collide.
+            for primary_actual in primary_files:
                 try:
                     primary_body = _fetch_text(
                         f'{ROOT}{source_integration}/{entity}/{snapshot}/{primary_actual}')
-                    primary_rows = _availability_extract(
+                    rows = _availability_extract(
                         primary_body, source_fields['primary'],
                         voyager_units=integration == 'Voyager',
                         realpage_units=integration == 'RealPage')
                     file_property_code = _availability_file_property_code(
                         primary_actual, primary_candidates)
                     if file_property_code:
-                        for row in primary_rows:
+                        for row in rows:
                             row['__file_property_code'] = file_property_code
+                    primary_rows.extend(rows)
                 except Exception:
                     raw_errors += 1
-                    primary_rows = []
             for source in source_configs:
-                actual_source = _availability_file_variant(
-                    snapshot_files, source_integration, source['file'])
-                if actual_source:
+                actual_sources = _availability_matching_files(
+                    snapshot_files, source_integration, [source['file']])
+                for actual_source in actual_sources:
                     try:
                         source_body = _fetch_text(
                             f'{ROOT}{source_integration}/{entity}/{snapshot}/{actual_source}')
-                        source_rows[source['file']] = _availability_extract(
+                        rows = _availability_extract(
                             source_body, source_fields[source['file']],
                             voyager_units=(integration == 'Voyager' and
                                            source['file'].startswith(
                                                ('AllUnits_Login', 'AvailableUnits_Login'))),
                             realpage_units=integration == 'RealPage')
-                        if source.get('add_missing_as_units'):
-                            # e.g. RealPage's getallunits: a same-integration
-                            # all-units feed that carries units getunitlist
-                            # omits, keyed by the same raw UnitID.
-                            file_property_code = _availability_file_property_code(
-                                actual_source, [source['file']])
-                            tagged_rows = []
-                            for row in source_rows[source['file']]:
-                                row = dict(row)
-                                if (file_property_code and
-                                        not row.get('__file_property_code')):
-                                    row['__file_property_code'] = file_property_code
-                                tagged_rows.append(row)
-                            primary_rows.extend(
-                                _availability_promote_missing_source_units(
-                                    primary_rows, tagged_rows, rules))
+                        file_property_code = _availability_file_property_code(
+                            actual_source, [source['file']])
+                        if file_property_code:
+                            for row in rows:
+                                row['__file_property_code'] = file_property_code
+                        source_rows[source['file']].extend(rows)
                     except Exception:
                         raw_errors += 1
-                        source_rows[source['file']] = []
+                if source.get('add_missing_as_units'):
+                    # e.g. RealPage's getallunits: a same-integration
+                    # all-units feed that carries units getunitlist omits,
+                    # keyed by the same raw UnitID. Every property-code
+                    # variant of this source is already loaded above.
+                    primary_rows.extend(
+                        _availability_promote_missing_source_units(
+                            primary_rows, source_rows[source['file']], rules))
             rentcafe_codes = {
                 str(code).strip()
                 for row in primary_rows
@@ -3331,13 +3385,25 @@ def _run_availability_job(job_id: str, integration: str, org: str = '',
                     actual_by_key.setdefault(key, (actual_index, row))
             source_by_key = {}
             for source in source_configs:
+                # Keyed by (file property code, join-key value): a
+                # multi-property-code source must never let one property's
+                # row enrich another property's unit just because their
+                # local UnitNumber/@IDValue happens to coincide.
                 keyed = {}
                 join_key = source.get('join_key')
-                for row in source_rows[source['file']]:
+                rows_for_file = source_rows[source['file']]
+                for row in rows_for_file:
+                    code = row.get('__file_property_code')
                     for key in _availability_keys(row, join_key or []):
-                        keyed.setdefault(key, row)
-                if not join_key and source_rows[source['file']]:
-                    keyed['__all__'] = source_rows[source['file']][0]
+                        keyed.setdefault((code, key), row)
+                if not join_key:
+                    seen_codes = set()
+                    for row in rows_for_file:
+                        code = row.get('__file_property_code')
+                        if code in seen_codes:
+                            continue
+                        seen_codes.add(code)
+                        keyed[(code, '__all__')] = row
                 source_by_key[source['file']] = keyed
 
             produced = []
@@ -3442,13 +3508,8 @@ def _run_availability_job(job_id: str, integration: str, org: str = '',
                             (rollout_config or {}).get('default', 'disabled'))
                     values[f'__rollout__{rollout_name}'] = variant
                 for source in source_configs:
-                    source_primary_keys = _availability_keys(
-                        primary_row, source.get('primary_key') or primary_key)
-                    related = next((source_by_key[source['file']][key]
-                                    for key in source_primary_keys
-                                    if key in source_by_key[source['file']]), None)
-                    if related is None:
-                        related = source_by_key[source['file']].get('__all__')
+                    related = _availability_source_lookup(
+                        source_by_key, source, primary_row, primary_key)
                     if related:
                         for key, value in related.items():
                             values.setdefault(key, value)
@@ -3492,12 +3553,8 @@ def _run_availability_job(job_id: str, integration: str, org: str = '',
                 for field in source_fields['primary']:
                     output[f'primary__{field}'] = _availability_value(primary_row, field)
                 for source in source_configs:
-                    source_primary_keys = _availability_keys(
-                        primary_row, source.get('primary_key') or primary_key)
-                    related = next((source_by_key[source['file']][key]
-                                    for key in source_primary_keys
-                                    if key in source_by_key[source['file']]), None)
-                    related = related or source_by_key[source['file']].get('__all__') or {}
+                    related = _availability_source_lookup(
+                        source_by_key, source, primary_row, primary_key)
                     for field in source_fields[source['file']]:
                         output[f"{source['file']}__{field}"] = _availability_value(related, field)
                 for field in actual_fields:
@@ -3699,6 +3756,7 @@ def _run_availability_job(job_id: str, integration: str, org: str = '',
             'stopped': _job_stop_requested(control_job_id),
             'includeStudents': include_students,
             'includeApplications': include_applications,
+            'includeNotLaunchedOnLeasing': include_not_launched_on_leasing,
             'supplementalUnits': supplemental_units,
             'supplementalErrors': supplemental_errors,
             'waitFiltered': wait_filtered,
@@ -3718,6 +3776,7 @@ def _run_availability_job(job_id: str, integration: str, org: str = '',
                 'showUnknown': show_unknown,
                 'includeStudents': include_students,
                 'includeApplications': include_applications,
+                'includeNotLaunchedOnLeasing': include_not_launched_on_leasing,
                 'supplementalUnits': supplemental_units,
                 'supplementalErrors': supplemental_errors,
                 'waitFiltered': wait_filtered,
@@ -3732,6 +3791,7 @@ def _run_availability_batch_job(job_id: str, integrations: list, org: str = '',
                                 show_unknown: bool = False,
                                 include_students: bool = False,
                                 include_applications: bool = False,
+                                include_not_launched_on_leasing: bool = False,
                                 max_results: int | None = None):
     """Run the cataloged integrations sequentially and combine their CSVs.
 
@@ -3789,7 +3849,8 @@ def _run_availability_batch_job(job_id: str, integrations: list, org: str = '',
                         note=f'Checking {integration}…')
             _run_availability_job(
                 child_id, integration, org, building_filter, as_of, show_unknown,
-                include_students, include_applications, remaining, False, job_id)
+                include_students, include_applications,
+                include_not_launched_on_leasing, remaining, False, job_id)
             child = _job_get(child_id) or {}
             if child.get('status') != 'done' or not child.get('result'):
                 failed.append(integration)
@@ -3854,6 +3915,7 @@ def _run_availability_batch_job(job_id: str, integrations: list, org: str = '',
                         'stopped': _job_stop_requested(job_id),
                         'includeStudents': include_students,
                         'includeApplications': include_applications,
+                        'includeNotLaunchedOnLeasing': include_not_launched_on_leasing,
                         'downloadUrl': f'/api/search/csv/{job_id}',
                     })
         _history_record(job_id, 'availability', _job_get(job_id)['result'], {
@@ -3863,6 +3925,7 @@ def _run_availability_batch_job(job_id: str, integrations: list, org: str = '',
             'showUnknown': show_unknown,
             'includeStudents': include_students,
             'includeApplications': include_applications,
+            'includeNotLaunchedOnLeasing': include_not_launched_on_leasing,
             'supplementalUnits': supplemental_units,
             'supplementalErrors': supplemental_errors,
             'waitFiltered': wait_filtered,
@@ -4523,7 +4586,7 @@ def _run_sync_issues_analyze_job(job_id: str, syncs: list):
                 # Pulled purely for display alongside the join key.
                 ['unit_number', 'unitNumber']))
 
-            primary_actual = _availability_first_file(
+            primary_files  = _availability_primary_files(
                 snapshot_files, source_integration, primary_candidates)
             actual_actual  = _availability_first_file(
                 snapshot_files, source_integration, actual_candidates)
@@ -4543,24 +4606,29 @@ def _run_sync_issues_analyze_job(job_id: str, syncs: list):
                         skip_reason=f'Could not read {actual_actual}: {exc}')
                 return
 
+            # A single MITS building can be backed by more than one PMS
+            # property (RealPage's getunitlist_<site>, Voyager's
+            # AvailableUnits_Login_<property>) -- read every variant, each
+            # tagged with its own property code so identities never collide.
+            # Voyager's unit_key is (file property code, @IDValue), so
+            # without the tag the composite key is None for every row and
+            # nothing joins.
             primary_rows = []
-            if primary_actual:
+            for primary_actual in primary_files:
                 try:
                     primary_body = _fetch_text(f'{s3base}{primary_actual}')
-                    primary_rows = _availability_extract(
+                    rows = _availability_extract(
                         primary_body, primary_fields,
                         voyager_units=(integration == 'Voyager'),
                         realpage_units=(integration == 'RealPage'))
-                    # Voyager's unit_key is (file property code, @IDValue), so
-                    # without this the composite key is None for every row and
-                    # nothing joins.
                     file_property_code = _availability_file_property_code(
                         primary_actual, primary_candidates)
                     if file_property_code:
-                        for row in primary_rows:
+                        for row in rows:
                             row['__file_property_code'] = file_property_code
+                    primary_rows.extend(rows)
                 except Exception:
-                    primary_rows = []
+                    pass
 
             # ── Supplemental PMS feed (Voyager AllUnits_Login for RentCafe) ───
             # Units the PMS knows about but the availability feed dropped have
@@ -4613,12 +4681,15 @@ def _run_sync_issues_analyze_job(job_id: str, syncs: list):
             }
             source_by_key: dict = {}
             for sc in source_configs:
+                # A single MITS building can be backed by more than one PMS
+                # property, so every property-code variant of this source is
+                # read, each tagged with its own code.
                 rows_for_file: list = []
-                variant = _availability_file_variant(
-                    snapshot_files, source_integration, sc['file'])
-                if variant:
+                variants = _availability_matching_files(
+                    snapshot_files, source_integration, [sc['file']])
+                for variant in variants:
                     try:
-                        rows_for_file = _availability_extract(
+                        rows = _availability_extract(
                             _fetch_text(f'{s3base}{variant}'),
                             source_fields_map[sc['file']],
                             voyager_units=(
@@ -4626,32 +4697,39 @@ def _run_sync_issues_analyze_job(job_id: str, syncs: list):
                                 sc['file'].startswith(
                                     ('AllUnits_Login', 'AvailableUnits_Login'))),
                             realpage_units=integration == 'RealPage')
+                        file_property_code = _availability_file_property_code(
+                            variant, [sc['file']])
+                        if file_property_code:
+                            for row in rows:
+                                row['__file_property_code'] = file_property_code
+                        rows_for_file.extend(rows)
                     except Exception:
-                        rows_for_file = []
+                        pass
                 if sc.get('add_missing_as_units') and rows_for_file:
                     # e.g. RealPage's getallunits: a same-integration
                     # all-units feed that carries units getunitlist omits,
                     # keyed by the same raw UnitID.
-                    file_property_code = (
-                        _availability_file_property_code(variant, [sc['file']])
-                        if variant else None)
-                    tagged_rows = []
-                    for row in rows_for_file:
-                        row = dict(row)
-                        if (file_property_code and
-                                not row.get('__file_property_code')):
-                            row['__file_property_code'] = file_property_code
-                        tagged_rows.append(row)
                     primary_rows.extend(
                         _availability_promote_missing_source_units(
-                            primary_rows, tagged_rows, rules))
+                            primary_rows, rows_for_file, rules))
+                # Keyed by (file property code, join-key value): a
+                # multi-property-code source must never let one property's
+                # row enrich another property's unit just because their
+                # local UnitNumber/@IDValue happens to coincide.
                 keyed: dict = {}
                 join_key = sc.get('join_key')
                 for row in rows_for_file:
+                    code = row.get('__file_property_code')
                     for key in _availability_keys(row, join_key or []):
-                        keyed.setdefault(key, row)
-                if not join_key and rows_for_file:
-                    keyed['__all__'] = rows_for_file[0]
+                        keyed.setdefault((code, key), row)
+                if not join_key:
+                    seen_codes = set()
+                    for row in rows_for_file:
+                        code = row.get('__file_property_code')
+                        if code in seen_codes:
+                            continue
+                        seen_codes.add(code)
+                        keyed[(code, '__all__')] = row
                 source_by_key[sc['file']] = keyed
 
             # ── Pre-sync baseline ─────────────────────────────────────────────
@@ -4823,13 +4901,8 @@ def _run_sync_issues_analyze_job(job_id: str, syncs: list):
                         for k, v in p_row.items():
                             values[f'primary__{k}'] = v
                         for sc in source_configs:
-                            keyed = source_by_key.get(sc['file'], {})
-                            src_keys = _availability_keys(
-                                p_row, sc.get('primary_key') or primary_key)
-                            related = next((keyed[k] for k in src_keys
-                                            if k in keyed), None)
-                            if related is None:
-                                related = keyed.get('__all__')
+                            related = _availability_source_lookup(
+                                source_by_key, sc, p_row, primary_key)
                             if related:
                                 for k, v in related.items():
                                     values.setdefault(k, v)
@@ -5374,10 +5447,13 @@ def availability_agent():
         return jsonify({'error': 'showUnknown must be a boolean'}), 400
     include_students = body.get('includeStudents', False)
     include_applications = body.get('includeApplications', False)
+    include_not_launched_on_leasing = body.get('includeNotLaunchedOnLeasing', False)
     if (not isinstance(include_students, bool) or
-            not isinstance(include_applications, bool)):
-        return jsonify({'error': ('includeStudents and includeApplications '
-                                  'must be booleans')}), 400
+            not isinstance(include_applications, bool) or
+            not isinstance(include_not_launched_on_leasing, bool)):
+        return jsonify({'error': ('includeStudents, includeApplications, and '
+                                  'includeNotLaunchedOnLeasing must be '
+                                  'booleans')}), 400
     try:
         max_results = _parse_result_limit(body.get('limit'))
     except ValueError as e:
@@ -5390,7 +5466,8 @@ def availability_agent():
     job_id = _job_new(job_kind, integration)
     common_args = ((body.get('org') or '').strip(),
                    (body.get('buildings') or '').strip(), as_of, show_unknown,
-                   include_students, include_applications, max_results)
+                   include_students, include_applications,
+                   include_not_launched_on_leasing, max_results)
     if run_all:
         threading.Thread(
             target=_run_availability_batch_job,
