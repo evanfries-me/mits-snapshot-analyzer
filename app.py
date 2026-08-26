@@ -2852,13 +2852,24 @@ def _availability_unit_key(row: dict, rule: dict,
     return '-'.join(parts).casefold() if parts else None
 
 
-def _availability_wait_unit(row: dict, rule: dict) -> bool:
-    """Exclude placeholder/wait-list unit names without inspecting status text."""
-    for field in rule.get('unit_name_fields') or []:
+def _availability_named_wait_unit(row: dict, name_fields: list) -> bool:
+    """True if any of `name_fields` on `row` reads as a wait-list placeholder.
+
+    Split out from `_availability_wait_unit` so the same "wait" substring test
+    can run against fields that live on a row other than the primary feed —
+    e.g. an actual/unit_details row, which does not carry `unit_name_fields`
+    (a primary-feed concept) at all.
+    """
+    for field in name_fields or []:
         value = _availability_value(row, field)
         if value is not None and 'wait' in str(value).casefold():
             return True
     return False
+
+
+def _availability_wait_unit(row: dict, rule: dict) -> bool:
+    """Exclude placeholder/wait-list unit names without inspecting status text."""
+    return _availability_named_wait_unit(row, rule.get('unit_name_fields'))
 
 
 def _availability_file_property_code(filename: str, candidates: list):
@@ -4720,6 +4731,17 @@ def _run_sync_issues_analyze_job(job_id: str, syncs: list):
 
                     unit_key_parts = _availability_keys(actual_row, actual_key)
                     unit_key = str(unit_key_parts[0]) if unit_key_parts else None
+
+                    # unit_details is a PMS export, so a wait-list placeholder
+                    # can appear there directly (Voyager's WAIT/WAITUNIT) even
+                    # though it never reaches the availability feed. The
+                    # primary-side wait filter above only ever protects units
+                    # that come through the primary feed; a placeholder that
+                    # lives solely in the actual file needs its own check here
+                    # so it is excluded for every integration alike.
+                    if _availability_named_wait_unit(
+                            actual_row, actual_key + ['unit_number', 'unitNumber']):
+                        continue
 
                     local_stage_9  += 1
                     local_analyzed += 1
