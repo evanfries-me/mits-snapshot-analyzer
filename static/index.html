@@ -253,6 +253,234 @@
     #availability-summary { padding: 7px 12px; font-size: 11px; color: #8b949e; border-bottom: 1px solid #21262d; flex-shrink: 0; display: none; }
     #availability-summary.show { display: block; }
     #availability-results { flex: 1; overflow-y: auto; }
+
+    /* ── Sync Issues sidebar ─────────────────────────────────────────────── */
+    #pane-sync-issues { overflow-y: auto; padding: 12px 0; gap: 0; }
+    #sync-issues-form { padding: 0 12px; display: flex; flex-direction: column; gap: 10px; }
+    #si-run-actions { display: flex; gap: 8px; padding-top: 4px; }
+    #btn-run-sync-query {
+      flex: 1; background: #238636; border: 1px solid #2ea043; color: #fff;
+      padding: 7px 0; border-radius: 6px; cursor: pointer;
+      font-size: 12.5px; font-weight: 600; font-family: inherit;
+      transition: background .1s;
+    }
+    #btn-run-sync-query:hover:not([disabled]) { background: #2ea043; }
+    #btn-run-sync-query[disabled] { opacity: .4; cursor: not-allowed; }
+    #si-status {
+      padding: 8px 12px; font-size: 11px; color: #8b949e;
+      border-top: 1px solid #21262d; margin-top: 10px;
+    }
+    #si-status:empty { display: none; }
+
+    /* ── Sync Issues preview pane ────────────────────────────────────────── */
+    #si-preview {
+      flex: 1; display: flex; flex-direction: column; overflow: hidden;
+    }
+    #si-preview-header {
+      padding: 10px 20px; border-bottom: 1px solid #21262d;
+      display: flex; align-items: center; justify-content: space-between;
+      flex-shrink: 0; min-height: 40px;
+    }
+    #si-preview-title {
+      font-size: 13px; font-weight: 600; color: #e6edf3;
+    }
+    #si-preview-status {
+      font-size: 11px; color: #8b949e;
+    }
+    #si-preview-body {
+      flex: 1; overflow-y: auto; padding: 20px;
+      display: flex; flex-direction: column; gap: 24px;
+    }
+    /* Distribution */
+    .si-dist-section { display: flex; flex-direction: column; gap: 8px; }
+    .si-dist-heading {
+      font-size: 11px; font-weight: 700; text-transform: uppercase;
+      letter-spacing: .07em; color: #8b949e;
+    }
+    .si-dist-meta { font-size: 11px; color: #6e7681; margin-top: -4px; }
+    .si-dist-table {
+      border-collapse: collapse; width: 100%; font-size: 12.5px;
+      border: 1px solid #30363d; border-radius: 6px; overflow: hidden;
+    }
+    .si-dist-table th, .si-dist-table td { padding: 7px 12px; border: 1px solid #21262d; }
+    .si-dist-table th {
+      background: #161b22; color: #8b949e; font-weight: 600; text-align: left;
+      font-size: 11px; text-transform: uppercase; letter-spacing: .05em;
+    }
+    .si-dist-table td { color: #e6edf3; }
+    .si-dist-table tbody tr:hover td { background: #161b22; }
+    .si-dist-bar-cell { width: 160px; }
+    .si-dist-bar-wrap { background: #21262d; border-radius: 3px; height: 10px; width: 140px; }
+    .si-dist-bar { height: 10px; background: #388bfd; border-radius: 3px; display: block; min-width: 2px; }
+    /* Syncs table */
+    .si-syncs-section { display: flex; flex-direction: column; gap: 8px; }
+    .si-syncs-heading {
+      font-size: 11px; font-weight: 700; text-transform: uppercase;
+      letter-spacing: .07em; color: #8b949e;
+    }
+    .si-syncs-wrap { overflow-x: auto; }
+    .si-table {
+      border-collapse: collapse; font-size: 11.5px; width: 100%;
+      border: 1px solid #30363d; border-radius: 6px; overflow: hidden;
+    }
+    .si-table th, .si-table td { padding: 6px 10px; border: 1px solid #21262d; white-space: nowrap; }
+    .si-table th { background: #161b22; color: #8b949e; font-weight: 600; text-align: left; font-size: 10.5px; text-transform: uppercase; letter-spacing: .05em; }
+    .si-table td { color: #e6edf3; }
+    .si-table tbody tr.si-sync-row:hover td { background: #161b22; }
+    .si-syncs-hint { font-weight: 400; text-transform: none; letter-spacing: 0; color: #6e7681; }
+
+    /* Scope toggle: newly-marked vs all unavailable */
+    .si-toggle-bar {
+      display: flex; align-items: center; gap: 10px; flex-wrap: wrap;
+      padding-bottom: 4px;
+    }
+    .si-toggle-label {
+      font-size: 11px; font-weight: 700; text-transform: uppercase;
+      letter-spacing: .07em; color: #8b949e;
+    }
+    .si-seg {
+      display: inline-flex; border: 1px solid #30363d; border-radius: 6px;
+      overflow: hidden; background: #0d1117;
+    }
+    .si-seg-btn {
+      background: none; border: 0; color: #8b949e; cursor: pointer;
+      font-size: 11.5px; padding: 5px 12px; font-family: inherit;
+    }
+    .si-seg-btn + .si-seg-btn { border-left: 1px solid #30363d; }
+    .si-seg-btn:hover:not(.active) { background: #161b22; color: #c9d1d9; }
+    .si-seg-btn.active { background: #1f6feb; color: #fff; font-weight: 600; }
+    .si-toggle-note { font-size: 11px; color: #6e7681; }
+    .si-detail-sub { color: #6e7681; }
+    .si-warn { color: #d29922; }
+
+    /* Post-query threshold slider */
+    .si-slider-bar {
+      display: flex; align-items: center; gap: 10px; flex-wrap: wrap;
+      padding-bottom: 8px;
+    }
+    #si-pct-slider {
+      width: 220px; accent-color: #1f6feb; cursor: pointer; height: 4px;
+    }
+    #si-pct-value {
+      font-size: 12px; font-weight: 700; color: #e6edf3;
+      font-variant-numeric: tabular-nums; min-width: 38px;
+    }
+
+    /* Sortable column headers */
+    .si-sortable, .si-dist-sortable { cursor: pointer; user-select: none; }
+    .si-sortable:hover, .si-dist-sortable:hover { background: #1f2733 !important; color: #e6edf3; }
+    .si-th-right { text-align: right !important; }
+    .si-sort-arrow { color: #58a6ff; font-size: 8px; }
+
+    /* Per-building expand control */
+    .si-expand-cell { width: 28px; text-align: center; padding: 0 !important; }
+    .si-expand-btn {
+      background: none; border: 0; color: #58a6ff; cursor: pointer;
+      font-size: 10px; line-height: 1; padding: 6px 8px; width: 100%;
+    }
+    .si-expand-btn:hover:not(:disabled) { color: #79c0ff; background: #1f2733; }
+    .si-expand-btn:disabled { color: #484f58; cursor: default; }
+    .si-pending { color: #6e7681; font-style: italic; }
+    .si-top-reason { max-width: 260px; overflow: hidden; text-overflow: ellipsis; }
+    .si-top-pct { color: #6e7681; font-variant-numeric: tabular-nums; }
+    .si-skipped-tag {
+      background: #21262d; border: 1px solid #30363d; border-radius: 10px;
+      padding: 1px 8px; font-size: 10px; color: #8b949e; cursor: help;
+    }
+
+    /* Expanded per-building detail panel */
+    .si-detail-row > td { padding: 0 !important; background: #0d1117; }
+    .si-detail {
+      display: flex; flex-direction: column; gap: 8px;
+      padding: 14px 16px 16px 36px; border-left: 2px solid #388bfd;
+      white-space: normal;
+    }
+    .si-detail-meta { font-size: 11px; color: #8b949e; }
+    /* Keep the in-detail distribution compact so the bars stay next to the numbers */
+    .si-detail .si-dist-table { width: auto; max-width: 700px; }
+    .si-detail .si-dist-table th:first-child,
+    .si-detail .si-dist-table td:first-child { min-width: 220px; }
+    .si-mono { font-family: ui-monospace, SFMono-Regular, Menlo, monospace; font-size: 10.5px; }
+    .si-skip-note {
+      font-size: 11.5px; color: #8b949e; background: #161b22;
+      border: 1px solid #30363d; border-radius: 6px; padding: 10px 12px;
+    }
+    .si-skip-note strong { color: #d29922; }
+
+    /* Per-reason unit lists */
+    .si-units-section { display: flex; flex-direction: column; gap: 4px; margin-top: 4px; }
+    .si-units > summary {
+      cursor: pointer; font-size: 11.5px; color: #58a6ff; padding: 5px 8px;
+      border-radius: 5px; list-style: none;
+    }
+    .si-units > summary::-webkit-details-marker { display: none; }
+    .si-units > summary::before { content: '▸ '; color: #6e7681; }
+    .si-units[open] > summary::before { content: '▾ '; }
+    .si-units > summary:hover { background: #161b22; }
+    .si-units-count { color: #6e7681; }
+    .si-units-wrap { max-height: 320px; overflow: auto; margin: 4px 0 8px 16px; }
+    .si-unit-table { border-collapse: collapse; font-size: 11px; }
+    .si-unit-table th, .si-unit-table td {
+      padding: 4px 10px; border: 1px solid #21262d; white-space: nowrap; text-align: left;
+    }
+    .si-unit-table th {
+      background: #161b22; color: #8b949e; font-weight: 600; font-size: 10px;
+      text-transform: uppercase; letter-spacing: .05em;
+      position: sticky; top: 0;
+    }
+    .si-unit-table td { color: #c9d1d9; }
+    .si-units-more { font-size: 10.5px; color: #6e7681; padding: 6px 2px 0; }
+
+    .si-lookup-warn {
+      font-size: 11.5px; color: #d29922; background: #1c1810;
+      border: 1px solid #3d2f11; border-radius: 6px; padding: 8px 11px;
+      margin-bottom: 8px; line-height: 1.5;
+    }
+
+    /* Collapsed combined rollup */
+    .si-combined { border-top: 1px solid #21262d; padding-top: 10px; }
+    .si-combined > summary { cursor: pointer; list-style: none; padding: 2px 0; }
+    .si-combined > summary::-webkit-details-marker { display: none; }
+    .si-combined > summary::before { content: '▸ '; color: #6e7681; }
+    .si-combined[open] > summary::before { content: '▾ '; }
+    .si-combined-body { display: flex; flex-direction: column; gap: 8px; padding-top: 8px; }
+
+    /* By-integration chips */
+    .si-by-int { display: flex; flex-wrap: wrap; gap: 6px; margin-top: 4px; }
+    .si-int-chip {
+      background: #161b22; border: 1px solid #30363d; border-radius: 12px;
+      padding: 3px 10px; font-size: 11px; color: #8b949e;
+    }
+    .si-int-chip strong { color: #e6edf3; }
+    /* Progress indicator in preview */
+    #si-analyze-progress {
+      background: #161b22; border: 1px solid #30363d; border-radius: 8px;
+      padding: 16px 20px; display: flex; flex-direction: column; gap: 10px;
+    }
+    #si-analyze-progress-header {
+      display: flex; align-items: center; gap: 10px;
+    }
+    .si-spinner {
+      width: 16px; height: 16px; border-radius: 50%; flex-shrink: 0;
+      border: 2px solid #30363d; border-top-color: #388bfd;
+      animation: si-spin .7s linear infinite;
+    }
+    @keyframes si-spin { to { transform: rotate(360deg); } }
+    #si-analyze-progress-label {
+      font-size: 13px; color: #e6edf3; font-weight: 500;
+    }
+    #si-analyze-progress-note {
+      font-size: 11px; color: #6e7681; padding-left: 26px;
+    }
+    #si-analyze-progress-track {
+      height: 8px; background: #21262d; border-radius: 4px; overflow: hidden;
+      margin-left: 26px;
+    }
+    #si-analyze-progress-fill {
+      height: 100%; background: linear-gradient(90deg, #388bfd, #58a6ff);
+      border-radius: 4px; transition: width .4s ease; width: 2%;
+      min-width: 8px;
+    }
     .field { display: flex; flex-direction: column; gap: 4px; }
     .field label {
       font-size: 10px; font-weight: 600; text-transform: uppercase;
@@ -711,6 +939,7 @@ AWS_SESSION_TOKEN=IQoJb3...</pre>
     <div id="mode-tabs">
       <button class="mode-tab active" data-mode="search">Search</button>
       <button class="mode-tab" data-mode="availability">Availability Agent</button>
+      <button class="mode-tab" data-mode="sync-issues">Sync Issues</button>
     </div>
 
     <!-- Availability Agent mode -->
@@ -741,7 +970,7 @@ AWS_SESSION_TOKEN=IQoJb3...</pre>
         <details id="agent-optional-filters">
           <summary>Optional filters</summary>
           <div id="agent-optional-body">
-            <div class="field"><label for="agent-asof">As of <span class="field-optional">(optional)</span></label><input type="text" id="agent-asof" placeholder="YYYY-MM-DDTHH:MM (UTC)" autocomplete="off" /><span class="field-hint" id="agent-asof-hint">Uses latest syncs created within the past 24 hours</span></div>
+            <div class="field"><label for="agent-asof">As of <span class="field-optional">(optional)</span></label><input type="text" id="agent-asof" placeholder="YYYY-MM-DDTHH:MM (UTC)" autocomplete="off" /><span class="field-hint" id="agent-asof-hint">Uses the latest snapshots recorded in the index</span></div>
             <div class="field"><label for="agent-sel-org">Organization</label><select id="agent-sel-org"><option value="">Any organization</option></select></div>
             <div class="field"><label for="agent-buildings">Building ID</label><input type="text" id="agent-buildings" placeholder="e.g. 10238, 10287 — blank for all" autocomplete="off" /></div>
           </div>
@@ -777,6 +1006,39 @@ AWS_SESSION_TOKEN=IQoJb3...</pre>
         </div>
         <div class="saved-list" id="history-availability-list"></div>
       </div>
+    </div>
+
+    <!-- Sync Issues mode -->
+    <div class="mode-pane" id="pane-sync-issues">
+      <div id="sync-issues-form">
+        <div class="field">
+          <label for="si-start-date">Start date</label>
+          <input type="date" id="si-start-date" autocomplete="off" />
+        </div>
+        <div class="field">
+          <label for="si-end-date">End date</label>
+          <input type="date" id="si-end-date" autocomplete="off" />
+        </div>
+        <div class="field">
+          <label for="si-integration">Integration</label>
+          <select id="si-integration">
+            <option value="">All integrations</option>
+          </select>
+        </div>
+        <div class="field">
+          <label for="si-threshold">Unavailability threshold</label>
+          <input type="number" id="si-threshold" min="1" max="100" step="1" value="20" autocomplete="off" />
+          <span class="field-hint">Min % of units marked unavailable to flag a sync</span>
+        </div>
+        <div class="field">
+          <label for="si-limit">Max syncs to return</label>
+          <input type="number" id="si-limit" min="1" max="500" step="1" value="100" autocomplete="off" />
+        </div>
+        <div id="si-run-actions">
+          <button id="btn-run-sync-query">Find Problematic Syncs</button>
+        </div>
+      </div>
+      <div id="si-status"></div>
     </div>
 
     <!-- Search mode -->
@@ -862,7 +1124,7 @@ AWS_SESSION_TOKEN=IQoJb3...</pre>
               <input type="text" id="input-asof"
                      placeholder="YYYY-MM-DDTHH:MM (UTC) or paste a snapshot-viewer link"
                      autocomplete="off" spellcheck="false" />
-              <span class="field-hint" id="asof-hint">Uses latest syncs created within the past 24 hours</span>
+              <span class="field-hint" id="asof-hint">Uses the latest snapshots recorded in the index</span>
             </div>
             <div id="db-filters">
               <div class="field">
@@ -938,6 +1200,20 @@ AWS_SESSION_TOKEN=IQoJb3...</pre>
       <div class="pane-msg" style="flex-direction:column;gap:6px;">
         <span style="font-size:24px;opacity:.3">📄</span>
         <span>Click a file to preview it</span>
+      </div>
+    </div>
+
+    <!-- Sync Issues main display (shown when mode = sync-issues) -->
+    <div id="si-preview" style="display:none">
+      <div id="si-preview-header">
+        <span id="si-preview-title">Sync Issues</span>
+        <span id="si-preview-status"></span>
+      </div>
+      <div id="si-preview-body">
+        <div class="pane-msg" style="flex-direction:column;gap:6px;">
+          <span style="font-size:24px;opacity:.3">🔍</span>
+          <span>Configure a date range and click Find Problematic Syncs</span>
+        </div>
       </div>
     </div>
   </div>

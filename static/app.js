@@ -99,6 +99,35 @@ window.addEventListener('DOMContentLoaded', () => {
   document.getElementById('btn-run-availability').addEventListener('click', runAvailabilityAgent);
   document.getElementById('btn-stop-availability').addEventListener('click', stopAvailabilityAgent);
   document.getElementById('btn-agent-index').addEventListener('click', buildAgentIndex);
+  document.getElementById('btn-run-sync-query').addEventListener('click', runSyncIssuesQuery);
+  // The syncs table is re-rendered on every query, so delegate the expand click.
+  const siBody = document.getElementById('si-preview-body');
+  siBody.addEventListener('click', ev => {
+    const btn = ev.target.closest('.si-expand-btn');
+    if (btn && !btn.disabled) { siToggleBuilding(btn.dataset.bid); return; }
+    const seg = ev.target.closest('.si-seg-btn');
+    if (seg) { siSetScope(seg.dataset.scope === 'all'); return; }
+    const th = ev.target.closest('th.si-sortable');
+    if (th) { siSortSyncsBy(th.dataset.sortkey); return; }
+    const dth = ev.target.closest('th.si-dist-sortable');
+    if (dth) siSortDistBy(dth.dataset.sortkey);
+  });
+  // 'input' keeps the readout live while dragging; the repaint is cheap since
+  // it only re-aggregates already-fetched data.
+  siBody.addEventListener('input', ev => {
+    if (ev.target.id === 'si-pct-slider') {
+      siSetMinPct(parseFloat(ev.target.value) / 100);
+    }
+  });
+  // Default date range: last 7 days
+  (() => {
+    const today = new Date();
+    const pad = n => String(n).padStart(2, '0');
+    const fmt = d => `${d.getFullYear()}-${pad(d.getMonth()+1)}-${pad(d.getDate())}`;
+    document.getElementById('si-end-date').value = fmt(today);
+    const start = new Date(today); start.setDate(start.getDate() - 7);
+    document.getElementById('si-start-date').value = fmt(start);
+  })();
   document.getElementById('btn-agent-companion').addEventListener('click', buildAgentCompanionIndex);
   document.getElementById('btn-index').addEventListener('click', buildIndex);
 
@@ -350,13 +379,20 @@ async function tryConnect() {
 
 // ── Mode switching ────────────────────────────────────────────────────────────
 function setMode(mode) {
-  if (mode !== 'search' && mode !== 'availability') mode = 'search';
+  if (!['search', 'availability', 'sync-issues'].includes(mode)) mode = 'search';
   state.mode = mode;
   document.querySelectorAll('.mode-tab').forEach(t =>
     t.classList.toggle('active', t.dataset.mode === mode)
   );
   document.getElementById('pane-search').classList.toggle('active', mode === 'search');
   document.getElementById('pane-availability').classList.toggle('active', mode === 'availability');
+  document.getElementById('pane-sync-issues').classList.toggle('active', mode === 'sync-issues');
+
+  // Show/hide the right-side preview areas
+  const isSI = mode === 'sync-issues';
+  document.getElementById('preview-header').style.display = isSI ? 'none' : '';
+  document.getElementById('preview-content').style.display = isSI ? 'none' : '';
+  document.getElementById('si-preview').style.display     = isSI ? 'flex' : 'none';
 }
 
 // ── Explore mode ──────────────────────────────────────────────────────────────
@@ -499,6 +535,10 @@ async function loadIntegrations() {
     document.getElementById('agent-sel-integration').innerHTML =
       '<option value="">Select an integration…</option>' +
       '<option value="__all__">All integrations</option>' +
+      supported.map(n => `<option value="${esc(n)}">${esc(n)}</option>`).join('');
+    // Sync Issues integration filter
+    document.getElementById('si-integration').innerHTML =
+      '<option value="">All integrations</option>' +
       supported.map(n => `<option value="${esc(n)}">${esc(n)}</option>`).join('');
     renderAgentLimitFeedback();
     syncAvailabilityButton();
@@ -820,7 +860,7 @@ function renderAsOfFeedback() {
 
   if (!search.asOf.trim()) {
     hint.className   = 'field-hint';
-    hint.textContent = "Uses latest syncs created within the past 24 hours";
+    hint.textContent = 'Uses the latest snapshots recorded in the index';
   } else if (parsed.ok) {
     hint.className   = 'field-hint ok';
     hint.textContent = `→ latest sync in the 24 hours before ${fmtDateUTC(parsed.dt.toISOString())} UTC`;
@@ -1496,7 +1536,7 @@ async function refreshAgentIndexStatus() {
       // entire panel stuck at "Checking index freshness…".
       renderAgentIndexStatus();
       syncAvailabilityButton();
-      if (selected === 'RentCafe') {
+      if (selected === 'RentCafe' && search.agentIndex.state !== 'none') {
         const controller = new AbortController();
         const timeout = setTimeout(() => controller.abort(), 5000);
         try {
@@ -1540,7 +1580,9 @@ function renderAgentIndexStatus() {
   bar.className = `show ${idx?.state || 'none'}`;
   if (!idx) {
     text.textContent = 'Checking index freshness…';
-    btn.textContent = 'Re-index';
+    btn.textContent = selected === 'RentCafe'
+      ? 'Build or refresh RentCafe index'
+      : 'Build or refresh index';
   } else if (selected === '__all__') {
     const total = search.availabilityIntegrations.length;
     const expired = idx.needsRefresh || [];
@@ -1558,13 +1600,13 @@ function renderAgentIndexStatus() {
   } else if (idx.state === 'ready') {
     const sample = Number(idx.stats?.samplePercent || 100);
     text.textContent = `Indexed ${Number(idx.buildings || 0).toLocaleString()} buildings${sample < 100 ? ` · ${sample}% sample` : ''} · ${fmtAge(idx.age)} ago`;
-    btn.textContent = 'Re-index';
+    btn.textContent = selected === 'RentCafe' ? 'Refresh RentCafe index' : 'Re-index';
   } else if (idx.state === 'stale') {
     text.textContent = `Last indexed ${fmtAge(idx.age)} ago · latest index will be used`;
-    btn.textContent = 'Re-index';
+    btn.textContent = selected === 'RentCafe' ? 'Refresh RentCafe index' : 'Re-index';
   } else {
     text.textContent = 'Not indexed · index required to run';
-    btn.textContent = 'Re-index';
+    btn.textContent = selected === 'RentCafe' ? 'Build RentCafe index' : 'Build index';
   }
   // Index maintenance must remain available even if the status request is
   // delayed or fails. With no metadata, buildAgentIndex safely does a build.
@@ -1589,6 +1631,12 @@ function renderAgentIndexStatus() {
 async function buildAgentCompanionIndex() {
   const selected = document.getElementById('agent-sel-integration').value;
   if (selected !== 'RentCafe' || search.indexing || search.running) return;
+  // A companion cannot define the RentCafe building scope. If stale UI state
+  // exposes this action before a primary index exists, build RentCafe first.
+  if (!search.agentIndex || search.agentIndex.state === 'none') {
+    await buildAgentIndex();
+    return;
+  }
   search.indexing = true;
   renderAgentIndexStatus();
   syncAvailabilityButton();
@@ -1623,6 +1671,8 @@ async function buildAgentIndex() {
     : [selected];
   const samplePercent = Number(document.getElementById('agent-index-percent').value || 100);
   const referenceTime = document.getElementById('agent-asof').value.trim();
+  const missingIndexes = new Set(search.agentIndex?.missing ||
+    (search.agentIndex?.state === 'none' && selected !== '__all__' ? [selected] : []));
   search.indexing = true;
   renderAgentIndexStatus();
   syncAvailabilityButton();
@@ -1630,7 +1680,8 @@ async function buildAgentIndex() {
   try {
     const rebuilt = [];
     for (const [position, integration] of integrations.entries()) {
-      results.innerHTML = `<div class="pane-msg">Re-indexing ${esc(integration)} at ${samplePercent}% (${position + 1} of ${integrations.length})…</div>`;
+      const action = missingIndexes.has(integration) ? 'Building new index for' : 'Re-indexing';
+      results.innerHTML = `<div class="pane-msg">${action} ${esc(integration)} at ${samplePercent}% (${position + 1} of ${integrations.length})…</div>`;
       const response = await fetch('/api/index/build', {
         method: 'POST', headers: {'Content-Type': 'application/json'},
         body: JSON.stringify({integration, samplePercent, referenceTime}),
@@ -1642,9 +1693,9 @@ async function buildAgentIndex() {
     }
     const empty = rebuilt.filter(item => !Number(item.result?.buildings || 0));
     if (empty.length) {
-      results.innerHTML = `<div class="pane-msg">Re-indexing completed, but no current snapshots were found for: ${esc(empty.map(item => item.integration).join(', '))}. The Availability Agent remains unavailable for those integrations.</div>`;
+      results.innerHTML = `<div class="pane-msg">Indexing completed, but no current snapshots were found for: ${esc(empty.map(item => item.integration).join(', '))}. The Availability Agent remains unavailable for those integrations.</div>`;
     } else {
-      results.innerHTML = '<div class="pane-msg">Re-indexing complete. The Availability Agent is ready to run.</div>';
+      results.innerHTML = '<div class="pane-msg">Indexing complete. The Availability Agent is ready to run.</div>';
     }
   } catch (error) {
     results.innerHTML = `<div class="pane-msg">Index maintenance failed: ${esc(error.message)}</div>`;
@@ -1664,7 +1715,7 @@ function renderAgentAsOfFeedback() {
   search.agentAsOfValid = parsed.ok;
   if (!raw.trim()) {
     hint.className = 'field-hint';
-    hint.textContent = 'Uses latest syncs created within the past 24 hours';
+    hint.textContent = 'Uses the latest snapshots recorded in the index';
   } else if (parsed.ok) {
     hint.className = 'field-hint ok';
     hint.textContent = `→ latest sync in the 24 hours before ${fmtDateUTC(parsed.dt.toISOString())} UTC`;
@@ -1981,6 +2032,7 @@ function renderAvailabilityResult(data) {
   if (data.supplementalUnits) bits.push(`${data.supplementalUnits.toLocaleString()} Voyager-only unit${data.supplementalUnits !== 1 ? 's' : ''} added as Lease Signed`);
   if (data.supplementalErrors) bits.push(`${data.supplementalErrors.toLocaleString()} Voyager supplement${data.supplementalErrors !== 1 ? 's' : ''} unreadable`);
   if (data.waitFiltered) bits.push(`${data.waitFiltered.toLocaleString()} unit${data.waitFiltered !== 1 ? 's' : ''} with “wait” in the name excluded`);
+  if (data.unitDetailsOnlyCount) bits.push(`${data.unitDetailsOnlyCount.toLocaleString()} unit${data.unitDetailsOnlyCount !== 1 ? 's' : ''} found only in unit-details`);
   if (data.stopped) bits.push('stopped early; CSV contains collected data');
   if (data.limit) bits.push(data.limited ? `limited to ${Number(data.limit).toLocaleString()}` : `limit ${Number(data.limit).toLocaleString()} not reached`);
   if (data.asOf) bits.push(`as of ${fmtDateUTC(data.asOf)} UTC`);
@@ -2167,7 +2219,6 @@ function renderSearchResults(data) {
     `${data.searched.toLocaleString()} of ${data.buildings.toLocaleString()} buildings searched`,
   ];
   if (data.asOf)        bits.push(`as of ${fmtDateUTC(data.asOf)} UTC`);
-  if (data.staleLatest) bits.push(`${data.staleLatest.toLocaleString()} latest sync${data.staleLatest !== 1 ? 's' : ''} older than ${data.freshnessHours || 24} hours excluded`);
   if (data.org)         bits.push(`org filter on`);
   if (data.includeStudents === false) bits.push('student housing excluded');
   if (data.noSnapshot)  bits.push(`${data.noSnapshot.toLocaleString()} had no snapshot in the preceding 24-hour window`);
@@ -2180,11 +2231,8 @@ function renderSearchResults(data) {
   if (data.enrichCredentialIssue) showSnowflakeCredentialPrompt(data.enrichError);
 
   if (!data.matches.length) {
-    const scope = data.freshnessHours && !data.asOf
-      ? ` from a latest sync created within the past ${data.freshnessHours} hours`
-      : '';
     results.innerHTML =
-      `<div class="pane-msg">No snapshot${scope} contains “${esc(data.text)}”</div>`;
+      `<div class="pane-msg">No indexed snapshot contains “${esc(data.text)}”</div>`;
     return;
   }
 
@@ -2229,7 +2277,6 @@ function renderFieldsResult(data) {
     `${data.searched.toLocaleString()} of ${data.buildings.toLocaleString()} buildings searched`,
   ];
   if (data.asOf)        bits.push(`as of ${fmtDateUTC(data.asOf)} UTC`);
-  if (data.staleLatest) bits.push(`${data.staleLatest.toLocaleString()} latest sync${data.staleLatest !== 1 ? 's' : ''} older than ${data.freshnessHours || 24} hours excluded`);
   if (data.org)         bits.push(`org filter on`);
   if (data.includeStudents === false) bits.push('student housing excluded');
   if (data.unique)      bits[0] = `${data.rowCount.toLocaleString()} unique row${data.rowCount !== 1 ? 's' : ''}`;
@@ -2243,10 +2290,7 @@ function renderFieldsResult(data) {
   if (data.enrichCredentialIssue) showSnowflakeCredentialPrompt(data.enrichError);
 
   if (!data.rowCount) {
-    const scope = data.freshnessHours && !data.asOf
-      ? ` created within the past ${data.freshnessHours} hours`
-      : '';
-    results.innerHTML = `<div class="pane-msg">None of the searched snapshots${scope} had a value for ` +
+    results.innerHTML = `<div class="pane-msg">None of the searched indexed snapshots had a value for ` +
       `${data.fields.map(f => `“${esc(f)}”`).join(', ')}</div>`;
     renderFieldsPreview(data);
     return;
@@ -2478,6 +2522,799 @@ function esc(s) {
 
 function escRegex(s) {
   return String(s).replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+}
+
+// ── Sync Issues ────────────────────────────────────────────────────────────────
+
+const syncIssues = {
+  syncs:     [],         // last query results
+  jobId:     null,       // current analyze job id
+  polling:   null,       // setInterval handle
+  buildings: {},         // BUILDING_ID → per-building analysis detail
+  open:      new Set(),  // BUILDING_IDs whose detail row is expanded
+  showAll:   false,      // false = only units this sync newly marked
+  lastResult: null,      // last job result, for re-rendering on toggle
+  queryPct:  0,          // threshold the query ran with (slider floor)
+  minPct:    0,          // post-query threshold from the slider
+  sortSyncs: {key: 'pct',   dir: 'desc'},
+  sortDist:  {key: 'count', dir: 'desc'},
+};
+
+// Every reason row carries both an all-units and a newly-marked count; these
+// pick the active one so the toggle needs no re-fetch.
+function siCount(row) { return syncIssues.showAll ? row.count : row.countNew; }
+function siPct(row)   { return syncIssues.showAll ? row.pct   : row.pctNew;   }
+
+// Reasons with no units in the active scope are hidden, and the surviving rows
+// re-sort by the active count.
+function siActiveReasons(reasons) {
+  return (reasons || [])
+    .filter(r => siCount(r) > 0)
+    .sort((a, b) => siCount(b) - siCount(a) ||
+                    a.reason.localeCompare(b.reason));
+}
+
+function siActiveUnits(row) {
+  const units = row.units || [];
+  return syncIssues.showAll ? units : units.filter(u => u.isNew === true);
+}
+
+function siScopeLabel() {
+  return syncIssues.showAll ? 'unavailable units' : 'newly marked unavailable';
+}
+
+function buildScopeToggleHtml() {
+  const a = syncIssues.showAll;
+  return `<div class="si-toggle-bar">
+    <span class="si-toggle-label">Show</span>
+    <div class="si-seg">
+      <button class="si-seg-btn${a ? '' : ' active'}" data-scope="new">Newly marked only</button>
+      <button class="si-seg-btn${a ? ' active' : ''}" data-scope="all">All unavailable</button>
+    </div>
+    <span class="si-toggle-note">${a
+      ? 'Including units that were already unavailable before the sync.'
+      : 'Excluding units that were already unavailable before the sync.'}</span>
+  </div>`;
+}
+
+function siSetScope(showAll) {
+  if (syncIssues.showAll === showAll) return;
+  syncIssues.showAll = showAll;
+  document.querySelectorAll('.si-seg-btn').forEach(b =>
+    b.classList.toggle('active', (b.dataset.scope === 'all') === showAll));
+  const note = document.querySelector('.si-toggle-note');
+  if (note) note.textContent = showAll
+    ? 'Including units that were already unavailable before the sync.'
+    : 'Excluding units that were already unavailable before the sync.';
+  siRepaint();
+}
+
+function siSummaryLine(r) {
+  const n = syncIssues.showAll ? r.unavailableUnits : r.newlyMarkedUnits;
+  const dedup = r.deduplicatedBuildings || r.syncsAnalyzed || 0;
+  const orig  = r.originalSyncs || dedup;
+  const dupNote = orig > dedup ? ` (${orig} syncs → ${dedup} unique buildings)` : '';
+  return `${n || 0} ${siScopeLabel()} · ${r.syncsWithData || 0} buildings analyzed${dupNote}`;
+}
+
+// Helpers for the two status surfaces
+function siSetSidebarStatus(msg, isError) {
+  const el = document.getElementById('si-status');
+  el.textContent = msg;
+  el.style.color = isError ? '#f85149' : '#8b949e';
+}
+
+function siSetPreviewStatus(msg) {
+  document.getElementById('si-preview-status').textContent = msg;
+}
+
+function siSetPreviewTitle(msg) {
+  document.getElementById('si-preview-title').textContent = msg;
+}
+
+function siSetPreviewBody(html) {
+  document.getElementById('si-preview-body').innerHTML = html;
+}
+
+async function runSyncIssuesQuery() {
+  const startDate = document.getElementById('si-start-date').value.trim();
+  const endDate   = document.getElementById('si-end-date').value.trim();
+  if (!startDate || !endDate) {
+    siSetSidebarStatus('Please select a start and end date.', true);
+    return;
+  }
+  const integration = document.getElementById('si-integration').value;
+  const thresholdPct = parseFloat(document.getElementById('si-threshold').value);
+  if (isNaN(thresholdPct) || thresholdPct <= 0 || thresholdPct > 100) {
+    siSetSidebarStatus('Threshold must be between 1 and 100.', true);
+    return;
+  }
+  const threshold = thresholdPct / 100;
+  const limit = parseInt(document.getElementById('si-limit').value, 10) || 100;
+
+  // Cancel any in-flight analysis and drop the previous run's per-building data
+  if (syncIssues.polling) {
+    clearInterval(syncIssues.polling);
+    syncIssues.polling = null;
+    syncIssues.jobId = null;
+  }
+  syncIssues.buildings  = {};
+  syncIssues.lastResult = null;
+  syncIssues.open.clear();
+  // The slider can only narrow the query, so it starts at the queried value.
+  syncIssues.queryPct   = threshold;
+  syncIssues.minPct     = threshold;
+  syncIssues.sortSyncs  = {key: 'pct',   dir: 'desc'};
+  syncIssues.sortDist   = {key: 'count', dir: 'desc'};
+
+  siSetSidebarStatus('Running Snowflake query…', false);
+  siSetPreviewTitle('Sync Issues');
+  siSetPreviewStatus('Querying…');
+  siSetPreviewBody(`<div class="pane-msg" style="flex-direction:column;gap:6px;">
+    <span style="font-size:20px;opacity:.4">⏳</span>
+    <span>Running Snowflake query — this may take up to a minute…</span>
+  </div>`);
+
+  const btn = document.getElementById('btn-run-sync-query');
+  btn.disabled = true;
+
+  try {
+    const res = await fetch('/api/sync-issues/query', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ startDate, endDate, integration, threshold, limit }),
+    });
+    const data = await res.json();
+    if (!res.ok || data.error) throw new Error(data.error || res.statusText);
+
+    syncIssues.syncs = data.syncs || [];
+    const n = syncIssues.syncs.length;
+    siSetSidebarStatus(`Found ${n} sync${n === 1 ? '' : 's'}.`, false);
+
+    if (!n) {
+      siSetPreviewStatus('');
+      siSetPreviewBody(`<div class="pane-msg" style="flex-direction:column;gap:6px;">
+        <span style="font-size:20px;opacity:.4">✅</span>
+        <span>No syncs matched the criteria for this date range.</span>
+      </div>`);
+      return;
+    }
+
+    // Render the syncs table immediately, then auto-start analysis
+    siSetPreviewStatus(`${n} sync${n === 1 ? '' : 's'} found — analyzing…`);
+    siSetPreviewBody(
+      `<div id="si-controls">${buildScopeToggleHtml()}${buildThresholdSliderHtml()}</div>
+       <div id="si-syncs-host"></div>` + buildAnalyzeProgressHtml());
+    siRenderSyncsTable();
+    runSyncIssuesAnalyze();
+  } catch (e) {
+    siSetSidebarStatus(`Query failed: ${e.message}`, true);
+    siSetPreviewStatus('Error');
+    siSetPreviewBody(`<div class="pane-msg" style="color:#f85149">${esc(e.message)}</div>`);
+  } finally {
+    btn.disabled = false;
+  }
+}
+
+const SI_TABLE_COLS = 9;
+
+// Sortable columns of the Flagged Syncs table.  `get` returns a comparable
+// value; `num` marks numeric columns so they compare as numbers, not strings.
+const SI_SYNC_COLUMNS = [
+  {key: 'org',      label: 'Org',             get: s => s.ORG_NAME || ''},
+  {key: 'building', label: 'Building',        get: s => s.BUILDING_NAME || ''},
+  {key: 'started',  label: 'Sync Start',      get: s => s.SYNC_STARTED_AT || ''},
+  {key: 'sources',  label: 'Sources',         get: s => s.SOURCES || ''},
+  {key: 'before',   label: 'Units Before',    get: s => s.TOTAL_UNITS_BEFORE_SYNC, num: true, right: true},
+  {key: 'marked',   label: 'Marked Unavail.', get: s => s.UNITS_MARKED_UNAVAILABLE, num: true, right: true},
+  {key: 'pct',      label: '% Unavail.',      get: s => s.PCT_UNITS_MARKED_UNAVAILABLE, num: true, right: true},
+  {key: 'reason',   label: 'Top Reason',      get: s => {
+    const b = syncIssues.buildings[String(s.BUILDING_ID ?? '')];
+    if (!b) return '';
+    if (b.status === 'skipped') return '\uffff';          // sort skipped last
+    return (siActiveReasons(b.reasons)[0] || {}).reason || '';
+  }},
+];
+
+function siSortIndicator(key) {
+  const st = syncIssues.sortSyncs;
+  if (st.key !== key) return '';
+  return st.dir === 'asc' ? ' <span class="si-sort-arrow">▲</span>'
+                          : ' <span class="si-sort-arrow">▼</span>';
+}
+
+function siCompare(a, b, col, dir) {
+  let va = col.get(a), vb = col.get(b);
+  if (col.num) {
+    va = va == null ? -Infinity : parseFloat(va);
+    vb = vb == null ? -Infinity : parseFloat(vb);
+    if (Number.isNaN(va)) va = -Infinity;
+    if (Number.isNaN(vb)) vb = -Infinity;
+  } else {
+    va = String(va ?? '').toLowerCase();
+    vb = String(vb ?? '').toLowerCase();
+  }
+  const c = va < vb ? -1 : va > vb ? 1 : 0;
+  return dir === 'asc' ? c : -c;
+}
+
+// Syncs at or above the post-query threshold slider.
+function siVisibleSyncs() {
+  const min = syncIssues.minPct;
+  const kept = syncIssues.syncs.filter(s => {
+    const v = parseFloat(s.PCT_UNITS_MARKED_UNAVAILABLE);
+    return Number.isNaN(v) ? true : v >= min - 1e-9;
+  });
+  const col = SI_SYNC_COLUMNS.find(c => c.key === syncIssues.sortSyncs.key)
+            || SI_SYNC_COLUMNS.find(c => c.key === 'pct');
+  return kept.sort((a, b) => siCompare(a, b, col, syncIssues.sortSyncs.dir));
+}
+
+function buildThresholdSliderHtml() {
+  const floorPct = Math.round(syncIssues.queryPct * 100);
+  const curPct   = Math.round(syncIssues.minPct * 100);
+  return `<div class="si-slider-bar">
+    <span class="si-toggle-label">Min % Unavail.</span>
+    <input type="range" id="si-pct-slider" min="${floorPct}" max="100" step="1"
+           value="${curPct}" aria-label="Minimum percent of units marked unavailable">
+    <span id="si-pct-value">${curPct}%</span>
+    <span id="si-pct-count" class="si-toggle-note"></span>
+  </div>`;
+}
+
+function buildSyncsTableHtml(syncs) {
+  const rows = syncs.map(s => {
+    const bid = String(s.BUILDING_ID ?? '');
+    const pct = s.PCT_UNITS_MARKED_UNAVAILABLE != null
+      ? (parseFloat(s.PCT_UNITS_MARKED_UNAVAILABLE) * 100).toFixed(1) + '%'
+      : '—';
+    const buildingCell = s.SNAPSHOT_LINK
+      ? `<a href="${esc(s.SNAPSHOT_LINK)}" target="_blank" rel="noopener" style="color:#58a6ff">${esc(s.BUILDING_NAME || '—')}</a>`
+      : esc(s.BUILDING_NAME || '—');
+    const ts = (s.SYNC_STARTED_AT || '').replace('T', ' ').replace(/\.\d+.*$/, '');
+    return `<tr class="si-sync-row" data-bid="${esc(bid)}">
+      <td class="si-expand-cell">
+        <button class="si-expand-btn" data-bid="${esc(bid)}" aria-expanded="false"
+                title="Show unavailability reasons for this building" disabled>▶</button>
+      </td>
+      <td>${esc(s.ORG_NAME || '—')}</td>
+      <td>${buildingCell}</td>
+      <td>${esc(ts)}</td>
+      <td>${esc(s.SOURCES || '—')}</td>
+      <td style="text-align:right">${esc(String(s.TOTAL_UNITS_BEFORE_SYNC ?? '—'))}</td>
+      <td style="text-align:right">${esc(String(s.UNITS_MARKED_UNAVAILABLE ?? '—'))}</td>
+      <td style="text-align:right;font-weight:600;color:#f85149">${esc(pct)}</td>
+      <td class="si-top-reason" data-bid="${esc(bid)}"><span class="si-pending">analyzing…</span></td>
+    </tr>
+    <tr class="si-detail-row" data-bid="${esc(bid)}" hidden>
+      <td colspan="${SI_TABLE_COLS}"><div class="si-detail"></div></td>
+    </tr>`;
+  }).join('');
+
+  const total = syncIssues.syncs.length;
+  const shownNote = syncs.length === total
+    ? `${total}` : `${syncs.length} of ${total}`;
+  const heads = SI_SYNC_COLUMNS.map(c =>
+    `<th class="si-sortable${c.right ? ' si-th-right' : ''}" data-sortkey="${c.key}"
+         title="Sort by ${esc(c.label)}">${esc(c.label)}${siSortIndicator(c.key)}</th>`
+  ).join('');
+
+  return `<div class="si-syncs-section">
+    <div class="si-syncs-heading">Flagged Syncs (${shownNote})
+      <span class="si-syncs-hint">— click ▶ for a building's reasons, or a column header to sort</span>
+    </div>
+    <div class="si-syncs-wrap">
+      <table class="si-table">
+        <thead><tr><th style="width:28px"></th>${heads}</tr></thead>
+        <tbody>${rows}</tbody>
+      </table>
+    </div>
+  </div>`;
+}
+
+// Re-render the syncs table in place, preserving which rows were expanded.
+function siRenderSyncsTable() {
+  const host = document.getElementById('si-syncs-host');
+  if (!host) return;
+  const visible = siVisibleSyncs();
+  host.innerHTML = buildSyncsTableHtml(visible);
+  // Restore expanded rows that survived the filter.
+  syncIssues.open.forEach(bid => {
+    const row = host.querySelector(`.si-detail-row[data-bid="${CSS.escape(bid)}"]`);
+    const btn = host.querySelector(`.si-expand-btn[data-bid="${CSS.escape(bid)}"]`);
+    if (row) row.hidden = false;
+    if (btn) { btn.textContent = '▼'; btn.setAttribute('aria-expanded', 'true'); }
+  });
+  siRefreshBuildingRows();
+  const countEl = document.getElementById('si-pct-count');
+  if (countEl) {
+    const total = syncIssues.syncs.length;
+    countEl.textContent = visible.length === total
+      ? `all ${total} sync${total === 1 ? '' : 's'}`
+      : `${visible.length} of ${total} syncs`;
+  }
+}
+
+// The combined rollup is recomputed from the per-building data so the slider
+// needs no re-query: buildings below the threshold simply drop out.
+function siAggregateVisibleResult() {
+  const base = syncIssues.lastResult || {};
+  const visibleBids = new Set(siVisibleSyncs().map(s => String(s.BUILDING_ID ?? '')));
+  const byReason = new Map();
+  const byInt = {}, byIntNew = {};
+  let all = 0, neu = 0, withData = 0, skipped = 0, baselineMissing = 0, analyzed = 0;
+
+  Object.entries(syncIssues.buildings).forEach(([bid, b]) => {
+    if (!visibleBids.has(bid)) return;
+    analyzed++;
+    if (b.status === 'skipped') { skipped++; return; }
+    withData++;
+    all += b.unavailableUnits || 0;
+    neu += b.newlyMarkedUnits || 0;
+    if (!b.baselineAvailable) baselineMissing++;
+    if (b.integration) {
+      byInt[b.integration]    = (byInt[b.integration]    || 0) + (b.unavailableUnits || 0);
+      byIntNew[b.integration] = (byIntNew[b.integration] || 0) + (b.newlyMarkedUnits || 0);
+    }
+    (b.reasons || []).forEach(r => {
+      const e = byReason.get(r.reason) || {reason: r.reason, count: 0, countNew: 0};
+      e.count    += r.count    || 0;
+      e.countNew += r.countNew || 0;
+      byReason.set(r.reason, e);
+    });
+  });
+
+  const rows = [...byReason.values()].map(e => ({
+    ...e,
+    pct:    all ? Math.round(1000 * e.count    / all) / 10 : 0,
+    pctNew: neu ? Math.round(1000 * e.countNew / neu) / 10 : 0,
+  }));
+
+  return {
+    ...base,
+    reasonDistribution: rows,
+    unavailableUnits: all,
+    newlyMarkedUnits: neu,
+    syncsAnalyzed: analyzed,
+    syncsWithData: withData,
+    skipped,
+    baselineMissingBuildings: baselineMissing,
+    byIntegration: byInt,
+    byIntegrationNew: byIntNew,
+    originalSyncs: analyzed,
+    deduplicatedBuildings: analyzed,
+  };
+}
+
+// One place that repaints everything the slider / toggle / sort can affect.
+function siRepaint() {
+  siRenderSyncsTable();
+  if (syncIssues.lastResult) {
+    const agg = siAggregateVisibleResult();
+    _siRenderLiveDist(agg, !!syncIssues.lastResult.partial);
+    siSetPreviewStatus(siSummaryLine(agg));
+  }
+}
+
+function siSetMinPct(pct) {
+  const next = Math.max(syncIssues.queryPct, Math.min(1, pct));
+  if (Math.abs(next - syncIssues.minPct) < 1e-9) return;
+  syncIssues.minPct = next;
+  const val = document.getElementById('si-pct-value');
+  if (val) val.textContent = `${Math.round(next * 100)}%`;
+  siRepaint();
+}
+
+function siDistSortIndicator(key) {
+  const st = syncIssues.sortDist;
+  if (st.key !== key) return '';
+  return st.dir === 'asc' ? ' <span class="si-sort-arrow">▲</span>'
+                          : ' <span class="si-sort-arrow">▼</span>';
+}
+
+// Count and % rank identically within one scope, so both map to the active
+// count; only Reason sorts as text.
+function siSortDistRows(rows) {
+  const {key, dir} = syncIssues.sortDist;
+  rows.sort((a, b) => {
+    let c;
+    if (key === 'reason') {
+      c = a.reason.toLowerCase() < b.reason.toLowerCase() ? -1
+        : a.reason.toLowerCase() > b.reason.toLowerCase() ? 1 : 0;
+    } else {
+      c = siCount(a) - siCount(b);
+      if (c === 0) c = a.reason.toLowerCase() < b.reason.toLowerCase() ? -1 : 1;
+    }
+    return dir === 'asc' ? c : -c;
+  });
+  return rows;
+}
+
+function siSortDistBy(key) {
+  const st = syncIssues.sortDist;
+  if (st.key === key) {
+    st.dir = st.dir === 'desc' ? 'asc' : 'desc';
+  } else {
+    st.key = key;
+    st.dir = key === 'reason' ? 'asc' : 'desc';
+  }
+  if (syncIssues.lastResult) {
+    _siRenderLiveDist(siAggregateVisibleResult(), !!syncIssues.lastResult.partial);
+  }
+}
+
+function siSortSyncsBy(key) {
+  const st = syncIssues.sortSyncs;
+  if (st.key === key) {
+    st.dir = st.dir === 'desc' ? 'asc' : 'desc';
+  } else {
+    st.key = key;
+    // Numeric columns are most useful largest-first; text ascending.
+    const col = SI_SYNC_COLUMNS.find(c => c.key === key);
+    st.dir = col && col.num ? 'desc' : 'asc';
+  }
+  siRenderSyncsTable();
+}
+
+// ── Per-building expand ─────────────────────────────────────────────────────
+
+function siToggleBuilding(bid) {
+  const detail = document.querySelector(`.si-detail-row[data-bid="${CSS.escape(bid)}"]`);
+  const btn    = document.querySelector(`.si-expand-btn[data-bid="${CSS.escape(bid)}"]`);
+  if (!detail) return;
+  const willOpen = detail.hidden;
+  detail.hidden = !willOpen;
+  if (btn) {
+    btn.textContent = willOpen ? '▼' : '▶';
+    btn.setAttribute('aria-expanded', String(willOpen));
+  }
+  if (willOpen) { syncIssues.open.add(bid); siRenderBuildingDetail(bid); }
+  else          { syncIssues.open.delete(bid); }
+}
+
+function siRenderBuildingDetail(bid) {
+  const row = document.querySelector(`.si-detail-row[data-bid="${CSS.escape(bid)}"]`);
+  if (!row || row.hidden) return;
+  const host = row.querySelector('.si-detail');
+  if (!host) return;
+  const b = syncIssues.buildings[bid];
+
+  if (!b) {
+    host.innerHTML = `<div class="si-pending">Still analyzing this building…</div>`;
+    return;
+  }
+  if (b.status === 'skipped') {
+    host.innerHTML = `<div class="si-skip-note">
+      <strong>Not analyzed.</strong> ${esc(b.skipReason || 'Unknown reason')}
+    </div>`;
+    return;
+  }
+
+  const reasons = siActiveReasons(b.reasons);
+  const maxCount = Math.max(...reasons.map(siCount), 1);
+
+  const distRows = reasons.map(r => {
+    const barPct = Math.round(100 * siCount(r) / maxCount);
+    return `<tr>
+      <td>${esc(r.reason)}</td>
+      <td style="text-align:right;font-variant-numeric:tabular-nums">${siCount(r)}</td>
+      <td style="text-align:right;font-variant-numeric:tabular-nums">${siPct(r)}%</td>
+      <td class="si-dist-bar-cell">
+        <div class="si-dist-bar-wrap"><div class="si-dist-bar" style="width:${barPct}%"></div></div>
+      </td>
+    </tr>`;
+  }).join('');
+
+  const unitBlocks = reasons.map(r => {
+    const units = siActiveUnits(r);
+    if (!units.length) return '';
+    const cols = ['status', 'rent', 'availableDate', 'sqft']
+      .filter(c => units.some(u => u[c] != null));
+    const head = ['Unit Key', 'Unit Number', ...cols.map(siUnitColLabel)]
+      .map(h => `<th>${esc(h)}</th>`).join('');
+    const body = units.map(u => `<tr>
+      <td class="si-mono">${esc(String(u.unitKey ?? '—'))}</td>
+      <td>${esc(String(u.unitNumber ?? '—'))}</td>
+      ${cols.map(c => `<td>${esc(u[c] == null ? '—' : String(u[c]))}</td>`).join('')}
+    </tr>`).join('');
+    const more = r.unitsTruncated
+      ? `<div class="si-units-more">Showing first ${units.length} of ${siCount(r)} units.</div>`
+      : '';
+    return `<details class="si-units">
+      <summary>${esc(r.reason)} <span class="si-units-count">${siCount(r)} unit${siCount(r) === 1 ? '' : 's'}</span></summary>
+      <div class="si-units-wrap">
+        <table class="si-unit-table"><thead><tr>${head}</tr></thead><tbody>${body}</tbody></table>
+        ${more}
+      </div>
+    </details>`;
+  }).join('');
+
+  // The baseline is the snapshot preceding the analysed one; without it we
+  // cannot separate newly-marked units from already-unavailable ones.
+  const baselineNote = b.baselineAvailable
+    ? `baseline <span class="si-mono">${esc(b.baselineSnapshot || '')}</span>`
+    : `<span class="si-warn">no pre-sync snapshot found — newly-marked count unavailable</span>`;
+
+  const shown = syncIssues.showAll ? b.unavailableUnits : b.newlyMarkedUnits;
+  const breakdown = b.baselineAvailable
+    ? ` <span class="si-detail-sub">(${b.newlyMarkedUnits} newly marked, `
+      + `${b.preExistingUnits} already unavailable)</span>`
+    : '';
+
+  const emptyMsg = syncIssues.showAll
+    ? 'No unavailable units found in this snapshot.'
+    : (b.baselineAvailable
+        ? 'This sync newly marked no units unavailable — every unavailable unit was already unavailable beforehand.'
+        : 'No pre-sync snapshot was found for this building, so newly-marked units cannot be identified. Switch to "All unavailable" to see the full distribution.');
+
+  host.innerHTML = `
+    <div class="si-detail-meta">
+      ${esc(b.integration || '—')} · <span class="si-mono">${esc(b.snapshot || 'unknown snapshot')}</span> · ${baselineNote}
+    </div>
+    <div class="si-detail-meta">
+      <strong style="color:#e6edf3">${shown}</strong> ${esc(siScopeLabel())}${breakdown}
+    </div>
+    ${reasons.length
+      ? `<table class="si-dist-table">
+           <thead><tr><th>Reason</th><th>Count</th><th>%</th><th style="width:160px"></th></tr></thead>
+           <tbody>${distRows}</tbody>
+         </table>
+         ${unitBlocks ? `<div class="si-units-section">${unitBlocks}</div>` : ''}`
+      : `<div class="si-pending">${esc(emptyMsg)}</div>`}`;
+}
+
+function siUnitColLabel(c) {
+  return { status: 'Status', rent: 'Rent', availableDate: 'Available', sqft: 'Sq Ft' }[c] || c;
+}
+
+// Refresh the "Top Reason" cells and any expanded detail panes.
+function siRefreshBuildingRows() {
+  Object.entries(syncIssues.buildings).forEach(([bid, b]) => {
+    const cell = document.querySelector(`.si-top-reason[data-bid="${CSS.escape(bid)}"]`);
+    if (cell) {
+      if (b.status === 'skipped') {
+        cell.innerHTML = `<span class="si-skipped-tag" title="${esc(b.skipReason || '')}">skipped</span>`;
+      } else if (!syncIssues.showAll && !b.baselineAvailable) {
+        cell.innerHTML = `<span class="si-pending" title="No pre-sync snapshot found">no baseline</span>`;
+      } else {
+        const top = siActiveReasons(b.reasons)[0];
+        cell.innerHTML = top
+          ? `${esc(top.reason)} <span class="si-top-pct">${siPct(top)}%</span>`
+          : `<span class="si-pending">none newly marked</span>`;
+      }
+    }
+    const btn = document.querySelector(`.si-expand-btn[data-bid="${CSS.escape(bid)}"]`);
+    if (btn) btn.disabled = false;
+  });
+  syncIssues.open.forEach(siRenderBuildingDetail);
+}
+
+function buildAnalyzeProgressHtml() {
+  return `<div id="si-analyze-progress">
+    <div id="si-analyze-progress-header">
+      <div class="si-spinner"></div>
+      <div id="si-analyze-progress-label">Running Availability Agent…</div>
+    </div>
+    <div id="si-analyze-progress-note">Loading integration indexes…</div>
+    <div id="si-analyze-progress-track">
+      <div id="si-analyze-progress-fill" style="width:2%"></div>
+    </div>
+  </div>
+  <div id="si-live-dist"></div>`;
+}
+
+async function runSyncIssuesAnalyze() {
+  if (!syncIssues.syncs.length) return;
+  try {
+    const res = await fetch('/api/sync-issues/analyze', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ syncs: syncIssues.syncs }),
+    });
+    const data = await res.json();
+    if (!res.ok || data.error) throw new Error(data.error || res.statusText);
+    syncIssues.jobId = data.jobId;
+    clearInterval(syncIssues.polling);
+    syncIssues.polling = setInterval(pollSyncIssuesJob, 2500);
+  } catch (e) {
+    siSetSidebarStatus(`Analysis failed: ${e.message}`, true);
+    siSetPreviewStatus('Analysis failed');
+    // Replace progress bar with error note
+    const prog = document.getElementById('si-analyze-progress');
+    if (prog) prog.innerHTML = `<div style="color:#f85149;font-size:12px">${esc(e.message)}</div>`;
+  }
+}
+
+async function pollSyncIssuesJob() {
+  if (!syncIssues.jobId) return;
+  try {
+    const res  = await fetch(`/api/job?id=${encodeURIComponent(syncIssues.jobId)}`);
+    const data = await res.json();
+    const { status, done, total, note, result, error } = data;
+
+    // A 404 / error payload has no status — surface it instead of falling
+    // through to the "done" branch with an undefined result.
+    if (!status) {
+      throw new Error(error || `job status unavailable (HTTP ${res.status})`);
+    }
+
+    if (status === 'running') {
+      const frac = total ? done / total : 0;
+      const pct  = total ? `${done} / ${total}` : '…';
+      const fill = document.getElementById('si-analyze-progress-fill');
+      if (fill) fill.style.width = Math.max(2, Math.round(frac * 100)) + '%';
+      const lbl = document.getElementById('si-analyze-progress-label');
+      if (lbl) lbl.textContent = `Running Availability Agent — ${pct} buildings`;
+      const noteEl = document.getElementById('si-analyze-progress-note');
+      if (noteEl) noteEl.textContent = note || '';
+      siSetPreviewStatus(`Analyzing — ${pct} buildings`);
+      // Render live partial distribution as it accumulates
+      if (result) {
+        syncIssues.buildings  = result.buildings || {};
+        syncIssues.lastResult = result;
+        siRefreshBuildingRows();
+        if ((result.reasonDistribution || []).length > 0) {
+          _siRenderLiveDist(siAggregateVisibleResult(), true);
+        }
+      }
+      return;
+    }
+
+    clearInterval(syncIssues.polling);
+    syncIssues.polling = null;
+    syncIssues.jobId   = null;
+
+    if (status === 'error') {
+      siSetSidebarStatus(`Analysis error: ${error || 'unknown'}`, true);
+      siSetPreviewStatus('Analysis error');
+      const prog = document.getElementById('si-analyze-progress');
+      if (prog) prog.innerHTML =
+        `<div style="color:#f85149;font-size:12px">Analysis error: ${esc(error || 'unknown')}</div>`;
+      return;
+    }
+
+    // Done — remove progress bar, finalize distribution
+    const prog = document.getElementById('si-analyze-progress');
+    if (prog) prog.remove();
+
+    const r = result || {};
+    syncIssues.buildings  = r.buildings || {};
+    syncIssues.lastResult = r;
+    siSetSidebarStatus(
+      `Done — ${r.newlyMarkedUnits || 0} newly marked / ${r.unavailableUnits || 0} unavailable`, false);
+
+    // Re-render through the shared path so an active slider / sort / scope
+    // selection is preserved when the job finishes.
+    siRepaint();
+  } catch (e) {
+    // Stop the loop and show the failure rather than polling forever in silence.
+    clearInterval(syncIssues.polling);
+    syncIssues.polling = null;
+    syncIssues.jobId   = null;
+    siSetSidebarStatus(`Analysis failed: ${e.message}`, true);
+    siSetPreviewStatus('Analysis failed');
+    const prog = document.getElementById('si-analyze-progress');
+    if (prog) prog.innerHTML =
+      `<div style="color:#f85149;font-size:12px">Analysis failed: ${esc(e.message)}</div>`;
+  }
+}
+
+function _siRenderLiveDist(result, isPartial) {
+  // The progress card owns #si-live-dist; if it was already removed, recreate
+  // the container so the final distribution always has somewhere to render.
+  let liveDist = document.getElementById('si-live-dist');
+  if (!liveDist) {
+    const body = document.getElementById('si-preview-body');
+    if (!body) return;
+    liveDist = document.createElement('div');
+    liveDist.id = 'si-live-dist';
+    body.appendChild(liveDist);
+  }
+  // Preserve which sections the user had open, since every slider drag, sort,
+  // or scope change re-renders this subtree.
+  const prevCombined = liveDist.querySelector('.si-combined');
+  const wasOpen = prevCombined ? prevCombined.open : false;
+
+  const el = buildDistributionHtml(result, isPartial);
+  liveDist.innerHTML = '';
+  liveDist.appendChild(el);
+
+  const nextCombined = liveDist.querySelector('.si-combined');
+  if (nextCombined) nextCombined.open = wasOpen;
+}
+
+function buildDistributionHtml(result, isPartial) {
+  const dist = siActiveReasons(result.reasonDistribution);
+  const wrap = document.createElement('div');
+  wrap.className = 'si-dist-section';
+
+  const headingSuffix = isPartial ? ' <span style="color:#6e7681;font-weight:400">(updating…)</span>' : '';
+
+  if (!dist.length) {
+    // The slider is the likelier cause once it has been raised, so name it
+    // rather than pointing at the scope toggle.
+    const filtered = syncIssues.minPct > syncIssues.queryPct + 1e-9;
+    const msg = filtered
+      ? `No syncs are at or above ${Math.round(syncIssues.minPct * 100)}% unavailable. `
+        + `Lower the Min % Unavail. slider to widen the results.`
+      : (syncIssues.showAll
+          ? 'No unavailable units found yet in analyzed snapshots.'
+          : 'No newly-marked units found yet. Switch to \u201cAll unavailable\u201d to include units that were already unavailable before the sync.');
+    wrap.innerHTML = `<div class="si-dist-heading">Combined Distribution — All Buildings${headingSuffix}</div>
+      <div style="font-size:12px;color:#8b949e;padding:8px 0">${msg}</div>`;
+    return wrap;
+  }
+
+  const maxCount = Math.max(...dist.map(siCount), 1);
+  siSortDistRows(dist);
+  const rows = dist.map(d => {
+    const barPct = Math.round(100 * siCount(d) / maxCount);
+    return `<tr>
+      <td>${esc(d.reason)}</td>
+      <td style="text-align:right;font-variant-numeric:tabular-nums">${siCount(d)}</td>
+      <td style="text-align:right;font-variant-numeric:tabular-nums">${siPct(d)}%</td>
+      <td class="si-dist-bar-cell">
+        <div class="si-dist-bar-wrap">
+          <div class="si-dist-bar" style="width:${barPct}%"></div>
+        </div>
+      </td>
+    </tr>`;
+  }).join('');
+
+  const skippedNote = result.skipped
+    ? ` · ${result.skipped} skipped (expand a row for the reason)`
+    : '';
+  // Buildings with no pre-sync snapshot contribute nothing to the newly-marked
+  // view, so say so rather than letting them silently vanish.
+  const baselineNote = (!syncIssues.showAll && result.baselineMissingBuildings)
+    ? ` · ${result.baselineMissingBuildings} building${result.baselineMissingBuildings === 1 ? '' : 's'} excluded (no pre-sync snapshot)`
+    : '';
+  const dedup = result.deduplicatedBuildings;
+  const orig  = result.originalSyncs;
+  const dedupNote = (dedup && orig && orig > dedup)
+    ? ` · ${orig} syncs → ${dedup} unique buildings`
+    : '';
+
+  const byInt = Object.entries(
+    (syncIssues.showAll ? result.byIntegration : result.byIntegrationNew) || {}
+  ).filter(([, v]) => v > 0).sort((a, b) => b[1] - a[1]);
+  const chips = byInt.map(([k, v]) =>
+    `<span class="si-int-chip">${esc(k)} <strong>${v}</strong></span>`
+  ).join('');
+
+  // A failed rollout/metadata lookup leaves rollout-dependent overrides
+  // dormant, which under-reports reasons — say so rather than hiding it.
+  const lookupWarn = (result.rolloutError || result.enrichError)
+    ? `<div class="si-lookup-warn">⚠ Building/rollout metadata lookup failed — `
+      + `rollout-dependent reasons (AppFolio "Not Posted to Website", RealPage `
+      + `"Exclude Not Rent Ready Units") were not evaluated. `
+      + `${esc(result.rolloutError || result.enrichError)}</div>`
+    : '';
+
+  // Per-building distributions live in the Flagged Syncs table now, so the
+  // all-buildings rollup is collapsed by default.
+  wrap.innerHTML = `${lookupWarn}
+    <details class="si-combined">
+      <summary>
+        <span class="si-dist-heading">Combined Distribution — All Buildings${headingSuffix}</span>
+      </summary>
+      <div class="si-combined-body">
+        <div class="si-dist-meta">
+          ${syncIssues.showAll ? result.unavailableUnits : result.newlyMarkedUnits} ${esc(siScopeLabel())} · ${result.syncsWithData} buildings${skippedNote}${dedupNote}${baselineNote}
+        </div>
+        ${chips ? `<div class="si-by-int">${chips}</div>` : ''}
+        <table class="si-dist-table">
+          <thead><tr>
+            <th class="si-dist-sortable" data-sortkey="reason">Reason${siDistSortIndicator('reason')}</th>
+            <th class="si-dist-sortable" data-sortkey="count">Count${siDistSortIndicator('count')}</th>
+            <th class="si-dist-sortable" data-sortkey="pct">%${siDistSortIndicator('pct')}</th>
+            <th style="width:160px"></th>
+          </tr></thead>
+          <tbody>${rows}</tbody>
+        </table>
+      </div>
+    </details>`;
+  return wrap;
 }
 
 function highlight(obj) {

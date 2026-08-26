@@ -16,7 +16,7 @@ from flask import Flask, request, jsonify, send_from_directory
 from flask_cors import CORS
 from concurrent.futures import (ThreadPoolExecutor, TimeoutError as FutureTimeoutError,
                                 wait, FIRST_COMPLETED)
-from datetime import datetime, timedelta, timezone
+from datetime import date, datetime, timedelta, timezone
 from botocore.config import Config
 from botocore.exceptions import ClientError
 from dotenv import load_dotenv
@@ -51,7 +51,6 @@ SAMPLE_SIZE   = 150 # buildings sampled to populate the file-name dropdown
 RESULT_CAP    = 500 # max matches returned to the client
 SNIPPET_PAD   = 70  # chars of context on each side of a match
 ENRICH_TIMEOUT = 20 # seconds before Snowflake enrichment is abandoned
-DEFAULT_SEARCH_LOOKBACK_HOURS = 24
 AVAILABILITY_INDEX_MAX_AGE = 24 * 60 * 60
 ENV_PATH        = os.path.join(os.path.dirname(os.path.abspath(__file__)), '.env')
 
@@ -313,6 +312,53 @@ def _snapshot_prefix_before(entity_prefix: str, cutoff: datetime,
         if not resp.get('IsTruncated'):
             break
         kwargs['ContinuationToken'] = resp['NextContinuationToken']
+    return best_prefix
+
+
+def _snapshot_prefix_nearest(entity_prefix: str, reference: datetime,
+                             max_skew_minutes: int = 15):
+    """Return the snapshot closest to ``reference`` within a small sync skew.
+
+    Related integration snapshots from the same logical sync can finish a few
+    seconds after the primary snapshot. Latest-mode cross-integration joins
+    may use that near-future snapshot; explicit as-of searches continue using
+    the strict at-or-before resolver above.
+    """
+    client = s3()
+    lower_bound = reference - timedelta(minutes=max_skew_minutes)
+    upper_bound = reference + timedelta(minutes=max_skew_minutes)
+    seek = (lower_bound - timedelta(microseconds=1)).astimezone(timezone.utc)
+    kwargs = {
+        'Bucket': BUCKET,
+        'Delimiter': '/',
+        'Prefix': entity_prefix,
+        'MaxKeys': PAGE_SIZE,
+        'StartAfter': (
+            f'{entity_prefix}snapshot-'
+            f'{seek.isoformat(timespec="microseconds").replace("+00:00", "Z")}'),
+    }
+    best_prefix = None
+    best_rank = None
+    while True:
+        response = client.list_objects_v2(**kwargs)
+        for common_prefix in response.get('CommonPrefixes', []):
+            name = common_prefix['Prefix'][len(entity_prefix):].rstrip('/')
+            try:
+                timestamp = _snapshot_dt(name)
+            except (TypeError, ValueError):
+                continue
+            if timestamp > upper_bound:
+                return best_prefix
+            if timestamp < lower_bound:
+                continue
+            rank = (abs((timestamp - reference).total_seconds()),
+                    timestamp > reference, timestamp)
+            if best_rank is None or rank < best_rank:
+                best_rank = rank
+                best_prefix = common_prefix['Prefix']
+        if not response.get('IsTruncated'):
+            break
+        kwargs['ContinuationToken'] = response['NextContinuationToken']
     return best_prefix
 
 
@@ -1530,6 +1576,12 @@ def _condition_value_matches(actual, operator: str, expected: str) -> bool:
     actual_text = _csv_cell(actual).strip()
     expected_text = str(expected).strip()
     if operator == 'eq':
+        # An absent field is not an empty one. A rule testing for an empty
+        # value (RentCafe "Status: Blank") must match only rows that actually
+        # carry a blank status, not rows where the field is missing entirely
+        # — e.g. unit_details-only rows, which have no status field at all.
+        if actual is None and not expected_text:
+            return False
         return actual_text.casefold() == expected_text.casefold()
     if operator == 'ne':
         return actual_text.casefold() != expected_text.casefold()
@@ -1666,22 +1718,13 @@ def _build_targets(entities: dict, integration: str, file_name: str, allowed, as
     whether it had that file in whatever snapshot existed as of the cutoff.
     """
     file_name = _canonical_file_name(integration, file_name)
-    stale_latest = 0
-    freshness_cutoff = (
-        datetime.now(timezone.utc) - timedelta(hours=DEFAULT_SEARCH_LOOKBACK_HOURS)
-        if as_of is None else None
-    )
     if as_of is None:
+        # Index construction already applied the 24-hour eligibility window.
+        # Once built, the index is the complete latest-search scope even when
+        # its recorded snapshots later become more than 24 hours old.
         targets = []
         for entity, (snapshot, files) in entities.items():
             if allowed is not None and entity not in allowed:
-                continue
-            try:
-                created_at = _snapshot_dt(snapshot)
-            except (TypeError, ValueError):
-                created_at = None
-            if created_at is None or created_at < freshness_cutoff:
-                stale_latest += 1
                 continue
             actual_file = _file_variant(files, integration, file_name)
             if actual_file:
@@ -1695,7 +1738,7 @@ def _build_targets(entities: dict, integration: str, file_name: str, allowed, as
             if allowed is None or entity in allowed
         ]
     targets.sort()
-    return targets, stale_latest
+    return targets
 
 
 def _fetch_text(key: str) -> str:
@@ -1710,7 +1753,7 @@ def _fetch_text(key: str) -> str:
     return raw.decode('utf-8', errors='replace')
 
 
-def _enrich_with_snowflake(job_id: str, entity_list: list):
+def _enrich_with_snowflake(job_id: str, entity_list: list, timeout=None):
     """
     Building name/org lookup for the rows actually being returned. Runs through
     a throwaway single-worker pool so a stuck connection (seen in practice: TCP
@@ -1718,6 +1761,9 @@ def _enrich_with_snowflake(job_id: str, entity_list: list):
     policy) times out instead of hanging the whole job. shutdown(wait=False)
     means the stuck thread is abandoned, not joined — the caller doesn't wait
     for it to die. Returns (meta_dict_or_None, column_map_or_None, error_or_None).
+
+    `timeout` overrides ENRICH_TIMEOUT for callers that can afford to wait; a
+    cold warehouse routinely needs far longer than the interactive default.
     """
     if not entity_list:
         return None, None, None
@@ -1728,10 +1774,11 @@ def _enrich_with_snowflake(job_id: str, entity_list: list):
     pool = ThreadPoolExecutor(max_workers=1)
     try:
         future = pool.submit(snowflake_db.lookup, entity_list)
-        meta = future.result(timeout=ENRICH_TIMEOUT)
+        limit = timeout or ENRICH_TIMEOUT
+        meta = future.result(timeout=limit)
         return meta, snowflake_db.column_map(), None
     except FutureTimeoutError:
-        return None, None, (f'Snowflake lookup timed out after {ENRICH_TIMEOUT}s '
+        return None, None, (f'Snowflake lookup timed out after {limit}s '
                             f'(network/connection issue) — showing results without '
                             f'building details')
     except Exception as e:
@@ -1756,7 +1803,7 @@ def _run_search_job(job_id: str, integration: str, file_name: str, text: str,
         allowed, filter_note = _resolve_org_building_filter(
             org, building_filter, exclude_students=not include_students)
 
-        targets, stale_latest = _build_targets(
+        targets = _build_targets(
             entities, integration, file_name, allowed, as_of)
         _job_update(job_id, total=len(targets),
                    note=(f'Resolving snapshots as of {as_of.isoformat()}…'
@@ -1864,9 +1911,6 @@ def _run_search_job(job_id: str, integration: str, file_name: str, text: str,
                         'searched':    counter['n'],
                         'buildings':   len(entities),
                         'noSnapshot':  no_snapshot,
-                        'staleLatest': stale_latest,
-                        'freshnessHours': (DEFAULT_SEARCH_LOOKBACK_HOURS
-                                           if as_of is None else None),
                         'matchCount':  len(matches),
                         'matches':     shown,
                         'truncated':   limit_reached.is_set(),
@@ -2120,7 +2164,7 @@ def _run_fields_job(job_id: str, integration: str, file_name: str, raw_field_spe
         allowed, filter_note = _resolve_org_building_filter(
             org, building_filter, exclude_students=not include_students)
 
-        targets, stale_latest = _build_targets(
+        targets = _build_targets(
             entities, integration, file_name, allowed, as_of)
         # A right/full join may have buildings that exist only in the
         # secondary integration/file. Add those buildings without issuing any
@@ -2132,12 +2176,7 @@ def _run_fields_job(job_id: str, integration: str, file_name: str, raw_field_spe
         for rel in outer_related:
             search_buildings.update(related_entities.get(rel['integration'], {}))
         target_by_entity = {target[0]: target for target in targets}
-        stale_outer = set()
         if outer_related:
-            freshness_cutoff = (
-                datetime.now(timezone.utc) - timedelta(hours=DEFAULT_SEARCH_LOOKBACK_HOURS)
-                if as_of is None else None
-            )
             for rel in outer_related:
                 for entity, (rel_snapshot, rel_files) in related_entities.get(
                         rel['integration'], {}).items():
@@ -2149,18 +2188,10 @@ def _run_fields_job(job_id: str, integration: str, file_name: str, raw_field_spe
                             rel_files, rel['integration'], rel['filename'])
                         if not rel_actual:
                             continue
-                        try:
-                            rel_created_at = _snapshot_dt(rel_snapshot)
-                        except (TypeError, ValueError):
-                            rel_created_at = None
-                        if rel_created_at is None or rel_created_at < freshness_cutoff:
-                            stale_outer.add((rel['integration'], entity, rel['filename']))
-                            continue
                         target_by_entity[entity] = (entity, rel_snapshot, None)
                     else:
                         target_by_entity[entity] = (entity, None, None)
             targets = sorted(target_by_entity.values())
-            stale_latest += len(stale_outer)
         _job_update(job_id, total=len(targets),
                    note=(f'Resolving snapshots as of {as_of.isoformat()}…'
                          if as_of else 'Reading snapshots…'))
@@ -2349,9 +2380,6 @@ def _run_fields_job(job_id: str, integration: str, file_name: str, raw_field_spe
                         'searched':     counter['n'],
                         'buildings':    len(search_buildings),
                         'noSnapshot':   no_snapshot,
-                        'staleLatest':  stale_latest,
-                        'freshnessHours': (DEFAULT_SEARCH_LOOKBACK_HOURS
-                                           if as_of is None else None),
                         'rowCount':     len(all_rows),
                         'buildingColumns': have_building_cols,
                         'csvFields':     ['building', 'snapshot', 'building_name', 'org_id',
@@ -2427,6 +2455,17 @@ def _availability_first_file(files, integration: str, candidates: list):
     return None
 
 
+def _availability_matching_files(files, integration: str, candidates: list):
+    """Return every physical file matching configured logical candidates."""
+    matches = []
+    for actual in sorted(files or []):
+        if any(actual == candidate or actual.startswith(candidate + '_') or
+               actual.startswith(candidate + '.')
+               for candidate in (candidates or [])):
+            matches.append(actual)
+    return matches
+
+
 def _availability_value(row: dict, field: str):
     """Read a field from a row, including nested JSON stored as a string.
 
@@ -2496,6 +2535,15 @@ def _availability_voyager_units(body: str, fields: list) -> list:
             if field.startswith('@'):
                 value = next((value for key, value in unit.attrib.items()
                               if key.rsplit('}', 1)[-1] == local), None)
+                if value is None:
+                    # Unit identity is not represented consistently across
+                    # Voyager feeds. IDValue may be on ILS_Unit while IDType
+                    # is commonly on its nested Identification element.
+                    value = next((value
+                                  for descendant in unit.iter()
+                                  if descendant is not unit
+                                  for key, value in descendant.attrib.items()
+                                  if key.rsplit('}', 1)[-1] == local), None)
             else:
                 value = None
                 for descendant in unit.iter():
@@ -2537,9 +2585,52 @@ def _availability_voyager_units(body: str, fields: list) -> list:
     return rows
 
 
-def _availability_extract(body: str, fields: list, voyager_units: bool = False):
+def _availability_realpage_units(body: str, fields: list) -> list:
+    """Extract one coherent row per RealPage ``UnitObject`` XML element.
+
+    RealPage nests identity fields under ``Address`` and availability fields
+    under ``Availability``. The generic unscoped XML extractor treats those
+    nested objects as separate rows, which prevents PropertyNumberID + UnitID
+    from forming the canonical key used to join against unit-details.
+    """
+    try:
+        root = ET.fromstring(body)
+    except (ET.ParseError, TypeError, ValueError):
+        return []
+    rows = []
+    wanted = {str(field): str(field).lstrip('@') for field in fields}
+    for unit in root.iter():
+        if unit.tag.rsplit('}', 1)[-1] != 'UnitObject':
+            continue
+        row = {'_group': 'UnitObject'}
+        for field, local in wanted.items():
+            if field.startswith('@'):
+                value = next((value for key, value in unit.attrib.items()
+                              if key.rsplit('}', 1)[-1] == local), None)
+            else:
+                value = None
+                for descendant in unit.iter():
+                    if (descendant is unit or
+                            descendant.tag.rsplit('}', 1)[-1] != local):
+                        continue
+                    value = (descendant.text or '').strip() or None
+                    if value is None:
+                        value = (descendant.attrib.get('Value') or
+                                 descendant.attrib.get('Min') or
+                                 descendant.attrib.get('Max'))
+                    if value is not None:
+                        break
+            row[field] = value
+        rows.append(row)
+    return rows
+
+
+def _availability_extract(body: str, fields: list, voyager_units: bool = False,
+                          realpage_units: bool = False):
     if voyager_units:
         return _availability_voyager_units(body, fields)
+    if realpage_units:
+        return _availability_realpage_units(body, fields)
     specs = _normalize_field_specs([{'name': field} for field in fields])
     return _extract_rows_v2(body, specs, set()) if specs else []
 
@@ -2679,7 +2770,7 @@ def _availability_direct_prediction(rule: dict, values: dict):
 
 def _availability_predict(rule: dict, values: dict):
     predicted, reason = _availability_direct_prediction(rule, values)
-    direct_predicted, direct_reason = predicted, reason
+    direct_predicted = predicted
     override_reason = None
     for override in rule.get('overrides') or []:
         # Overrides are exclusion rules: they may only remove a unit from
@@ -2695,8 +2786,9 @@ def _availability_predict(rule: dict, values: dict):
         if clauses and all(_availability_when(values, clause) for clause in clauses):
             predicted = override_stage
             override_reason = override.get('reason') or f"Override: {predicted}"
-            # Direct mapping wins when it already explains the final stage.
-            if direct_predicted != predicted:
+            # Rules may explicitly prefer an override's more specific reason
+            # even when the direct status already maps to the same stage.
+            if override.get('replace_reason') or direct_predicted != predicted:
                 reason = override_reason
     if predicted is None:
         fallback = rule.get('fallback') or {}
@@ -2774,12 +2866,20 @@ def _availability_file_property_code(filename: str, candidates: list):
     for candidate in candidates or []:
         if filename.startswith(candidate + '_'):
             suffix = filename[len(candidate) + 1:]
-            return suffix.split('.', 1)[0].strip() or None
+            # A period can be part of the external property id (for example
+            # 4600.02). Remove only recognized file extensions rather than
+            # truncating at the first punctuation character.
+            for extension in ('.xml.gz', '.json.gz', '.xml', '.json', '.gz'):
+                if suffix.casefold().endswith(extension):
+                    suffix = suffix[:-len(extension)]
+                    break
+            return suffix.strip() or None
     return None
 
 
 def _availability_supplemental_rows(body: str, config: dict,
-                                    primary_rows: list) -> list:
+                                    primary_rows: list,
+                                    property_code: str | None = None) -> list:
     """Return source units whose external ids are absent from the primary feed.
 
     RentCafe is the first consumer: Voyager Unit Identification/@IDType is the
@@ -2793,56 +2893,81 @@ def _availability_supplemental_rows(body: str, config: dict,
                 supplemental_name_field)):
         return []
 
-    existing_ids = {
-        str(value).strip().casefold()
-        for row in primary_rows
-        for value in [_availability_value(row, primary_id_field)]
-        if value is not None and str(value).strip()
-    }
     output_name_field = config.get('output_name_field') or 'unit_number'
-    existing_names = {
-        str(value).strip().casefold()
-        for row in primary_rows
-        for value in [_availability_value(row, output_name_field)]
-        if value is not None and str(value).strip()
-    }
-    seen = set(existing_ids)
+    output_property_field = config.get('output_property_field')
+    existing_ids = set()
+    existing_id_values = set()
+    existing_names = set()
+    existing_name_values = set()
+    for row in primary_rows:
+        row_code = (_availability_value(row, output_property_field)
+                    if output_property_field else None)
+        normalized_code = str(row_code or '').strip().casefold()
+        source_id = _availability_value(row, primary_id_field)
+        if source_id is not None and str(source_id).strip():
+            normalized_id = str(source_id).strip().casefold()
+            existing_ids.add((normalized_code, normalized_id))
+            existing_id_values.add(normalized_id)
+        value = _availability_value(row, output_name_field)
+        if value is not None and str(value).strip():
+            normalized_name = str(value).strip().casefold()
+            existing_names.add((normalized_code, normalized_name))
+            existing_name_values.add(normalized_name)
+    seen_ids = set(existing_ids)
+    seen_id_values = set(existing_id_values)
     seen_names = set(existing_names)
+    seen_name_values = set(existing_name_values)
     output = []
     row_type_field = config.get('row_type_field')
     row_type_value = str(config.get('row_type_value') or '').strip().casefold()
-    for source_row in _availability_extract(body, config.get('fields') or []):
+    for source_row in _availability_extract(
+            body, config.get('fields') or [], voyager_units=True):
         if row_type_field:
             actual_type = _availability_value(source_row, row_type_field)
-            if str(actual_type or '').strip().casefold() != row_type_value:
+            # A coherent ILS_Unit row is already scoped to a physical unit.
+            # Older feeds expose OrganizationName="Unit"; newer feeds omit it.
+            if (source_row.get('_group') != 'ILS_Unit' and
+                    str(actual_type or '').strip().casefold() != row_type_value):
                 continue
         source_id = _availability_value(source_row, supplemental_id_field)
         source_name = _availability_value(source_row, supplemental_name_field)
         normalized_id = str(source_id or '').strip().casefold()
         normalized_name = str(source_name or '').strip().casefold()
+        normalized_code = str(property_code or '').strip().casefold()
         # Some RentCafe rows omit voyagerApartmentId even though the unit is
-        # present. Unit numbers are unique within a building, so IDValue/name
-        # is the safe fallback that prevents the same physical unit from being
-        # re-added as a synthetic Lease Signed Voyager unit.
-        if (not normalized_id or normalized_id in seen or not normalized_name or
-                normalized_name in seen_names):
+        # present. The external property id plus IDValue/name is the safe
+        # fallback that prevents the same physical unit from being re-added as
+        # a duplicate supplemental Voyager unit.
+        id_seen = ((normalized_code, normalized_id) in seen_ids
+                   if normalized_code else normalized_id in seen_id_values)
+        name_seen = ((normalized_code, normalized_name) in seen_names
+                     if normalized_code else normalized_name in seen_name_values)
+        if not normalized_id or id_seen or not normalized_name or name_seen:
             continue
-        seen.add(normalized_id)
-        seen_names.add(normalized_name)
-        output.append({
+        seen_ids.add((normalized_code, normalized_id))
+        seen_id_values.add(normalized_id)
+        seen_names.add((normalized_code, normalized_name))
+        seen_name_values.add(normalized_name)
+        supplemental_row = dict(source_row)
+        supplemental_row.update({
             output_name_field: source_name,
             primary_id_field: source_id,
-            config.get('output_status_field') or 'status':
-                config.get('output_status_value'),
             '__supplemental_unit': True,
         })
+        output_status_field = config.get('output_status_field')
+        if output_status_field:
+            supplemental_row[output_status_field] = config.get(
+                'output_status_value')
+        if output_property_field and property_code:
+            supplemental_row[output_property_field] = property_code
+        output.append(supplemental_row)
     return output
 
 
-def _availability_supplemental_target(entity: str, primary_snapshot: str,
-                                      as_of, config: dict,
-                                      indexed_entities: dict):
-    """Resolve the supplemental file, preferring its existing on-disk index."""
+def _availability_supplemental_targets(entity: str, primary_snapshot: str,
+                                       as_of, config: dict,
+                                       indexed_entities: dict):
+    """Resolve all supplemental files, preferring an existing on-disk index."""
     integrations = config.get('integrations') or []
     files = config.get('files') or []
     if as_of is None:
@@ -2851,15 +2976,35 @@ def _availability_supplemental_target(entity: str, primary_snapshot: str,
             if not entity_data:
                 continue
             snapshot, snapshot_files = entity_data
-            actual = _availability_first_file(
+            actuals = _availability_matching_files(
                 snapshot_files, related_integration, files)
-            if actual:
-                return related_integration, snapshot, actual
+            if actuals:
+                return [(related_integration, snapshot, actual)
+                        for actual in actuals]
 
-    cutoff = as_of or _availability_snapshot_datetime(primary_snapshot)
+    primary_reference = _availability_snapshot_datetime(primary_snapshot)
+    cutoff = as_of or primary_reference
     for related_integration in integrations:
         entity_prefix = f'{ROOT}{related_integration}/{entity}/'
-        if cutoff is not None:
+        if as_of is None and primary_reference is not None:
+            try:
+                nearest_minutes = int(config.get(
+                    'nearest_snapshot_minutes', 15))
+            except (TypeError, ValueError):
+                nearest_minutes = 15
+            snapshot_prefix = _snapshot_prefix_nearest(
+                entity_prefix, primary_reference,
+                max_skew_minutes=max(0, nearest_minutes))
+            if snapshot_prefix:
+                snapshot = snapshot_prefix[len(entity_prefix):].rstrip('/')
+            elif config.get('use_latest_historical_snapshot'):
+                snapshot = _latest_snapshot_seeked(
+                    entity_prefix, _cutoff_stamps(), full_fallback=True)
+                if not snapshot:
+                    continue
+            else:
+                continue
+        elif cutoff is not None:
             snapshot_prefix = _snapshot_prefix_before(entity_prefix, cutoff)
             if not snapshot_prefix:
                 continue
@@ -2870,11 +3015,12 @@ def _availability_supplemental_target(entity: str, primary_snapshot: str,
             if not snapshot:
                 continue
         snapshot_files = _snapshot_files(entity_prefix, snapshot)
-        actual = _availability_first_file(
+        actuals = _availability_matching_files(
             snapshot_files, related_integration, files)
-        if actual:
-            return related_integration, snapshot, actual
-    return None
+        if actuals:
+            return [(related_integration, snapshot, actual)
+                    for actual in actuals]
+    return []
 
 
 def _write_availability_csv(job_id: str, rows: list, fieldnames: list):
@@ -2926,6 +3072,7 @@ def _run_availability_job(job_id: str, integration: str, org: str = '',
             exclude_students=not include_students,
             exclude_applications=not include_applications)
         primary_candidates = rules.get('primary') or []
+        actual_candidates = rules.get('actual') or []
         supplemental_config = rules.get('supplemental_units') or {}
         supplemental_indexes = {}
         for related_integration in supplemental_config.get('integrations') or []:
@@ -2936,21 +3083,18 @@ def _run_availability_job(job_id: str, integration: str, org: str = '',
         limit_note = f' for a {max_results:,}-unit limit' if max_results else ''
         _job_update(job_id, note=f'Selecting indexed buildings{limit_note}…')
         targets = []
-        stale_latest = 0
-        freshness_cutoff = (
-            datetime.now(timezone.utc) - timedelta(hours=24)
-            if as_of is None else None)
+        # The index builder owns the 24-hour building eligibility rule. A
+        # latest-index run must consume every stored entry without applying a
+        # second rolling age cutoff as wall-clock time advances.
         for entity, (snapshot, files) in entities.items():
             if allowed is not None and entity not in allowed:
                 continue
-            if freshness_cutoff is not None:
-                created_at = _availability_snapshot_datetime(snapshot)
-                if created_at is None or created_at < freshness_cutoff:
-                    stale_latest += 1
-                    continue
-            actual = _availability_first_file(files, source_integration, primary_candidates)
-            if actual:
-                targets.append((entity, snapshot, actual, files))
+            primary_actual = _availability_first_file(
+                files, source_integration, primary_candidates)
+            unit_details_actual = _availability_first_file(
+                files, source_integration, actual_candidates)
+            if unit_details_actual:
+                targets.append((entity, snapshot, primary_actual, files))
             elif as_of is not None:
                 targets.append((entity, None, None, []))
         targets.sort()
@@ -3032,87 +3176,100 @@ def _run_availability_job(job_id: str, integration: str, org: str = '',
                 snapshot_files = _snapshot_files(entity_prefix, snapshot)
                 primary_actual = _availability_first_file(
                     snapshot_files, source_integration, primary_candidates)
-                if not primary_actual:
-                    with lock:
-                        no_snapshot += 1
-                        counter['n'] += 1
-                    return
-            primary_s3_key = f'{ROOT}{source_integration}/{entity}/{snapshot}/{primary_actual}'
+            actual_actual = _availability_first_file(
+                snapshot_files, source_integration, actual_candidates)
+            if not actual_actual:
+                with lock:
+                    counter['n'] += 1
+                return
             try:
-                primary_body = _fetch_text(primary_s3_key)
-                primary_rows = _availability_extract(
-                    primary_body, source_fields['primary'],
-                    voyager_units=integration == 'Voyager')
-                file_property_code = _availability_file_property_code(
-                    primary_actual, primary_candidates)
-                if file_property_code:
-                    for row in primary_rows:
-                        row['__file_property_code'] = file_property_code
-                rentcafe_codes = {
-                    str(code).strip()
-                    for row in primary_rows
-                    for code in [_availability_value(row, 'voyagerPropertyCode')]
-                    if code is not None and str(code).strip()
-                } if integration == 'RentCafe' else set()
-                phase_fields = (rules.get('unit_key') or {}).get(
-                    'phase_prefix_when_multiple') or []
-                phase_prefix_values = {
-                    str(value).strip().casefold()
-                    for row in primary_rows
-                    for field in phase_fields
-                    for value in [_availability_value(row, field)]
-                    if value is not None and str(value).strip()
-                }
-                source_rows = {}
-                for source in source_configs:
-                    actual_source = _availability_file_variant(
-                        snapshot_files, source_integration, source['file'])
-                    if actual_source:
-                        source_body = _fetch_text(
-                            f'{ROOT}{source_integration}/{entity}/{snapshot}/{actual_source}')
-                        source_rows[source['file']] = _availability_extract(
-                            source_body, source_fields[source['file']],
-                            voyager_units=(integration == 'Voyager' and
-                                           source['file'].startswith(
-                                               ('AllUnits_Login', 'AvailableUnits_Login'))))
-                    else:
-                        source_rows[source['file']] = []
-                actual_actual = _availability_first_file(
-                    snapshot_files, source_integration, rules.get('actual') or [])
-                actual_rows = []
-                if actual_actual:
-                    actual_body = _fetch_text(
-                        f'{ROOT}{source_integration}/{entity}/{snapshot}/{actual_actual}')
-                    actual_rows = _availability_extract(actual_body, actual_fields)
+                actual_body = _fetch_text(
+                    f'{ROOT}{source_integration}/{entity}/{snapshot}/{actual_actual}')
+                actual_rows = _availability_extract(actual_body, actual_fields)
             except Exception:
                 with lock:
                     errors += 1
                     counter['n'] += 1
                 return
 
+            primary_rows = []
+            source_rows = {source['file']: [] for source in source_configs}
+            raw_errors = 0
+            if primary_actual:
+                try:
+                    primary_body = _fetch_text(
+                        f'{ROOT}{source_integration}/{entity}/{snapshot}/{primary_actual}')
+                    primary_rows = _availability_extract(
+                        primary_body, source_fields['primary'],
+                        voyager_units=integration == 'Voyager',
+                        realpage_units=integration == 'RealPage')
+                    file_property_code = _availability_file_property_code(
+                        primary_actual, primary_candidates)
+                    if file_property_code:
+                        for row in primary_rows:
+                            row['__file_property_code'] = file_property_code
+                except Exception:
+                    raw_errors += 1
+                    primary_rows = []
+            for source in source_configs:
+                actual_source = _availability_file_variant(
+                    snapshot_files, source_integration, source['file'])
+                if actual_source:
+                    try:
+                        source_body = _fetch_text(
+                            f'{ROOT}{source_integration}/{entity}/{snapshot}/{actual_source}')
+                        source_rows[source['file']] = _availability_extract(
+                            source_body, source_fields[source['file']],
+                            voyager_units=(integration == 'Voyager' and
+                                           source['file'].startswith(
+                                               ('AllUnits_Login', 'AvailableUnits_Login'))),
+                            realpage_units=integration == 'RealPage')
+                    except Exception:
+                        raw_errors += 1
+                        source_rows[source['file']] = []
+            rentcafe_codes = {
+                str(code).strip()
+                for row in primary_rows
+                for code in [_availability_value(row, 'voyagerPropertyCode')]
+                if code is not None and str(code).strip()
+            } if integration == 'RentCafe' else set()
+            phase_fields = (rules.get('unit_key') or {}).get(
+                'phase_prefix_when_multiple') or []
+            phase_prefix_values = {
+                str(value).strip().casefold()
+                for row in primary_rows
+                for field in phase_fields
+                for value in [_availability_value(row, field)]
+                if value is not None and str(value).strip()
+            }
+
             added_supplemental = []
+            supplemental_targets = []
             if supplemental_config:
                 try:
-                    supplemental_target = _availability_supplemental_target(
+                    supplemental_targets = _availability_supplemental_targets(
                         entity, snapshot, as_of, supplemental_config,
                         supplemental_indexes)
-                    if supplemental_target:
-                        related_integration, related_snapshot, related_file = supplemental_target
+                    for (related_integration, related_snapshot,
+                         related_file) in supplemental_targets:
                         supplemental_body = _fetch_text(
                             f'{ROOT}{related_integration}/{entity}/'
                             f'{related_snapshot}/{related_file}')
-                        added_supplemental = _availability_supplemental_rows(
-                            supplemental_body, supplemental_config, primary_rows)
-                        # Voyager's supplemental row does not carry the
-                        # RentCafe property code. It is safe to inherit only
-                        # when this building has one code; multi-code/CLO
-                        # buildings would otherwise recreate the collision
-                        # that building_unique_id is designed to prevent.
-                        if len(rentcafe_codes) == 1:
-                            sole_code = next(iter(rentcafe_codes))
-                            for row in added_supplemental:
-                                row['voyagerPropertyCode'] = sole_code
-                        primary_rows.extend(added_supplemental)
+                        property_code = _availability_file_property_code(
+                            related_file, supplemental_config.get('files') or [])
+                        new_rows = _availability_supplemental_rows(
+                            supplemental_body, supplemental_config,
+                            primary_rows + added_supplemental, property_code)
+                        added_supplemental.extend(new_rows)
+                    # A legacy unsuffixed Voyager file has no property code.
+                    # It is safe to inherit one only for a single-code
+                    # RentCafe building; multi-code files are keyed by their
+                    # own filename suffix above.
+                    if len(rentcafe_codes) == 1:
+                        sole_code = next(iter(rentcafe_codes))
+                        for row in added_supplemental:
+                            row.setdefault('voyagerPropertyCode', sole_code)
+                    primary_rows.extend(added_supplemental)
                 except Exception:
                     # The primary RentCafe analysis is still useful if the
                     # optional Voyager supplement is temporarily unreadable.
@@ -3120,9 +3277,10 @@ def _run_availability_job(job_id: str, integration: str, org: str = '',
                         supplemental_errors += 1
 
             actual_by_key = {}
-            for row in actual_rows:
+            actual_entries = list(enumerate(actual_rows))
+            for actual_index, row in actual_entries:
                 for key in _availability_keys(row, actual_key):
-                    actual_by_key.setdefault(key, row)
+                    actual_by_key.setdefault(key, (actual_index, row))
             source_by_key = {}
             for source in source_configs:
                 keyed = {}
@@ -3136,6 +3294,7 @@ def _run_availability_job(job_id: str, integration: str, org: str = '',
 
             produced = []
             seen_unit_keys = set()
+            matched_actual_indices = set()
             for primary_row in primary_rows:
                 if cap_hit['flag']:
                     break
@@ -3153,28 +3312,26 @@ def _run_availability_job(job_id: str, integration: str, org: str = '',
                 primary_keys = _availability_keys(primary_row, primary_key)
                 unit_key = _availability_unit_key(
                     primary_row, rules, phase_prefix_values)
-                # A canonical external identity may occur more than once in a
-                # raw feed. Retain the first row and its status deterministically.
-                if unit_key in seen_unit_keys:
-                    continue
-                if unit_key:
-                    seen_unit_keys.add(unit_key)
-                actual_row = actual_by_key.get(unit_key, {})
+                actual_match = actual_by_key.get(unit_key)
                 if integration == 'RentCafe':
-                    # For a true single-property building, ILSUnit.external_id
-                    # is the bare apartmentName. This fallback is deliberately
-                    # forbidden when multiple Voyager property codes exist.
-                    if not actual_row and len(rentcafe_codes) == 1:
+                    is_supplemental = bool(
+                        primary_row.get('__supplemental_unit'))
+                    # RentCafe unit-details may persist only the bare external
+                    # id. A single RentCafe property code is unambiguous; a
+                    # Voyager-only supplemental row is also safe to match by
+                    # its unit name because the supplement already deduplicates
+                    # names within this building.
+                    if (actual_match is None and
+                            (len(rentcafe_codes) == 1 or is_supplemental)):
                         name = (_availability_value(primary_row, 'apartmentName') or
                                 _availability_value(primary_row, 'ApartmentName'))
                         name_key = str(name).strip().casefold() if name is not None else ''
-                        actual_row = actual_by_key.get(name_key, {})
-                    # Supplemental Voyager units on a multi-code building do
-                    # not identify which RentCafe code owns them, so they
-                    # cannot form a guaranteed building_unique_id.
-                    if not unit_key:
-                        actual_row = {}
-                elif integration == 'Voyager' and not actual_row:
+                        actual_match = actual_by_key.get(name_key)
+                        if actual_match is not None and is_supplemental:
+                            unit_key = name_key
+                    if not unit_key and not is_supplemental:
+                        actual_match = None
+                elif integration == 'Voyager' and actual_match is None:
                     # Current Voyager unit-details snapshots persist a bare
                     # ILS unit external_id for a single property file, even
                     # though the canonical identity is property-unit. Use the
@@ -3189,14 +3346,24 @@ def _run_availability_job(job_id: str, integration: str, org: str = '',
                     if len(property_codes) == 1:
                         bare_id = _availability_value(primary_row, '@IDValue')
                         if bare_id is not None:
-                            actual_row = actual_by_key.get(
-                                str(bare_id).strip().casefold(), {})
+                            actual_match = actual_by_key.get(
+                                str(bare_id).strip().casefold())
+                # A canonical external identity may occur more than once in a
+                # raw feed. Retain the first row and its status deterministically.
+                if unit_key in seen_unit_keys:
+                    continue
+                if unit_key:
+                    seen_unit_keys.add(unit_key)
                 # unit_details is the canonical post-filter physical-unit
                 # feed. Never emit raw API records — including supplemental
                 # cross-integration units — when that unit was filtered out
                 # before unit_details was produced.
-                if not actual_row:
+                if actual_match is None:
                     continue
+                actual_index, actual_row = actual_match
+                if actual_index in matched_actual_indices:
+                    continue
+                matched_actual_indices.add(actual_index)
                 values = dict(primary_row)
                 snapshot_datetime = _availability_snapshot_datetime(snapshot)
                 if snapshot_datetime is not None:
@@ -3229,7 +3396,8 @@ def _run_availability_job(job_id: str, integration: str, org: str = '',
                         for field, value in related.items():
                             values[f"{source['file']}__{field}"] = value
                     values[f"__source_present__{source['file']}"] = bool(related)
-                values['__direct_stage'] = _availability_direct_prediction(rules, values)[0]
+                values['__direct_stage'] = _availability_direct_prediction(
+                    rules, values)[0]
                 predicted, reason = _availability_predict(rules, values)
                 actual_stage = _availability_value(actual_row, 'availability_stage')
                 if actual_stage is None:
@@ -3247,6 +3415,7 @@ def _run_availability_job(job_id: str, integration: str, org: str = '',
                 output = {
                     '_entity': entity, '_snapshot': snapshot,
                     '_supplemental': bool(primary_row.get('__supplemental_unit')),
+                    '_unit_details_only': False,
                     'unit_key': unit_key or '',
                     'Actual Availability': actual_stage,
                     'Predicted Availability': predicted,
@@ -3275,7 +3444,60 @@ def _run_availability_job(job_id: str, integration: str, org: str = '',
                 for field in actual_fields:
                     output[f'unit_details__{field}'] = _availability_value(actual_row, field)
                 produced.append(output)
+
+            # unit-details is the canonical physical-unit inventory. Emit
+            # every record that did not match a raw API row, leaving all raw
+            # and prediction columns blank so missing upstream data is visible
+            # without removing the unit from the report.
+            for actual_index, actual_row in actual_entries:
+                if actual_index in matched_actual_indices:
+                    continue
+                actual_stage = _availability_value(actual_row, 'availability_stage')
+                if actual_stage is None:
+                    actual_stage = _availability_value(actual_row, 'availabilityStage')
+                try:
+                    actual_stage = int(actual_stage) if actual_stage is not None else None
+                except (TypeError, ValueError):
+                    pass
+                predicted = None
+                reason = None
+                if rules.get('predict_unit_details_only'):
+                    values = dict(actual_row)
+                    values['__supplemental_snapshot_missing'] = not bool(
+                        supplemental_targets)
+                    values['__supplemental_unit_missing'] = bool(
+                        supplemental_targets)
+                    snapshot_datetime = _availability_snapshot_datetime(snapshot)
+                    if snapshot_datetime is not None:
+                        values['__current_date'] = snapshot_datetime.date().isoformat()
+                    values['__direct_stage'] = _availability_direct_prediction(
+                        rules, values)[0]
+                    predicted, reason = _availability_predict(rules, values)
+                if show_unknown and predicted == actual_stage:
+                    continue
+                actual_unit_keys = _availability_keys(actual_row, actual_key)
+                output = {
+                    '_entity': entity, '_snapshot': snapshot,
+                    '_supplemental': False,
+                    '_unit_details_only': True,
+                    'unit_key': actual_unit_keys[0] if actual_unit_keys else '',
+                    'Actual Availability': actual_stage,
+                    'Predicted Availability': predicted,
+                    'Availability Reason': reason or (
+                        'No matching availability rule' if predicted is None else ''),
+                }
+                for rollout_name in rollout_names:
+                    output[f'rollout__{rollout_name}'] = None
+                for field in source_fields['primary']:
+                    output[f'primary__{field}'] = None
+                for source in source_configs:
+                    for field in source_fields[source['file']]:
+                        output[f"{source['file']}__{field}"] = None
+                for field in actual_fields:
+                    output[f'unit_details__{field}'] = _availability_value(actual_row, field)
+                produced.append(output)
             with lock:
+                errors += raw_errors
                 if max_results is not None:
                     remaining = max_results - len(all_rows)
                     if remaining <= 0:
@@ -3401,8 +3623,8 @@ def _run_availability_job(job_id: str, integration: str, org: str = '',
             'searched': counter['n'], 'buildings': len(entities), 'rowCount': len(all_rows),
             'unknownCount': sum(1 for row in all_rows
                                 if row.get('Predicted Availability') != row.get('Actual Availability')),
-            'staleLatest': stale_latest,
-            'freshnessHours': 24 if as_of is None else None,
+            'unitDetailsOnlyCount': sum(
+                1 for row in all_rows if row.get('_unit_details_only')),
             'limit': max_results, 'limited': bool(max_results is not None and cap_hit['flag']),
             'stopped': _job_stop_requested(control_job_id),
             'includeStudents': include_students,
@@ -3452,8 +3674,8 @@ def _run_availability_batch_job(job_id: str, integrations: list, org: str = '',
         combined_rows = []
         combined_fields = []
         searched = buildings = unknown = errors = no_snapshot = 0
-        stale_latest = 0
         supplemental_units = supplemental_errors = wait_filtered = 0
+        unit_details_only = 0
         notes = []
         failed = []
         skipped = []
@@ -3514,10 +3736,10 @@ def _run_availability_batch_job(job_id: str, integrations: list, org: str = '',
             unknown += result.get('unknownCount') or 0
             errors += result.get('errors') or 0
             no_snapshot += result.get('noSnapshot') or 0
-            stale_latest += result.get('staleLatest') or 0
             supplemental_units += result.get('supplementalUnits') or 0
             supplemental_errors += result.get('supplementalErrors') or 0
             wait_filtered += result.get('waitFiltered') or 0
+            unit_details_only += result.get('unitDetailsOnlyCount') or 0
             if result.get('filterNote'):
                 notes.append(f'{integration}: {result["filterNote"]}')
             if result.get('rolloutError'):
@@ -3544,8 +3766,7 @@ def _run_availability_batch_job(job_id: str, integrations: list, org: str = '',
                         'asOf': as_of.isoformat() if as_of else None,
                         'searched': searched, 'buildings': buildings,
                         'rowCount': len(combined_rows), 'unknownCount': unknown,
-                        'staleLatest': stale_latest,
-                        'freshnessHours': 24 if as_of is None else None,
+                        'unitDetailsOnlyCount': unit_details_only,
                         'supplementalUnits': supplemental_units,
                         'supplementalErrors': supplemental_errors,
                         'waitFiltered': wait_filtered,
@@ -3577,6 +3798,1029 @@ def _run_availability_batch_job(job_id: str, integrations: list, org: str = '',
             'waitFiltered': wait_filtered,
             'limit': max_results,
         })
+    except Exception as e:
+        _job_update(job_id, status='error', error=str(e), finished=time.time())
+
+
+# ── Sync Issues ───────────────────────────────────────────────────────────────
+
+SYNC_ISSUES_QUERY_TIMEOUT = 600   # seconds; the CTE chain is expensive
+
+# Cap the unit identifiers sent per reason per building.  A single sync can mark
+# thousands of units unavailable and the whole payload is re-sent on every poll.
+SYNC_ISSUES_MAX_UNITS_PER_REASON = 250
+
+# How far back to look for the snapshot preceding the one being analysed.  That
+# earlier snapshot is the baseline used to tell units this sync newly marked
+# unavailable apart from units that were already unavailable going in.
+SYNC_ISSUES_BASELINE_LOOKBACK_HOURS = 72
+
+# The building/org lookup that feeds rollout and building-flag overrides can
+# take ~50s on a cold warehouse — far past the interactive ENRICH_TIMEOUT.  It
+# runs once per job, before the S3 fan-out, so it can afford to wait.
+SYNC_ISSUES_ENRICH_TIMEOUT = 180
+
+# Simplified version of the dashboard SQL: only the unavailable-threshold branch.
+# Parameters (positional %s in order):
+#   1 audit_date_range_start  (date/timestamp)
+#   2 audit_date_range_end    (date/timestamp)
+#   3 integration filter check  (empty string → match all)
+#   4 integration filter value  (same string used in CONTAINS)
+#   5 new_import_window_minutes (integer)
+#   6 unit_unavailable_threshold (decimal 0–1)
+# LIMIT is formatted in as a safe integer.
+_SYNC_ISSUES_SQL = """\
+WITH buildings AS (
+    SELECT ID AS BUILDING_ID, ORG_ID, ORG_NAME, BUILDING_NAME
+    FROM ELISE.DA.DIM_BUILDINGS
+    WHERE IS_TEST = FALSE
+        AND COALESCE(IS_STUDENT_HOUSING, FALSE) = FALSE
+),
+audit_rows AS (
+    SELECT
+        a.BUILDING_ID, a.CHANGE_GROUP_ID, a.UNIT_ID, a.CHANGE_TYPE,
+        a.SOURCE, a.APP_USER_ID, a.CHANGE_TIMESTAMP,
+        a.OLD_VALUE:availability_stage::NUMBER AS OLD_AVAILABILITY_STAGE,
+        a.NEW_VALUE:availability_stage::NUMBER AS NEW_AVAILABILITY_STAGE,
+        a.OLD_VALUE:active::NUMBER AS OLD_ACTIVE,
+        a.NEW_VALUE:active::NUMBER AS NEW_ACTIVE,
+        a.OLD_VALUE:is_deleted::BOOLEAN AS OLD_IS_DELETED,
+        a.NEW_VALUE:is_deleted::BOOLEAN AS NEW_IS_DELETED,
+        a.OLD_VALUE:is_it_default_unit::NUMBER AS OLD_IS_IT_DEFAULT_UNIT,
+        a.NEW_VALUE:is_it_default_unit::NUMBER AS NEW_IS_IT_DEFAULT_UNIT,
+        a.OLD_VALUE:unit_use_type::STRING AS OLD_UNIT_USE_TYPE,
+        a.NEW_VALUE:unit_use_type::STRING AS NEW_UNIT_USE_TYPE
+    FROM ENG_REPORTING.PUBLIC.UNIT_AUDIT_LOG_V2 AS a
+    WHERE a.CHANGE_TIMESTAMP >= %s
+        AND a.CHANGE_TIMESTAMP < DATEADD('day', 1, %s)
+        AND a.CHANGE_GROUP_ID IS NOT NULL
+        AND a.CHANGE_TYPE IN ('unit_created', 'unit_updated', 'unit_deleted')
+),
+audit_enriched AS (
+    SELECT a.*,
+        MAX(IFF(
+            a.CHANGE_TYPE = 'unit_updated'
+            AND a.OLD_ACTIVE = 1 AND a.OLD_IS_IT_DEFAULT_UNIT = 0
+            AND COALESCE(a.OLD_IS_DELETED, FALSE) = FALSE
+            AND (a.OLD_UNIT_USE_TYPE IS NULL OR a.OLD_UNIT_USE_TYPE != 'commercial')
+            AND NOT (a.NEW_ACTIVE = 1 AND a.NEW_IS_IT_DEFAULT_UNIT = 0
+                AND COALESCE(a.NEW_IS_DELETED, FALSE) = FALSE
+                AND (a.NEW_UNIT_USE_TYPE IS NULL OR a.NEW_UNIT_USE_TYPE != 'commercial')),
+            1, 0
+        )) OVER (PARTITION BY a.BUILDING_ID, a.CHANGE_GROUP_ID, a.UNIT_ID)
+            AS IS_DEACTIVATED_IN_SYNC
+    FROM audit_rows AS a
+),
+syncs AS (
+    SELECT
+        a.BUILDING_ID, a.CHANGE_GROUP_ID,
+        MIN(a.CHANGE_TIMESTAMP) AS SYNC_STARTED_AT,
+        MAX(a.CHANGE_TIMESTAMP) AS SYNC_COMPLETED_AT,
+        LISTAGG(DISTINCT a.SOURCE, ', ') WITHIN GROUP (ORDER BY a.SOURCE) AS SOURCES,
+        LISTAGG(DISTINCT a.APP_USER_ID, ', ') WITHIN GROUP (ORDER BY a.APP_USER_ID) AS APP_USER_IDS,
+        COUNT(DISTINCT a.UNIT_ID) AS UNITS_CHANGED,
+        COUNT(DISTINCT CASE
+            WHEN a.CHANGE_TYPE = 'unit_updated'
+                AND a.OLD_AVAILABILITY_STAGE IN (0, 1)
+                AND a.NEW_AVAILABILITY_STAGE = 9
+                AND a.OLD_ACTIVE = 1 AND a.OLD_IS_IT_DEFAULT_UNIT = 0
+                AND COALESCE(a.OLD_IS_DELETED, FALSE) = FALSE
+                AND (a.OLD_UNIT_USE_TYPE IS NULL OR a.OLD_UNIT_USE_TYPE != 'commercial')
+                AND a.IS_DEACTIVATED_IN_SYNC = 0
+                THEN a.UNIT_ID END) AS UNITS_MARKED_UNAVAILABLE
+    FROM audit_enriched AS a
+    GROUP BY 1, 2
+),
+active_units AS (
+    SELECT u.BUILDING_ID,
+        COUNT(*) AS TOTAL_UNITS,
+        COUNT_IF(u.AVAILABILITY_STAGE = 9) AS TOTAL_UNAVAILABLE_UNITS_NOW
+    FROM ELISE.FANSCAN_LOGICAL_PUBLIC.UNIT_DETAILS AS u
+    INNER JOIN (SELECT DISTINCT BUILDING_ID FROM syncs) AS s ON u.BUILDING_ID = s.BUILDING_ID
+    WHERE u.ACTIVE = 1 AND u.IS_IT_DEFAULT_UNIT = 0
+        AND (u.IS_DELETED IS NULL OR u.IS_DELETED = FALSE)
+        AND (u.UNIT_USE_TYPE IS NULL OR u.UNIT_USE_TYPE != 'commercial')
+    GROUP BY 1
+),
+scored AS (
+    SELECT b.ORG_ID, b.ORG_NAME, b.BUILDING_NAME,
+        s.BUILDING_ID, s.CHANGE_GROUP_ID, s.SYNC_STARTED_AT, s.SYNC_COMPLETED_AT,
+        s.SOURCES, s.APP_USER_IDS, u.TOTAL_UNITS, u.TOTAL_UNAVAILABLE_UNITS_NOW,
+        s.UNITS_CHANGED, s.UNITS_MARKED_UNAVAILABLE
+    FROM syncs AS s
+    INNER JOIN buildings AS b ON s.BUILDING_ID = b.BUILDING_ID
+    INNER JOIN active_units AS u ON s.BUILDING_ID = u.BUILDING_ID
+),
+candidate_syncs AS (
+    SELECT * FROM scored
+    WHERE UNITS_MARKED_UNAVAILABLE >= 10
+        AND (%s = '' OR CONTAINS(UPPER(SOURCES), UPPER(%s)))
+),
+snapshot_unit_state_before AS (
+    SELECT f.BUILDING_ID, f.CHANGE_GROUP_ID, s.DBT_VALID_FROM,
+        s.ACTIVE, s.AVAILABILITY_STAGE, s.IS_IT_DEFAULT_UNIT, s.IS_DELETED, s.UNIT_USE_TYPE
+    FROM candidate_syncs AS f
+    INNER JOIN ELISE.DA.UNIT_DETAILS_SNAPSHOT AS s
+        ON s.BUILDING_ID = f.BUILDING_ID
+        AND s.DBT_VALID_FROM <= DATEADD('minute', -1, f.SYNC_STARTED_AT)
+        AND (s.DBT_VALID_TO > DATEADD('minute', -1, f.SYNC_STARTED_AT) OR s.DBT_VALID_TO IS NULL)
+),
+historical_unit_counts AS (
+    SELECT BUILDING_ID, CHANGE_GROUP_ID,
+        MAX(DBT_VALID_FROM) AS SNAPSHOT_AS_OF,
+        COUNT_IF(ACTIVE = 1 AND IS_IT_DEFAULT_UNIT = 0
+            AND (IS_DELETED IS NULL OR IS_DELETED = FALSE)
+            AND (UNIT_USE_TYPE IS NULL OR UNIT_USE_TYPE != 'commercial')) AS TOTAL_UNITS_BEFORE_SYNC,
+        COUNT_IF(ACTIVE = 1 AND AVAILABILITY_STAGE = 9 AND IS_IT_DEFAULT_UNIT = 0
+            AND (IS_DELETED IS NULL OR IS_DELETED = FALSE)
+            AND (UNIT_USE_TYPE IS NULL OR UNIT_USE_TYPE != 'commercial')) AS TOTAL_UNAVAILABLE_UNITS_BEFORE_SYNC
+    FROM snapshot_unit_state_before
+    GROUP BY 1, 2
+),
+pre_sync_audit AS (
+    SELECT f.BUILDING_ID, f.CHANGE_GROUP_ID,
+        COUNT(DISTINCT CASE
+            WHEN a.CHANGE_TYPE = 'unit_created'
+                AND a.NEW_VALUE:active::NUMBER = 1 AND a.NEW_VALUE:is_it_default_unit::NUMBER = 0
+                AND COALESCE(a.NEW_VALUE:is_deleted::BOOLEAN, FALSE) = FALSE
+                AND COALESCE(a.NEW_VALUE:unit_use_type::STRING, '') != 'commercial'
+                THEN a.UNIT_ID END) AS UNITS_CREATED_SINCE_SNAPSHOT,
+        COUNT(DISTINCT CASE
+            WHEN a.CHANGE_TYPE IN ('unit_deleted', 'unit_updated')
+                AND a.OLD_VALUE:active::NUMBER = 1 AND a.OLD_VALUE:is_it_default_unit::NUMBER = 0
+                AND COALESCE(a.OLD_VALUE:is_deleted::BOOLEAN, FALSE) = FALSE
+                AND COALESCE(a.OLD_VALUE:unit_use_type::STRING, '') != 'commercial'
+                AND NOT (a.CHANGE_TYPE = 'unit_updated'
+                    AND a.NEW_VALUE:active::NUMBER = 1 AND a.NEW_VALUE:is_it_default_unit::NUMBER = 0
+                    AND COALESCE(a.NEW_VALUE:is_deleted::BOOLEAN, FALSE) = FALSE
+                    AND COALESCE(a.NEW_VALUE:unit_use_type::STRING, '') != 'commercial')
+                THEN a.UNIT_ID END) AS UNITS_REMOVED_SINCE_SNAPSHOT
+    FROM candidate_syncs AS f
+    INNER JOIN historical_unit_counts AS h ON f.BUILDING_ID = h.BUILDING_ID AND f.CHANGE_GROUP_ID = h.CHANGE_GROUP_ID
+    INNER JOIN ENG_REPORTING.PUBLIC.UNIT_AUDIT_LOG_V2 AS a
+        ON a.BUILDING_ID = f.BUILDING_ID
+        AND a.CHANGE_TIMESTAMP > h.SNAPSHOT_AS_OF
+        AND a.CHANGE_TIMESTAMP < f.SYNC_STARTED_AT
+    GROUP BY 1, 2
+),
+recent_unit_creations AS (
+    SELECT f.BUILDING_ID, f.CHANGE_GROUP_ID,
+        COUNT(DISTINCT a.UNIT_ID) AS UNITS_CREATED_RECENTLY
+    FROM candidate_syncs AS f
+    INNER JOIN ENG_REPORTING.PUBLIC.UNIT_AUDIT_LOG_V2 AS a
+        ON a.BUILDING_ID = f.BUILDING_ID
+        AND a.CHANGE_TYPE = 'unit_created'
+        AND a.CHANGE_TIMESTAMP >= DATEADD('minute', -%s, f.SYNC_STARTED_AT)
+        AND a.CHANGE_TIMESTAMP <= f.SYNC_STARTED_AT
+        AND a.NEW_VALUE:active::NUMBER = 1 AND a.NEW_VALUE:is_it_default_unit::NUMBER = 0
+        AND COALESCE(a.NEW_VALUE:is_deleted::BOOLEAN, FALSE) = FALSE
+        AND COALESCE(a.NEW_VALUE:unit_use_type::STRING, '') != 'commercial'
+    GROUP BY 1, 2
+),
+history_adjusted AS (
+    SELECT f.*,
+        COALESCE(r.UNITS_CREATED_RECENTLY, 0) AS UNITS_CREATED_RECENTLY,
+        h.TOTAL_UNITS_BEFORE_SYNC AS TOTAL_UNITS_IN_SNAPSHOT,
+        COALESCE(p.UNITS_CREATED_SINCE_SNAPSHOT, 0) AS UNITS_CREATED_SINCE_SNAPSHOT,
+        COALESCE(p.UNITS_REMOVED_SINCE_SNAPSHOT, 0) AS UNITS_REMOVED_SINCE_SNAPSHOT,
+        GREATEST(
+            h.TOTAL_UNITS_BEFORE_SYNC
+                + COALESCE(p.UNITS_CREATED_SINCE_SNAPSHOT, 0)
+                - COALESCE(p.UNITS_REMOVED_SINCE_SNAPSHOT, 0),
+            0
+        ) AS TOTAL_UNITS_BEFORE_SYNC,
+        h.TOTAL_UNAVAILABLE_UNITS_BEFORE_SYNC
+    FROM candidate_syncs AS f
+    LEFT JOIN historical_unit_counts AS h ON f.BUILDING_ID = h.BUILDING_ID AND f.CHANGE_GROUP_ID = h.CHANGE_GROUP_ID
+    LEFT JOIN pre_sync_audit AS p ON f.BUILDING_ID = p.BUILDING_ID AND f.CHANGE_GROUP_ID = p.CHANGE_GROUP_ID
+    LEFT JOIN recent_unit_creations AS r ON f.BUILDING_ID = r.BUILDING_ID AND f.CHANGE_GROUP_ID = r.CHANGE_GROUP_ID
+),
+scored_with_history AS (
+    SELECT f.*,
+        GREATEST(f.TOTAL_UNITS_BEFORE_SYNC, f.UNITS_MARKED_UNAVAILABLE, 0) AS TOTAL_UNITS_AFTER_SYNC,
+        LEAST(
+            GREATEST(f.TOTAL_UNITS_BEFORE_SYNC, f.UNITS_MARKED_UNAVAILABLE, 0),
+            f.TOTAL_UNAVAILABLE_UNITS_BEFORE_SYNC + f.UNITS_MARKED_UNAVAILABLE
+        ) AS TOTAL_UNAVAILABLE_UNITS_AFTER_SYNC,
+        DIV0(
+            f.UNITS_MARKED_UNAVAILABLE,
+            GREATEST(f.TOTAL_UNITS_BEFORE_SYNC, f.UNITS_MARKED_UNAVAILABLE, 0)
+        ) AS PCT_UNITS_MARKED_UNAVAILABLE
+    FROM history_adjusted AS f
+),
+scored_final AS (
+    SELECT s.*,
+        s.UNITS_CREATED_RECENTLY > 0
+            AND DIV0(s.UNITS_CREATED_RECENTLY, s.TOTAL_UNITS_AFTER_SYNC) >= 0.5
+            AS IS_LIKELY_INITIAL_IMPORT
+    FROM scored_with_history AS s
+),
+flagged AS (
+    SELECT * FROM scored_final
+    WHERE PCT_UNITS_MARKED_UNAVAILABLE >= %s
+        AND UNITS_MARKED_UNAVAILABLE >= 10
+        AND TOTAL_UNITS_BEFORE_SYNC IS NOT NULL
+        AND NOT IS_LIKELY_INITIAL_IMPORT
+    ORDER BY SYNC_STARTED_AT DESC
+    LIMIT {limit}
+)
+SELECT
+    f.ORG_NAME, f.BUILDING_NAME, f.BUILDING_ID, f.CHANGE_GROUP_ID,
+    'https://app.meetelise.com/tools/snapshot-viewer?tab=mits&org_id='
+        || f.ORG_ID
+        || '&building_id=' || f.BUILDING_ID
+        || '&reference_time='
+        || REPLACE(
+            TO_CHAR(DATEADD('minute', -1, f.SYNC_STARTED_AT), 'YYYY-MM-DD"T"HH24:MI:SS.FF3"Z"'),
+            ':', '%%3A'
+        )
+        || '&num_before=1&num_after=1&gc_search_mode=mc_id' AS SNAPSHOT_LINK,
+    f.SYNC_STARTED_AT, f.SYNC_COMPLETED_AT, f.SOURCES, f.APP_USER_IDS,
+    f.TOTAL_UNITS, f.TOTAL_UNITS_BEFORE_SYNC, f.TOTAL_UNITS_AFTER_SYNC,
+    f.TOTAL_UNAVAILABLE_UNITS_BEFORE_SYNC, f.UNITS_MARKED_UNAVAILABLE,
+    f.TOTAL_UNAVAILABLE_UNITS_AFTER_SYNC, f.TOTAL_UNAVAILABLE_UNITS_NOW,
+    f.PCT_UNITS_MARKED_UNAVAILABLE, f.IS_LIKELY_INITIAL_IMPORT
+FROM flagged AS f
+ORDER BY f.SYNC_STARTED_AT DESC
+"""
+
+
+def _infer_sync_integration(sources: str) -> str | None:
+    """Map SOURCES string (e.g. 'RentCafe, YardiVoyager') to an availability
+    agent integration name, or None if none matches."""
+    available = set(_availability_rules().get('integrations', {}).keys())
+    aliases = {'YardiVoyager': 'Voyager', 'yardivoyager': 'Voyager'}
+    for source in sources.split(','):
+        s = source.strip()
+        if s in available:
+            return s
+        mapped = aliases.get(s) or aliases.get(s.lower())
+        if mapped and mapped in available:
+            return mapped
+    return None
+
+
+def _sync_issues_target(sync):
+    """(integration, entity, as_of) for one sync row; integration None if the
+    source has no availability rules.  Shared by the metadata pre-pass and the
+    per-building probe so both agree on which snapshot window applies."""
+    integration = _infer_sync_integration(str(sync.get('SOURCES') or ''))
+    if not integration:
+        return None, None, None
+    raw = str(sync.get('BUILDING_ID') or '')
+    entity = raw if raw.lower().startswith('building_') else f'building_{raw}'
+    completed_raw = sync.get('SYNC_COMPLETED_AT')
+    try:
+        if isinstance(completed_raw, str):
+            completed_dt = datetime.fromisoformat(
+                completed_raw.replace('Z', '+00:00'))
+        else:
+            completed_dt = completed_raw
+        if completed_dt is not None and completed_dt.tzinfo is None:
+            completed_dt = completed_dt.replace(tzinfo=timezone.utc)
+    except (TypeError, ValueError, AttributeError):
+        completed_dt = None
+    as_of = (completed_dt + timedelta(minutes=90)) if completed_dt else None
+    return integration, entity, as_of
+
+
+def _sync_issues_reason_rows(reason_counts, reason_counts_new,
+                             total_all, total_new):
+    """One row per reason carrying both the all-units and newly-marked counts."""
+    rows = []
+    for reason in set(reason_counts) | set(reason_counts_new):
+        c_all = reason_counts.get(reason, 0)
+        c_new = reason_counts_new.get(reason, 0)
+        rows.append({
+            'reason':   reason,
+            'count':    c_all,
+            'countNew': c_new,
+            'pct':      round(100 * c_all / total_all, 1) if total_all else 0,
+            'pctNew':   round(100 * c_new / total_new, 1) if total_new else 0,
+        })
+    # Sorted by the all-units count; the UI re-sorts when showing newly-marked.
+    rows.sort(key=lambda r: (-r['count'], r['reason']))
+    return rows
+
+
+def _sync_issues_partial_result(reason_counts, by_integration,
+                                stage_9_count, total_analyzed,
+                                n_done, n_total, skipped, partial=True,
+                                buildings=None, reason_counts_new=None,
+                                newly_marked_count=0, by_integration_new=None,
+                                baseline_missing=0, rollout_error=None,
+                                enrich_error=None):
+    """Build the result dict used both for live updates and the final payload."""
+    reason_counts_new = reason_counts_new or {}
+    return {
+        'partial': partial,
+        'syncsAnalyzed': n_done,
+        'syncsWithData': n_done - skipped,
+        'skipped': skipped,
+        'totalUnitsAnalyzed': total_analyzed,
+        'unavailableUnits': stage_9_count,
+        # Units this sync actually flipped to unavailable, per the snapshot
+        # immediately preceding the one analysed.
+        'newlyMarkedUnits': newly_marked_count,
+        # Buildings with no usable pre-sync snapshot, so their units cannot be
+        # split into newly-marked vs already-unavailable.
+        'baselineMissingBuildings': baseline_missing,
+        'byIntegration': dict(by_integration),
+        'byIntegrationNew': dict(by_integration_new or {}),
+        'reasonDistribution': _sync_issues_reason_rows(
+            reason_counts, reason_counts_new, stage_9_count, newly_marked_count),
+        # Metadata-lookup failures leave rollout-dependent overrides dormant,
+        # so surface them instead of silently under-reporting reasons.
+        'rolloutError': rollout_error,
+        'enrichError':  enrich_error,
+        'rolloutCredentialIssue': (
+            snowflake_db.credential_error(rollout_error) if rollout_error else None),
+        # Per-building breakdown, keyed by BUILDING_ID, so the UI can expand a
+        # single sync row into its own distribution and unit list.
+        'buildings': dict(buildings or {}),
+    }
+
+
+def _sync_issues_first_value(*sources, keys):
+    """Return the first non-empty value found under `keys` across `sources`."""
+    for src in sources:
+        if not isinstance(src, dict):
+            continue
+        for k in keys:
+            v = src.get(k)
+            if v not in (None, '', []):
+                return v
+    return None
+
+
+# Field-name candidates vary by integration, so probe a few spellings each.
+# The unit number comes from the actual (unit_details) file; it is reported
+# alongside the join key rather than instead of it, because the two can differ.
+_SI_UNIT_NUMBER_KEYS = ('unit_number', 'unitNumber', 'apartmentName',
+                        'unitName', 'unit_name', 'external_id')
+_SI_UNIT_STATUS_KEYS = ('unitStatus', 'unit_status', 'status',
+                        'occupancyStatus', 'availabilityStatus')
+_SI_UNIT_RENT_KEYS   = ('minimumRent', 'marketRent', 'askingRent', 'rent',
+                        'market_rent', 'minimum_rent')
+_SI_UNIT_DATE_KEYS   = ('availableDate', 'available_date', 'dateAvailable',
+                        'madeReadyDate')
+_SI_UNIT_SQFT_KEYS   = ('sqft', 'squareFeet', 'square_feet', 'squareFootage')
+
+
+def _sync_issues_unit_label(primary_row, actual_row, unit_key, values=None):
+    """Shape one unavailable unit for the per-building expand view.
+
+    Reports the join key and the unit_details unit number separately, since a
+    mismatch between them is itself a useful signal.
+    """
+    number = _sync_issues_first_value(actual_row, primary_row,
+                                      keys=_SI_UNIT_NUMBER_KEYS)
+    unit = {
+        'unitKey':    str(unit_key) if unit_key not in (None, '') else '—',
+        'unitNumber': str(number)   if number   not in (None, '') else '—',
+    }
+    for field, keys in (('status', _SI_UNIT_STATUS_KEYS),
+                        ('rent',   _SI_UNIT_RENT_KEYS),
+                        ('availableDate', _SI_UNIT_DATE_KEYS),
+                        ('sqft',   _SI_UNIT_SQFT_KEYS)):
+        v = _sync_issues_first_value(primary_row, actual_row, values, keys=keys)
+        if v not in (None, ''):
+            unit[field] = v
+    return unit
+
+
+def _sync_issues_building_detail(sync, integration=None, snapshot=None,
+                                 skip_reason=None, stage_9=0, analyzed=0,
+                                 reasons=None, units=None, reasons_new=None,
+                                 newly_marked=0, baseline_snapshot=None,
+                                 baseline_available=False):
+    """Shape one building's analysis outcome for the per-sync expand view."""
+    reasons     = reasons or {}
+    reasons_new = reasons_new or {}
+    units       = units or {}
+    rows = _sync_issues_reason_rows(reasons, reasons_new, stage_9, newly_marked)
+    for row in rows:
+        bucket = units.get(row['reason']) or []
+        row['units'] = bucket[:SYNC_ISSUES_MAX_UNITS_PER_REASON]
+        row['unitsTruncated'] = len(bucket) > SYNC_ISSUES_MAX_UNITS_PER_REASON
+    return {
+        'buildingId':   str(sync.get('BUILDING_ID') or ''),
+        'buildingName': sync.get('BUILDING_NAME') or '',
+        'orgName':      sync.get('ORG_NAME') or '',
+        'integration':  integration,
+        'snapshot':     snapshot,
+        'status':       'skipped' if skip_reason else 'ok',
+        'skipReason':   skip_reason,
+        'unavailableUnits':  stage_9,
+        'newlyMarkedUnits':  newly_marked,
+        'preExistingUnits':  max(0, stage_9 - newly_marked),
+        # The snapshot used as the pre-sync baseline; without one we cannot
+        # tell newly-marked units from already-unavailable ones.
+        'baselineSnapshot':  baseline_snapshot,
+        'baselineAvailable': bool(baseline_available),
+        'totalUnitsAnalyzed': analyzed,
+        # What Snowflake believed the sync did, for side-by-side comparison.
+        'reportedMarkedUnavailable': sync.get('UNITS_MARKED_UNAVAILABLE'),
+        'reportedUnitsBeforeSync':   sync.get('TOTAL_UNITS_BEFORE_SYNC'),
+        'reasons': rows,
+    }
+
+
+def _run_sync_issues_analyze_job(job_id: str, syncs: list):
+    """
+    For each sync result, run availability rules and aggregate reasons for
+    stage-9 predictions.  Uses pre-loaded local index files to avoid per-building
+    S3 list operations, and deduplicates syncs by building so each building is
+    only downloaded once regardless of how many syncs it appears in.
+    """
+    try:
+        _job_update(job_id, total=len(syncs), note='Loading integration indexes…')
+
+        # ── Pre-load rules and index files once (fast local reads) ────────────
+        all_rules = _availability_rules().get('integrations', {})
+        integration_indexes: dict[str, dict] = {}
+        missing_from_index: set[str] = set()
+        for intg in all_rules:
+            data = _index_load(intg)
+            if data:
+                integration_indexes[intg] = data.get('entities', {})
+
+        # Indexes for the supplemental PMS feeds (e.g. Voyager AllUnits_Login),
+        # used to tell "dropped from the RentCafe feed" apart from "blank status".
+        supplemental_indexes: dict[str, dict] = {}
+        for _r in all_rules.values():
+            for rel in (_r.get('supplemental_units') or {}).get('integrations') or []:
+                if rel not in supplemental_indexes:
+                    rel_data = _index_load(rel)
+                    supplemental_indexes[rel] = (
+                        (rel_data or {}).get('entities', {})
+                        if isinstance(rel_data, dict) else {})
+
+        # ── Deduplicate by building_id so each building is processed once ─────
+        seen: set[str] = set()
+        deduped: list[dict] = []
+        for s in syncs:
+            bid = str(s.get('BUILDING_ID') or '')
+            if bid and bid not in seen:
+                seen.add(bid)
+                deduped.append(s)
+        n_total = len(deduped)
+        dedup_saved = len(syncs) - n_total
+
+        dedup_note = (f'Deduplicated to {n_total} unique buildings'
+                      f' (skipping {dedup_saved} duplicate syncs)')
+        _job_update(job_id, total=n_total, note=dedup_note)
+
+        # ── Rollout / building metadata (matches the Availability Agent) ──────
+        # Overrides such as AppFolio "Not Posted to Website" and RealPage
+        # "Exclude Not Rent Ready Units" read org-level rollout variants and
+        # building flags that only Snowflake/DynamoDB can answer.  Resolve them
+        # once, up front, so each probe thread reads a plain dict.
+        meta_entities: dict[str, datetime] = {}
+        rollout_names_needed: set[str] = set()
+        for _s in deduped:
+            _intg, _entity, _as_of = _sync_issues_target(_s)
+            if not _intg or not _entity:
+                continue
+            _r = all_rules.get(_intg) or {}
+            _names = list(_r.get('rollouts') or {})
+            if _names or (_r.get('building_fields') or []):
+                meta_entities[_entity] = _as_of or datetime.now(timezone.utc)
+                rollout_names_needed.update(_names)
+
+        building_meta: dict = {}
+        rollout_values: dict = {}
+        rollout_error = None
+        enrich_error = None
+        if meta_entities:
+            _job_update(job_id, note=(
+                f'Loading building metadata for {len(meta_entities)} '
+                f'rollout-dependent buildings…'))
+            building_meta, col_map, enrich_error = _enrich_with_snowflake(
+                job_id, list(meta_entities),
+                timeout=SYNC_ISSUES_ENRICH_TIMEOUT)
+            building_meta = building_meta or {}
+            if rollout_names_needed:
+                org_ids = {}
+                if enrich_error:
+                    rollout_error = (
+                        f'organization lookup unavailable: {enrich_error}')
+                elif building_meta and col_map and col_map.get('org'):
+                    org_ids = {e: d.get(col_map['org'])
+                               for e, d in building_meta.items()}
+                try:
+                    rollout_values = snowflake_db.rollout_variants(
+                        list(meta_entities), sorted(rollout_names_needed),
+                        meta_entities, org_ids)
+                except Exception as exc:
+                    # Keep the run usable, but leave rollout state unknown so a
+                    # rollout-dependent override is not applied speculatively.
+                    rollout_error = (str(exc) if not rollout_error
+                                     else f'{rollout_error}; {exc}')
+
+        reason_counts: dict[str, int] = {}
+        reason_counts_new: dict[str, int] = {}
+        by_integration: dict[str, int] = {}
+        by_integration_new: dict[str, int] = {}
+        building_details: dict[str, dict] = {}
+        total_analyzed = 0
+        stage_9_count = 0
+        newly_marked_count = 0
+        baseline_missing = 0
+        skipped = 0
+        lock = threading.Lock()
+        counter = {'n': 0}
+
+        def _finish(sync, skip_reason=None, local_analyzed=0, local_stage9=0,
+                    local_reasons=None, local_units=None, intg=None,
+                    snapshot=None, local_reasons_new=None, local_new=0,
+                    baseline_snapshot=None, baseline_available=False):
+            """Thread-safe counter / progress — called once per probe call."""
+            nonlocal total_analyzed, stage_9_count, skipped
+            nonlocal newly_marked_count, baseline_missing
+            with lock:
+                counter['n'] += 1
+                if skip_reason:
+                    skipped += 1
+                else:
+                    total_analyzed += local_analyzed
+                    stage_9_count += local_stage9
+                    newly_marked_count += local_new
+                    if not baseline_available:
+                        baseline_missing += 1
+                    if intg:
+                        by_integration[intg] = (
+                            by_integration.get(intg, 0) + local_stage9)
+                        by_integration_new[intg] = (
+                            by_integration_new.get(intg, 0) + local_new)
+                    for r, c in (local_reasons or {}).items():
+                        reason_counts[r] = reason_counts.get(r, 0) + c
+                    for r, c in (local_reasons_new or {}).items():
+                        reason_counts_new[r] = reason_counts_new.get(r, 0) + c
+
+                bid = str(sync.get('BUILDING_ID') or f'_{counter["n"]}')
+                building_details[bid] = _sync_issues_building_detail(
+                    sync, integration=intg, snapshot=snapshot,
+                    skip_reason=skip_reason, stage_9=local_stage9,
+                    analyzed=local_analyzed, reasons=local_reasons,
+                    units=local_units, reasons_new=local_reasons_new,
+                    newly_marked=local_new,
+                    baseline_snapshot=baseline_snapshot,
+                    baseline_available=baseline_available)
+
+                # Publish a live partial result on every completion so the
+                # frontend can render an updating distribution table.
+                partial = _sync_issues_partial_result(
+                    reason_counts, by_integration, stage_9_count,
+                    total_analyzed, counter['n'], n_total, skipped,
+                    buildings=building_details,
+                    reason_counts_new=reason_counts_new,
+                    newly_marked_count=newly_marked_count,
+                    by_integration_new=by_integration_new,
+                    baseline_missing=baseline_missing,
+                    rollout_error=rollout_error, enrich_error=enrich_error)
+                _job_update(
+                    job_id, done=counter['n'], result=partial,
+                    note=(f'{counter["n"]}/{n_total} buildings · '
+                          f'{newly_marked_count} newly marked / '
+                          f'{stage_9_count} unavailable units'
+                          + (f' · {len(missing_from_index)} not in index'
+                             if missing_from_index else '')))
+
+        def probe(sync):
+            sources = str(sync.get('SOURCES') or '')
+            integration, entity, as_of = _sync_issues_target(sync)
+            if not integration:
+                _finish(sync, skip_reason=(
+                    f'No availability rules for source "{sources}"'))
+                return
+
+            rules = all_rules.get(integration)
+            if not rules:
+                _finish(sync, skip_reason=(
+                    f'No availability rules for integration "{integration}"'))
+                return
+
+            source_integration = _availability_source_integration(integration)
+            entity_prefix = f'{ROOT}{source_integration}/{entity}/'
+
+            # ── Snapshot selection ────────────────────────────────────────────
+            # Always resolve the snapshot by the sync completion timestamp so
+            # we analyse the state at the time of the sync, not today's (which
+            # may have recovered and have no stage-9 units).  The local index
+            # is kept only as a fallback for when we lack a valid timestamp.
+            snapshot = None
+            snapshot_files = None
+            supp_as_of = as_of   # cutoff for the supplemental PMS snapshot
+
+            if as_of is not None:
+                # Look for the snapshot that existed just after the sync ran.
+                try:
+                    snap_prefix = _snapshot_prefix_before(entity_prefix, as_of)
+                except Exception:
+                    snap_prefix = None
+                if snap_prefix:
+                    snapshot = snap_prefix[len(entity_prefix):].rstrip('/')
+                    try:
+                        snapshot_files = _snapshot_files(entity_prefix, snapshot)
+                    except Exception:
+                        snapshot = None
+
+            if snapshot is None:
+                # Fall back to the index's latest snapshot when we can't resolve
+                # by time (missing timestamp or no S3 result).
+                idx_entry = integration_indexes.get(integration, {}).get(entity)
+                if idx_entry:
+                    snapshot, snapshot_files = idx_entry[0], list(idx_entry[1])
+                else:
+                    missing_from_index.add(entity)
+                    _finish(sync, intg=integration, skip_reason=(
+                        'No snapshot found near the sync time, and the building '
+                        'is not in the local index'))
+                    return
+
+            # ── Resolve file names ────────────────────────────────────────────
+            primary_candidates = rules.get('primary') or []
+            actual_candidates  = rules.get('actual') or []
+            primary_key        = rules.get('primary_key') or []
+            actual_key         = rules.get('actual_key') or []
+            primary_fields = list(dict.fromkeys(
+                (rules.get('fields') or []) + (rules.get('primary_key') or [])))
+            actual_fields = list(dict.fromkeys(
+                (rules.get('actual_fields') or
+                 ['availability_stage', 'availabilityStage']) +
+                (rules.get('actual_key') or []) +
+                # Pulled purely for display alongside the join key.
+                ['unit_number', 'unitNumber']))
+
+            primary_actual = _availability_first_file(
+                snapshot_files, source_integration, primary_candidates)
+            actual_actual  = _availability_first_file(
+                snapshot_files, source_integration, actual_candidates)
+            if not actual_actual:
+                _finish(sync, intg=integration, snapshot=snapshot,
+                        skip_reason=(f'Snapshot has no unit-details file '
+                                     f'(looked for {", ".join(actual_candidates)})'))
+                return
+
+            # ── Fetch files (2 S3 GetObject calls per building) ───────────────
+            s3base = f'{ROOT}{source_integration}/{entity}/{snapshot}/'
+            try:
+                actual_body = _fetch_text(f'{s3base}{actual_actual}')
+                actual_rows = _availability_extract(actual_body, actual_fields)
+            except Exception as exc:
+                _finish(sync, intg=integration, snapshot=snapshot,
+                        skip_reason=f'Could not read {actual_actual}: {exc}')
+                return
+
+            primary_rows = []
+            if primary_actual:
+                try:
+                    primary_body = _fetch_text(f'{s3base}{primary_actual}')
+                    primary_rows = _availability_extract(
+                        primary_body, primary_fields,
+                        voyager_units=(integration == 'Voyager'),
+                        realpage_units=(integration == 'RealPage'))
+                except Exception:
+                    primary_rows = []
+
+            # ── Supplemental PMS feed (Voyager AllUnits_Login for RentCafe) ───
+            # Units the PMS knows about but the availability feed dropped have
+            # no status to be blank, so pull them in and mark them explicitly.
+            supplemental_config = rules.get('supplemental_units') or {}
+            supplemental_targets: list = []
+            if supplemental_config:
+                try:
+                    targets = _availability_supplemental_targets(
+                        entity, snapshot, supp_as_of, supplemental_config,
+                        supplemental_indexes)
+                    supplemental_targets = list(targets)
+                    added: list = []
+                    for rel_intg, rel_snap, rel_file in targets:
+                        supp_body = _fetch_text(
+                            f'{ROOT}{rel_intg}/{entity}/{rel_snap}/{rel_file}')
+                        code = _availability_file_property_code(
+                            rel_file, supplemental_config.get('files') or [])
+                        added.extend(_availability_supplemental_rows(
+                            supp_body, supplemental_config,
+                            primary_rows + added, code))
+                    # A legacy unsuffixed Voyager file carries no property code;
+                    # inheriting one is only safe for a single-code building.
+                    codes = {
+                        str(c).strip()
+                        for row in primary_rows
+                        for c in [_availability_value(row, 'voyagerPropertyCode')]
+                        if c is not None and str(c).strip()
+                    }
+                    if len(codes) == 1:
+                        sole_code = next(iter(codes))
+                        for row in added:
+                            row.setdefault('voyagerPropertyCode', sole_code)
+                    primary_rows.extend(added)
+                except Exception:
+                    # The primary analysis is still useful without the optional
+                    # supplement; the rules' own "snapshot missing" reason then
+                    # applies to unmatched units.
+                    supplemental_targets = []
+
+            # ── Source files declared by the rules ────────────────────────────
+            # Overrides such as "Outside Availability Restriction Window" read
+            # fields from these files (property_details, floorplans, ...).  The
+            # rules cannot fire without them, so load and join them exactly the
+            # way the Availability Agent does.
+            source_configs = rules.get('sources') or []
+            source_fields_map = {
+                sc['file']: list(dict.fromkeys(sc.get('fields') or []))
+                for sc in source_configs
+            }
+            source_by_key: dict = {}
+            for sc in source_configs:
+                rows_for_file: list = []
+                variant = _availability_file_variant(
+                    snapshot_files, source_integration, sc['file'])
+                if variant:
+                    try:
+                        rows_for_file = _availability_extract(
+                            _fetch_text(f'{s3base}{variant}'),
+                            source_fields_map[sc['file']],
+                            voyager_units=(
+                                integration == 'Voyager' and
+                                sc['file'].startswith(
+                                    ('AllUnits_Login', 'AvailableUnits_Login'))),
+                            realpage_units=integration == 'RealPage')
+                    except Exception:
+                        rows_for_file = []
+                keyed: dict = {}
+                join_key = sc.get('join_key')
+                for row in rows_for_file:
+                    for key in _availability_keys(row, join_key or []):
+                        keyed.setdefault(key, row)
+                if not join_key and rows_for_file:
+                    keyed['__all__'] = rows_for_file[0]
+                source_by_key[sc['file']] = keyed
+
+            # ── Pre-sync baseline ─────────────────────────────────────────────
+            # The snapshot immediately before the one we analysed tells us which
+            # units were already unavailable going into this sync, so the caller
+            # can look at newly-marked units alone.
+            snap_dt  = _availability_snapshot_datetime(snapshot)
+            baseline_stage9 = None      # None => baseline unavailable
+            baseline_snapshot = None
+            if snap_dt is not None:
+                try:
+                    prev_prefix = _snapshot_prefix_before(
+                        entity_prefix, snap_dt - timedelta(microseconds=1),
+                        lookback_hours=SYNC_ISSUES_BASELINE_LOOKBACK_HOURS)
+                except Exception:
+                    prev_prefix = None
+                if prev_prefix:
+                    prev_snapshot = prev_prefix[len(entity_prefix):].rstrip('/')
+                    try:
+                        prev_files = _snapshot_files(entity_prefix, prev_snapshot)
+                        prev_actual = _availability_first_file(
+                            prev_files, source_integration, actual_candidates)
+                        if prev_actual:
+                            prev_body = _fetch_text(
+                                f'{ROOT}{source_integration}/{entity}/'
+                                f'{prev_snapshot}/{prev_actual}')
+                            prev_rows = _availability_extract(
+                                prev_body, actual_fields)
+                            baseline_stage9 = set()
+                            for prev_row in prev_rows:
+                                pv = (prev_row.get('availability_stage')
+                                      or prev_row.get('availabilityStage'))
+                                try:
+                                    if int(pv) != 9:
+                                        continue
+                                except (TypeError, ValueError):
+                                    continue
+                                baseline_stage9.update(
+                                    _availability_keys(prev_row, actual_key))
+                            baseline_snapshot = prev_snapshot
+                    except Exception:
+                        baseline_stage9 = None
+                        baseline_snapshot = None
+
+            # ── Run availability rules ────────────────────────────────────────
+            ref_date = (snap_dt.date() if snap_dt
+                        else datetime.now(timezone.utc).date())
+
+            # ── Match availability-feed rows to unit_details rows ─────────────
+            # Ported from the Availability Agent.  The join key is the rules'
+            # composite unit_key (e.g. voyagerPropertyCode-apartmentName, which
+            # is the persisted building_unique_id) — NOT the individual key
+            # fields — plus the integration-specific bare-id fallbacks.
+            actual_by_key: dict = {}
+            for idx_a, row_a in enumerate(actual_rows):
+                for key in _availability_keys(row_a, actual_key):
+                    actual_by_key.setdefault(key, (idx_a, row_a))
+
+            rentcafe_codes = {
+                str(code).strip()
+                for row in primary_rows
+                for code in [_availability_value(row, 'voyagerPropertyCode')]
+                if code is not None and str(code).strip()
+            } if integration == 'RentCafe' else set()
+
+            phase_fields = (rules.get('unit_key') or {}).get(
+                'phase_prefix_when_multiple') or []
+            phase_prefix_values = {
+                str(v).strip().casefold()
+                for row in primary_rows
+                for f in phase_fields
+                for v in [_availability_value(row, f)]
+                if v is not None and str(v).strip()
+            }
+
+            required_key = rules.get('required_key') or primary_key
+            primary_for_actual: dict = {}
+            seen_primary_keys: set = set()
+            claimed_actual: set = set()
+            for primary_row in primary_rows:
+                if required_key and not _availability_keys(primary_row, required_key):
+                    continue
+                if _availability_wait_unit(primary_row, rules):
+                    continue
+                unit_key_p = _availability_unit_key(
+                    primary_row, rules, phase_prefix_values)
+                actual_match = actual_by_key.get(unit_key_p)
+                if integration == 'RentCafe':
+                    is_supplemental = bool(primary_row.get('__supplemental_unit'))
+                    # unit_details may persist only the bare external id; a
+                    # single property code makes that unambiguous.
+                    if (actual_match is None and
+                            (len(rentcafe_codes) == 1 or is_supplemental)):
+                        name = (_availability_value(primary_row, 'apartmentName') or
+                                _availability_value(primary_row, 'ApartmentName'))
+                        name_key = (str(name).strip().casefold()
+                                    if name is not None else '')
+                        actual_match = actual_by_key.get(name_key)
+                        if actual_match is not None and is_supplemental:
+                            unit_key_p = name_key
+                    if not unit_key_p and not is_supplemental:
+                        actual_match = None
+                elif integration == 'Voyager' and actual_match is None:
+                    property_codes = {
+                        code for file_name in snapshot_files
+                        for code in [_availability_file_property_code(
+                            file_name, primary_candidates)]
+                        if code
+                    }
+                    if len(property_codes) == 1:
+                        bare_id = _availability_value(primary_row, '@IDValue')
+                        if bare_id is not None:
+                            actual_match = actual_by_key.get(
+                                str(bare_id).strip().casefold())
+                if actual_match is None:
+                    continue
+                # A canonical identity can repeat in a raw feed; keep the first
+                # row deterministically and claim each unit_details row once.
+                if unit_key_p and unit_key_p in seen_primary_keys:
+                    continue
+                idx_a = actual_match[0]
+                if idx_a in claimed_actual:
+                    continue
+                if unit_key_p:
+                    seen_primary_keys.add(unit_key_p)
+                claimed_actual.add(idx_a)
+                primary_for_actual[idx_a] = primary_row
+
+            local_reasons: dict[str, int] = {}
+            local_reasons_new: dict[str, int] = {}
+            local_units: dict[str, list] = {}
+            local_analyzed = 0
+            local_stage_9  = 0
+            local_new      = 0
+
+            try:
+                # unit_details is the canonical physical-unit feed, so iterate
+                # it directly and analyse the rows already at stage 9.
+                for idx_a, actual_row in enumerate(actual_rows):
+                    stage_val = (actual_row.get('availability_stage')
+                                 or actual_row.get('availabilityStage'))
+                    try:
+                        if int(stage_val) != 9:
+                            continue
+                    except (TypeError, ValueError):
+                        continue
+
+                    unit_key_parts = _availability_keys(actual_row, actual_key)
+                    unit_key = str(unit_key_parts[0]) if unit_key_parts else None
+
+                    local_stage_9  += 1
+                    local_analyzed += 1
+
+                    # Build the rule inputs exactly the way the Availability
+                    # Agent does, so every reason comes from the rules alone.
+                    p_row = primary_for_actual.get(idx_a, {})
+                    if p_row:
+                        values = dict(p_row)
+                        values['__current_date'] = ref_date.isoformat()
+                        for k, v in p_row.items():
+                            values[f'primary__{k}'] = v
+                        for sc in source_configs:
+                            keyed = source_by_key.get(sc['file'], {})
+                            src_keys = _availability_keys(
+                                p_row, sc.get('primary_key') or primary_key)
+                            related = next((keyed[k] for k in src_keys
+                                            if k in keyed), None)
+                            if related is None:
+                                related = keyed.get('__all__')
+                            if related:
+                                for k, v in related.items():
+                                    values.setdefault(k, v)
+                                for k, v in related.items():
+                                    values[f"{sc['file']}__{k}"] = v
+                            values[f"__source_present__{sc['file']}"] = bool(related)
+                    else:
+                        # The agent's predict_unit_details_only path: a unit in
+                        # unit_details with no availability-feed row at all.
+                        values = dict(actual_row)
+                        values['__current_date'] = ref_date.isoformat()
+                        values['__supplemental_snapshot_missing'] = (
+                            not bool(supplemental_targets))
+                        values['__supplemental_unit_missing'] = (
+                            bool(supplemental_targets))
+
+                    # Rollout variants and building flags, resolved up front
+                    # from Snowflake/DynamoDB exactly as the agent does.  A
+                    # failed lookup leaves the variant unknown rather than
+                    # letting a rollout-dependent override fire speculatively.
+                    building_detail = building_meta.get(entity, {})
+                    for bfield in (rules.get('building_fields') or []):
+                        values[f'__building__{bfield}'] = _availability_value(
+                            building_detail, bfield)
+                    for rollout_name, rollout_config in (
+                            rules.get('rollouts') or {}).items():
+                        if rollout_error:
+                            variant = '__unknown__'
+                        else:
+                            variant = rollout_values.get(entity, {}).get(
+                                rollout_name,
+                                (rollout_config or {}).get('default', 'disabled'))
+                        values[f'__rollout__{rollout_name}'] = variant
+
+                    # The rules own every reason; "Unknown" is only used when
+                    # they do not predict this unit unavailable at all.
+                    label = 'Unknown'
+                    try:
+                        values['__direct_stage'] = (
+                            _availability_direct_prediction(rules, values)[0])
+                        predicted, reason = _availability_predict(rules, values)
+                        if predicted == 9 and reason:
+                            label = reason.strip()
+                    except Exception:
+                        pass
+
+                    local_reasons[label] = local_reasons.get(label, 0) + 1
+
+                    # Newly marked by this sync, vs already unavailable before
+                    # it.  Unknown when there is no usable baseline snapshot.
+                    if baseline_stage9 is None:
+                        is_new = None
+                    else:
+                        is_new = not any(k in baseline_stage9
+                                         for k in unit_key_parts)
+                    if is_new:
+                        local_new += 1
+                        local_reasons_new[label] = (
+                            local_reasons_new.get(label, 0) + 1)
+
+                    # Record the unit so the UI can list which units carry
+                    # each reason.  Prefer a human-meaningful unit name from
+                    # the primary row, falling back to the join key.
+                    bucket = local_units.setdefault(label, [])
+                    if len(bucket) < SYNC_ISSUES_MAX_UNITS_PER_REASON + 1:
+                        unit_entry = _sync_issues_unit_label(
+                            p_row, actual_row, unit_key, values)
+                        unit_entry['isNew'] = is_new
+                        bucket.append(unit_entry)
+            except Exception:
+                pass  # keep partial results; don't crash the job
+
+            _finish(sync, local_analyzed=local_analyzed,
+                    local_stage9=local_stage_9, local_reasons=local_reasons,
+                    local_units=local_units, intg=integration,
+                    snapshot=snapshot, local_reasons_new=local_reasons_new,
+                    local_new=local_new, baseline_snapshot=baseline_snapshot,
+                    baseline_available=baseline_stage9 is not None)
+
+        max_w = min(16, max(n_total, 1))
+        with ThreadPoolExecutor(max_workers=max_w) as pool:
+            list(pool.map(probe, deduped))
+
+        final = _sync_issues_partial_result(
+            reason_counts, by_integration, stage_9_count,
+            total_analyzed, n_total, n_total, skipped, partial=False,
+            buildings=building_details, reason_counts_new=reason_counts_new,
+            newly_marked_count=newly_marked_count,
+            by_integration_new=by_integration_new,
+            baseline_missing=baseline_missing,
+            rollout_error=rollout_error, enrich_error=enrich_error)
+        final['originalSyncs'] = len(syncs)
+        final['deduplicatedBuildings'] = n_total
+        _job_update(job_id, status='done', done=n_total,
+                    finished=time.time(), result=final)
     except Exception as e:
         _job_update(job_id, status='error', error=str(e), finished=time.time())
 
@@ -3862,7 +5106,8 @@ def index_companion():
     primary = _safe_integration(body.get('integration', ''))
     if primary != 'RentCafe':
         return jsonify({'error': 'Voyager companion indexing requires RentCafe'}), 400
-    if not _index_load(primary):
+    primary_data = _index_load(primary)
+    if not isinstance(primary_data, dict) or not (primary_data.get('entities') or {}):
         return jsonify({'error': 'no-index',
                         'message': 'Build the RentCafe index first'}), 409
 
@@ -4099,6 +5344,98 @@ def delete_history(job_id):
     except OSError as exc:
         return jsonify({'error': f'could not delete export: {exc}'}), 500
     return jsonify({'ok': True})
+
+
+@app.route('/api/sync-issues/query', methods=['POST'])
+def sync_issues_query():
+    """Run the Snowflake query and return matching syncs."""
+    body = request.get_json(silent=True) or {}
+
+    # Date range
+    start_raw = (body.get('startDate') or '').strip()
+    end_raw = (body.get('endDate') or '').strip()
+    if not start_raw or not end_raw:
+        return jsonify({'error': 'startDate and endDate are required'}), 400
+    try:
+        start_dt = datetime.strptime(start_raw, '%Y-%m-%d').date()
+        end_dt   = datetime.strptime(end_raw,   '%Y-%m-%d').date()
+    except ValueError:
+        return jsonify({'error': 'startDate / endDate must be YYYY-MM-DD'}), 400
+    if end_dt < start_dt:
+        return jsonify({'error': 'endDate must be on or after startDate'}), 400
+
+    # Integration filter ('' means all)
+    integration_filter = (body.get('integration') or '').strip()
+
+    # Unavailability threshold (0–1 fraction, default 0.20)
+    try:
+        threshold = float(body.get('threshold', 0.20))
+        if not (0.0 < threshold <= 1.0):
+            raise ValueError()
+    except (TypeError, ValueError):
+        return jsonify({'error': 'threshold must be a number between 0 and 1'}), 400
+
+    # New-import window in minutes (default 1440)
+    try:
+        new_import_window = int(body.get('newImportWindowMinutes', 1440))
+        if new_import_window < 0:
+            raise ValueError()
+    except (TypeError, ValueError):
+        return jsonify({'error': 'newImportWindowMinutes must be a non-negative integer'}), 400
+
+    # Result limit (default 100, max 500)
+    try:
+        limit = int(body.get('limit', 100))
+        limit = max(1, min(limit, 500))
+    except (TypeError, ValueError):
+        limit = 100
+
+    try:
+        import snowflake_db
+        rows = snowflake_db.query(
+            _SYNC_ISSUES_SQL.format(limit=limit),
+            params=(
+                start_dt, end_dt,
+                integration_filter, integration_filter,
+                new_import_window,
+                threshold,
+            ),
+            timeout=SYNC_ISSUES_QUERY_TIMEOUT,
+        )
+    except Exception as exc:
+        return jsonify({'error': str(exc)}), 500
+
+    # Serialize datetime objects so JSON encoding works
+    serialized = []
+    for row in rows:
+        r = {}
+        for k, v in row.items():
+            if hasattr(v, 'isoformat'):
+                r[k] = v.isoformat()
+            else:
+                r[k] = v
+        serialized.append(r)
+
+    return jsonify({'syncs': serialized, 'count': len(serialized)})
+
+
+@app.route('/api/sync-issues/analyze', methods=['POST'])
+def sync_issues_analyze():
+    """Start an async job that runs the Availability Agent over a list of syncs."""
+    body = request.get_json(silent=True) or {}
+    syncs = body.get('syncs')
+    if not isinstance(syncs, list) or not syncs:
+        return jsonify({'error': 'syncs must be a non-empty array'}), 400
+    if len(syncs) > 500:
+        return jsonify({'error': 'at most 500 syncs per analysis run'}), 400
+
+    job_id = _job_new('sync_issues_analyze', '')
+    threading.Thread(
+        target=_run_sync_issues_analyze_job,
+        args=(job_id, syncs),
+        daemon=True,
+    ).start()
+    return jsonify({'jobId': job_id})
 
 
 @app.route('/api/search/csv/<job_id>')

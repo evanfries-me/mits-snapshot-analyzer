@@ -270,7 +270,7 @@ def _assert_read_only(sql: str):
         raise ValueError('Only read-only statements are permitted')
 
 
-def query(sql: str, params=None, limit=None):
+def query(sql: str, params=None, limit=None, timeout=None):
     """
     Run a read-only query and return a list of dicts.
     `params` must be a sequence/dict of bind values — never interpolate
@@ -280,7 +280,7 @@ def query(sql: str, params=None, limit=None):
     conn = connect()
     cur = conn.cursor(DictCursor)
     try:
-        cur.execute(sql, params or None, timeout=QUERY_TIMEOUT)
+        cur.execute(sql, params or None, timeout=timeout or QUERY_TIMEOUT)
         rows = cur.fetchmany(limit) if limit else cur.fetchall()
         return [dict(r) for r in rows]
     finally:

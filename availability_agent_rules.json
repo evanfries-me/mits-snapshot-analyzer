@@ -22,21 +22,21 @@
       "primary_key": ["voyagerPropertyCode", "apartmentName"],
       "required_key": ["voyagerPropertyCode", "apartmentName"],
       "actual_key": ["building_unique_id", "external_id"],
-      "fields": ["voyagerPropertyCode", "apartmentName", "voyagerApartmentId", "unitStatus", "minimumRent", "maximumRent", "availableDate", "sqft", "availability_stage"],
+      "fields": ["voyagerPropertyCode", "apartmentName", "voyagerApartmentId", "unitStatus", "minimumRent", "availableDate", "sqft"],
+      "predict_unit_details_only": true,
       "supplemental_units": {
         "integrations": ["YardiVoyager", "PricingAvailsSourceType.YardiVoyager"],
         "files": ["AllUnits_Login"],
-        "fields": ["@IDType", "@IDValue", "@OrganizationName"],
-        "row_type_field": "@OrganizationName",
-        "row_type_value": "Unit",
+        "fields": ["@IDType", "@IDValue"],
+        "nearest_snapshot_minutes": 15,
+        "use_latest_historical_snapshot": true,
         "primary_id_field": "voyagerApartmentId",
         "supplemental_id_field": "@IDType",
         "supplemental_name_field": "@IDValue",
         "output_name_field": "apartmentName",
-        "output_status_field": "unitStatus",
-        "output_status_value": "Lease Signed"
+        "output_property_field": "voyagerPropertyCode"
       },
-      "sources": [{"file": "property_details.json.gz", "fields": ["monthsAvailabilityRestrictedTo", "apartmentSettings"]}],
+      "sources": [{"file": "property_details.json.gz", "fields": ["monthsAvailabilityRestrictedTo"]}],
       "direct": {"field": "unitStatus", "map": {}},
       "direct_rules": [
         {"stage": 0, "reason": "Status: Vacant Unrented Ready", "when": [{"field": "unitStatus", "op": "equals", "value": "Vacant Unrented Ready"}]},
@@ -56,7 +56,9 @@
         {"stage": 9, "reason": "Outside Availability Restriction Window", "when": [{"field": "availableDate", "op": "future_by_field_days", "days_field": "monthsAvailabilityRestrictedTo", "multiplier": 30}]},
         {"stage": 9, "reason": "Future Availability Cutoff: 1 Year", "when": [{"field": "__direct_stage", "op": "stage_in", "value": [0, 1]}, {"field": "availableDate", "op": "future_days", "value": 365}]},
         {"stage": 9, "reason": "Invalid Rent", "when": [{"field": "minimumRent", "op": "invalid_rent"}]},
-        {"stage": 9, "reason": "Invalid Square Footage", "when": [{"field": "sqft", "op": "invalid_sqft"}]}
+        {"stage": 9, "reason": "Invalid Square Footage", "when": [{"field": "sqft", "op": "invalid_sqft"}]},
+        {"stage": 9, "reason": "Present in Voyager but absent from RentCafe", "replace_reason": true, "when": [{"field": "__supplemental_unit", "op": "truthy"}]},
+        {"stage": 9, "reason": "Absent from RentCafe; no Voyager snapshot found", "replace_reason": true, "when": [{"field": "__supplemental_snapshot_missing", "op": "truthy"}]}
       ]
     },
     "Voyager": {
@@ -67,8 +69,8 @@
       "primary_key": ["__file_property_code", "@IDValue"],
       "required_key": ["@IDValue"],
       "actual_key": ["building_unique_id", "external_id"],
-      "fields": ["@IDValue", "UnitLeasedStatus", "UnitLeasedStatusDescription", "Comment", "EffectiveRent", "MarketRent", "MadeReadyDate", "MinSquareFeet", "availability_stage"],
-      "sources": [{"file": "AllUnits_Login", "join_key": ["@IDValue"], "fields": ["@IDValue", "UnitLeasedStatus", "EffectiveRent", "MarketRent", "MadeReadyDate", "MinSquareFeet"]}],
+      "fields": ["@IDValue", "UnitLeasedStatus", "UnitLeasedStatusDescription", "Comment", "EffectiveRent", "MadeReadyDate"],
+      "sources": [{"file": "AllUnits_Login", "join_key": ["@IDValue"], "fields": ["@IDValue", "UnitLeasedStatus", "EffectiveRent", "MadeReadyDate"]}],
       "building_fields": ["EXCLUDE_NOT_RENT_READY_UNITS"],
       "direct": {"field": "UnitLeasedStatus", "casefold": true, "map": {}},
       "direct_rules": [
@@ -88,30 +90,30 @@
         {"stage": 9, "reason": "Non Revenue Generating Unit", "when": [{"field": "UnitLeasedStatusDescription", "op": "equals", "value": "Non Revenue Generating Unit"}]},
         {"stage": 9, "reason": "Made-Ready Date: 0/0/0", "when": [{"field": "__made_ready_date_all_zero", "op": "truthy"}]},
         {"stage": 9, "reason": "Future Availability Cutoff: 1 Year", "when": [{"field": "__direct_stage", "op": "stage_in", "value": [0, 1]}, {"field": "MadeReadyDate", "op": "future_days", "value": 365}]},
-        {"stage": 9, "reason": "Invalid rent", "when": [{"field": "EffectiveRent", "op": "invalid_rent"}]},
+        {"stage": 9, "reason": "Invalid Rent", "when": [{"field": "EffectiveRent", "op": "invalid_rent"}]},
         {"stage": 9, "reason": "Exclude Not Rent Ready Units", "when": [{"field": "__direct_stage", "op": "stage_in", "value": [1]}, {"field": "__building__EXCLUDE_NOT_RENT_READY_UNITS", "op": "truthy"}]}
       ]
     },
     "RealPage": {
       "primary": ["getunitlist"],
       "actual": ["unit_details.json.gz", "unit-details.json.gz"],
-      "unit_key": {"components": [["PropertyNumberID"], ["UnitID"]]},
+      "unit_key": {"components": [["__file_property_code"], ["UnitID"]]},
       "unit_name_fields": ["UnitNumber"],
       "primary_key": ["PropertyNumberID", "UnitID"],
       "required_key": ["UnitID"],
       "actual_key": ["building_unique_id", "external_id"],
       "fields": ["PropertyNumberID", "SiteID", "PropertyID", "UnitID", "UnitNumber", "BuildingNumber", "VacantBit", "AvailableBit", "MadeReadyBit", "MadeReadyDate", "EffectiveRent", "UnitMarketRent", "RentSqFtCount", "FloorNumber", "availability_stage"],
-      "sources": [{"file": "getallunits", "join_key": ["UnitNumber"], "fields": ["UnitNumber", "BuildingNumber", "VacantBit", "AvailableBit", "MadeReadyBit", "MadeReadyDate", "UnitMarketRent", "RentSqFtCount", "FloorNumber"]}],
+      "sources": [{"file": "getallunits", "join_key": ["UnitNumber"], "primary_key": ["UnitNumber"], "fields": ["UnitNumber", "BuildingNumber", "VacantBit", "AvailableBit", "MadeReadyBit", "MadeReadyDate", "UnitMarketRent", "RentSqFtCount", "FloorNumber"]}],
       "direct": {"field": "availability_stage", "map": {}},
       "direct_rules": [
-        {"stage": 1, "reason": "Status: Renovating", "when": [{"field": "VacantBit", "op": "truthy"}, {"field": "AvailableBit", "op": "truthy"}, {"field": "MadeReadyDate", "op": "future_or_equal_days", "value": 14}]},
-        {"stage": 0, "reason": "Status: Available", "when": [{"field": "AvailableBit", "op": "truthy"}, {"not": {"all": [{"field": "VacantBit", "op": "truthy"}, {"field": "MadeReadyDate", "op": "future_or_equal_days", "value": 14}]}}]},
-        {"stage": 9, "reason": "Status: Lease Signed", "when": [{"field": "AvailableBit", "op": "equals", "value": false}]}
+        {"stage": 1, "reason": "AvailableBit = true AND VacantBit = true AND MadeReadyDate >= today + 14 days", "when": [{"field": "VacantBit", "op": "truthy"}, {"field": "AvailableBit", "op": "truthy"}, {"field": "MadeReadyDate", "op": "future_or_equal_days", "value": 14}]},
+        {"stage": 0, "reason": "AvailableBit = true AND NOT (VacantBit = true AND MadeReadyDate >= today + 14 days)", "when": [{"field": "AvailableBit", "op": "truthy"}, {"not": {"all": [{"field": "VacantBit", "op": "truthy"}, {"field": "MadeReadyDate", "op": "future_or_equal_days", "value": 14}]}}]},
+        {"stage": 9, "reason": "AvailableBit = false", "when": [{"field": "AvailableBit", "op": "equals", "value": false}]}
       ],
       "overrides": [
         {"stage": 9, "reason": "Retail unit", "when": [{"field": "UnitNumber", "op": "contains", "value": "retail"}]},
         {"stage": 9, "reason": "Future availability cutoff", "when": [{"field": "MadeReadyDate", "op": "future_days", "value": 365}]},
-        {"stage": 9, "reason": "Invalid rent", "when": [{"field": "EffectiveRent", "op": "invalid_rent"}]},
+        {"stage": 9, "reason": "Invalid Rent", "when": [{"field": "EffectiveRent", "op": "invalid_rent"}]},
         {"stage": 9, "reason": "Invalid square footage", "when": [{"field": "RentSqFtCount", "op": "invalid_sqft"}]}
       ]
     },
@@ -195,7 +197,7 @@
         {"stage": 9, "reason": "Missing made-ready date", "when": [{"field": "MadeReadyDate", "op": "missing"}]},
         {"stage": 9, "reason": "Future availability cutoff", "when": [{"field": "__direct_stage", "op": "stage_in", "value": [0, 1]}, {"field": "MadeReadyDate", "op": "future_days", "value": 365}]},
         {"stage": 9, "reason": "Unsupported or leased status", "when": [{"field": "UnitLeasedStatus", "op": "missing"}]},
-        {"stage": 9, "reason": "Invalid rent", "when": [{"field": "EffectiveRent", "op": "invalid_rent"}]},
+        {"stage": 9, "reason": "Invalid Rent", "when": [{"field": "EffectiveRent", "op": "invalid_rent"}]},
         {"stage": 9, "reason": "Invalid square footage", "when": [{"field": "MinSquareFeet", "op": "invalid_sqft"}]}
       ]
     },
@@ -218,7 +220,7 @@
       "fallback": {"stage": -1, "reason": "Status: unsupported or unknown"},
       "overrides": [
         {"stage": 9, "reason": "Missing made-ready date", "when": [{"field": "EarliestAvailable", "op": "missing"}, {"field": "MakeReadyDate", "op": "missing"}]},
-        {"stage": 9, "reason": "Invalid rent", "when": [{"field": "HTPRent", "op": "invalid_rent"}]},
+        {"stage": 9, "reason": "Invalid Rent", "when": [{"field": "HTPRent", "op": "invalid_rent"}]},
         {"stage": 9, "reason": "Invalid square footage", "when": [{"field": "SquareFeet", "op": "invalid_sqft"}]}
       ]
     },
