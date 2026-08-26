@@ -2646,22 +2646,30 @@ def _availability_realpage_units(body: str, fields: list) -> list:
         root = ET.fromstring(body)
     except (ET.ParseError, TypeError, ValueError):
         return []
+    # LRO (Lease Rent Optimization) pricing is exposed as a whole <RentMatrix>
+    # element per unit, never a scalar the generic text-extraction below can
+    # read. Its mere presence anywhere in this property's raw feed means the
+    # property runs LRO; a unit within it that lacks its own <RentMatrix> is
+    # missing pricing the PMS itself expected it to have.
+    building_has_lro = bool(root.findall('.//RentMatrix'))
     rows = []
     wanted = {str(field): str(field).lstrip('@') for field in fields}
     for unit in root.iter():
         if unit.tag.rsplit('}', 1)[-1] != 'UnitObject':
             continue
-        row = {'_group': 'UnitObject'}
+        row = {'_group': 'UnitObject', '__building_has_lro': building_has_lro}
         for field, local in wanted.items():
             if field.startswith('@'):
                 value = next((value for key, value in unit.attrib.items()
                               if key.rsplit('}', 1)[-1] == local), None)
             else:
                 value = None
+                found = False
                 for descendant in unit.iter():
                     if (descendant is unit or
                             descendant.tag.rsplit('}', 1)[-1] != local):
                         continue
+                    found = True
                     value = (descendant.text or '').strip() or None
                     if value is None:
                         value = (descendant.attrib.get('Value') or
@@ -2669,6 +2677,13 @@ def _availability_realpage_units(body: str, fields: list) -> list:
                                  descendant.attrib.get('Max'))
                     if value is not None:
                         break
+                if value is None and found:
+                    # A structural element with no scalar text/Value/Min/Max
+                    # (RentMatrix's content is a nested Rows/Row tree) still
+                    # carries meaning by existing at all -- record presence
+                    # so rules can test it with truthy/missing like any
+                    # other field, rather than reading as absent.
+                    value = 'true'
             row[field] = value
         rows.append(row)
     return rows

@@ -107,7 +107,7 @@
       "primary_key": ["PropertyNumberID", "UnitID"],
       "required_key": ["UnitID"],
       "actual_key": ["building_unique_id", "external_id"],
-      "fields": ["PropertyNumberID", "SiteID", "PropertyID", "UnitID", "UnitNumber", "BuildingNumber", "VacantBit", "AvailableBit", "MadeReadyBit", "MadeReadyDate", "EffectiveRent", "UnitMarketRent", "RentSqFtCount", "FloorNumber", "availability_stage"],
+      "fields": ["PropertyNumberID", "SiteID", "PropertyID", "UnitID", "UnitNumber", "BuildingNumber", "VacantBit", "AvailableBit", "MadeReadyBit", "MadeReadyDate", "EffectiveRent", "UnitMarketRent", "RentSqFtCount", "FloorNumber", "RentMatrix", "availability_stage"],
       "sources": [{"file": "getallunits", "join_key": ["UnitNumber"], "primary_key": ["UnitNumber"], "fields": ["UnitID", "UnitNumber", "BuildingNumber", "VacantBit", "AvailableBit", "MadeReadyBit", "MadeReadyDate", "UnitMarketRent", "RentSqFtCount", "FloorNumber"], "add_missing_as_units": true}],
       "direct": {"field": "availability_stage", "map": {}},
       "direct_rules": [
@@ -120,7 +120,8 @@
         {"stage": 9, "reason": "Future availability cutoff", "when": [{"field": "MadeReadyDate", "op": "future_days", "value": 365}]},
         {"stage": 9, "reason": "Invalid Rent", "when": [{"field": "__primary_row", "op": "truthy"}, {"field": "EffectiveRent", "op": "invalid_rent"}], "_source": "__primary_row: true only when this identity has a matching row in the raw primary availability feed for this integration; guards against a field that is absent (not present in the raw API response) being misread as an invalid value."},
         {"stage": 9, "reason": "Invalid square footage", "when": [{"field": "RentSqFtCount", "op": "invalid_sqft"}]},
-        {"stage": 9, "reason": "Present in getallunits but absent from getunitlist", "replace_reason": true, "when": [{"field": "__supplemental_unit", "op": "truthy"}], "_source": "__supplemental_unit: true when this raw identity (UnitID) is found in the getallunits feed (see sources, add_missing_as_units) but not in getunitlist, this integration's own primary availability feed."}
+        {"stage": 9, "reason": "Present in getallunits but absent from getunitlist", "replace_reason": true, "when": [{"field": "__supplemental_unit", "op": "truthy"}], "_source": "__supplemental_unit: true when this raw identity (UnitID) is found in the getallunits feed (see sources, add_missing_as_units) but not in getunitlist, this integration's own primary availability feed."},
+        {"stage": 9, "reason": "Missing Rent Matrix for LRO Building", "replace_reason": true, "when": [{"field": "__building_has_lro", "op": "truthy"}, {"field": "RentMatrix", "op": "missing"}], "_source": "__building_has_lro: true when any UnitObject in this property's raw getunitlist feed carries a RentMatrix element (bool(unit_list.findall(\".//RentMatrix\"))), meaning the property runs RealPage's LRO pricing. RentMatrix: presence of this unit's own <RentMatrix> element in the same raw feed -- a unit missing one on an LRO property has no PMS-expected pricing."}
       ]
     },
     "Entrata": {
