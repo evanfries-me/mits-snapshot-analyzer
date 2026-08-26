@@ -72,6 +72,7 @@
       "actual_key": ["building_unique_id", "external_id"],
       "fields": ["@IDValue", "UnitLeasedStatus", "UnitLeasedStatusDescription", "Comment", "EffectiveRent", "MadeReadyDate"],
       "sources": [{"file": "AllUnits_Login", "join_key": ["@IDValue"], "fields": ["@IDValue", "UnitLeasedStatus", "EffectiveRent", "MadeReadyDate"]}],
+      "supplemental_units": {"integrations": ["YardiVoyager", "PricingAvailsSourceType.YardiVoyager"], "files": ["AllUnits_Login"], "fields": ["@IDType", "@IDValue"], "nearest_snapshot_minutes": 15, "use_latest_historical_snapshot": true, "primary_id_field": "@IDType", "supplemental_id_field": "@IDType", "supplemental_name_field": "@IDValue", "output_name_field": "@IDValue", "output_property_field": "__file_property_code"},
       "building_fields": ["EXCLUDE_NOT_RENT_READY_UNITS"],
       "direct": {"field": "UnitLeasedStatus", "casefold": true, "map": {}},
       "direct_rules": [
@@ -92,7 +93,8 @@
         {"stage": 9, "reason": "Made-Ready Date: 0/0/0", "when": [{"field": "__made_ready_date_all_zero", "op": "truthy"}]},
         {"stage": 9, "reason": "Future Availability Cutoff: 1 Year", "when": [{"field": "__direct_stage", "op": "stage_in", "value": [0, 1]}, {"field": "MadeReadyDate", "op": "future_days", "value": 365}]},
         {"stage": 9, "reason": "Invalid Rent", "when": [{"field": "__primary_row", "op": "truthy"}, {"field": "EffectiveRent", "op": "invalid_rent"}]},
-        {"stage": 9, "reason": "Exclude Not Rent Ready Units", "when": [{"field": "__direct_stage", "op": "stage_in", "value": [1]}, {"field": "__building__EXCLUDE_NOT_RENT_READY_UNITS", "op": "truthy"}]}
+        {"stage": 9, "reason": "Exclude Not Rent Ready Units", "when": [{"field": "__direct_stage", "op": "stage_in", "value": [1]}, {"field": "__building__EXCLUDE_NOT_RENT_READY_UNITS", "op": "truthy"}]},
+        {"stage": 9, "reason": "In Voyager all-units feed but not available-units feed", "replace_reason": true, "when": [{"field": "__supplemental_unit", "op": "truthy"}]}
       ]
     },
     "RealPage": {
