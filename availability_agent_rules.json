@@ -58,7 +58,8 @@
         {"stage": 9, "reason": "Invalid Rent", "when": [{"field": "minimumRent", "op": "invalid_rent"}]},
         {"stage": 9, "reason": "Invalid Square Footage", "when": [{"field": "sqft", "op": "invalid_sqft"}]},
         {"stage": 9, "reason": "Present in Voyager but absent from RentCafe", "replace_reason": true, "when": [{"field": "__supplemental_unit", "op": "truthy"}]},
-        {"stage": 9, "reason": "Absent from RentCafe; no Voyager snapshot found", "replace_reason": true, "when": [{"field": "__supplemental_snapshot_missing", "op": "truthy"}]}
+        {"stage": 9, "reason": "Absent from RentCafe; no Voyager snapshot found", "replace_reason": true, "when": [{"field": "__supplemental_snapshot_missing", "op": "truthy"}]},
+        {"stage": 9, "reason": "Absent from RentCafe; not found in Voyager snapshot", "replace_reason": true, "when": [{"field": "__supplemental_unit_missing", "op": "truthy"}]}
       ]
     },
     "Voyager": {
