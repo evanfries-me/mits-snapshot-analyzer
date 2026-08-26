@@ -54,13 +54,13 @@
       "overrides": [
         {"stage": 9, "reason": "Missing Available Date", "when": [{"field": "availableDate", "op": "missing"}]},
         {"stage": 9, "reason": "Outside Availability Restriction Window", "when": [{"field": "availableDate", "op": "future_by_field_days", "days_field": "monthsAvailabilityRestrictedTo", "multiplier": 30}]},
-        {"stage": 9, "reason": "Future Availability Cutoff: 1 Year", "when": [{"field": "__direct_stage", "op": "stage_in", "value": [0, 1]}, {"field": "availableDate", "op": "future_days", "value": 365}]},
-        {"stage": 9, "reason": "Invalid Rent", "when": [{"field": "__primary_row", "op": "truthy"}, {"field": "minimumRent", "op": "invalid_rent"}]},
+        {"stage": 9, "reason": "Future Availability Cutoff: 1 Year", "when": [{"field": "__direct_stage", "op": "stage_in", "value": [0, 1]}, {"field": "availableDate", "op": "future_days", "value": 365}], "_source": "__direct_stage: the stage this integration's own direct/direct_rules mapping (declared above) assigns from the raw PMS status field, before any override runs -- not a separate input."},
+        {"stage": 9, "reason": "Invalid Rent", "when": [{"field": "__primary_row", "op": "truthy"}, {"field": "minimumRent", "op": "invalid_rent"}], "_source": "__primary_row: true only when this identity has a matching row in the raw primary availability feed for this integration; guards against a field that is absent (not present in the raw API response) being misread as an invalid value."},
         {"stage": 9, "reason": "Invalid Square Footage", "when": [{"field": "sqft", "op": "invalid_sqft"}]},
-        {"stage": 9, "reason": "Present in Voyager but absent from RentCafe", "replace_reason": true, "when": [{"field": "__supplemental_unit", "op": "truthy"}]},
-        {"stage": 9, "reason": "Absent from RentCafe; no Voyager snapshot found", "replace_reason": true, "when": [{"field": "__supplemental_snapshot_missing", "op": "truthy"}]},
-        {"stage": 9, "reason": "Absent from RentCafe; not found in Voyager snapshot", "replace_reason": true, "when": [{"field": "__supplemental_unit_missing", "op": "truthy"}]},
-        {"stage": 9, "reason": "Waitlist or Tour Placeholder Unit", "replace_reason": true, "when": [{"field": "__wait_unit", "op": "truthy"}]}
+        {"stage": 9, "reason": "Present in Voyager but absent from RentCafe", "replace_reason": true, "when": [{"field": "__supplemental_unit", "op": "truthy"}], "_source": "__supplemental_unit: true when this raw identity is found in the supplemental PMS feed (see supplemental_units) but not in this integration's own primary availability feed."},
+        {"stage": 9, "reason": "Absent from RentCafe; no Voyager snapshot found", "replace_reason": true, "when": [{"field": "__supplemental_snapshot_missing", "op": "truthy"}], "_source": "__supplemental_snapshot_missing: true when no supplemental PMS feed snapshot (see supplemental_units) could be located for this building near the primary snapshot time."},
+        {"stage": 9, "reason": "Absent from RentCafe; not found in Voyager snapshot", "replace_reason": true, "when": [{"field": "__supplemental_unit_missing", "op": "truthy"}], "_source": "__supplemental_unit_missing: true when a supplemental PMS feed snapshot was found, but this raw identity was not present in it either."},
+        {"stage": 9, "reason": "Waitlist or Tour Placeholder Unit", "replace_reason": true, "when": [{"field": "__wait_unit", "op": "truthy"}], "_source": "__wait_unit: true when the raw PMS identity field named in unit_name_fields (e.g. Voyager's AllUnits_Login/AvailableUnits_Login @IDValue, RentCafe's apartmentName) contains the substring wait -- a tour-scheduling or waitlist placeholder the PMS itself tracks as a pseudo-unit in its raw feed."}
       ]
     },
     "Voyager": {
@@ -91,12 +91,12 @@
       "fallback": {"stage": -1, "reason": "Status: unsupported or unknown"},
       "overrides": [
         {"stage": 9, "reason": "Non Revenue Generating Unit", "when": [{"field": "UnitLeasedStatusDescription", "op": "equals", "value": "Non Revenue Generating Unit"}]},
-        {"stage": 9, "reason": "Made-Ready Date: 0/0/0", "when": [{"field": "__made_ready_date_all_zero", "op": "truthy"}]},
-        {"stage": 9, "reason": "Future Availability Cutoff: 1 Year", "when": [{"field": "__direct_stage", "op": "stage_in", "value": [0, 1]}, {"field": "MadeReadyDate", "op": "future_days", "value": 365}]},
-        {"stage": 9, "reason": "Invalid Rent", "when": [{"field": "__primary_row", "op": "truthy"}, {"field": "EffectiveRent", "op": "invalid_rent"}]},
-        {"stage": 9, "reason": "Exclude Not Rent Ready Units", "when": [{"field": "__direct_stage", "op": "stage_in", "value": [1]}, {"field": "__building__EXCLUDE_NOT_RENT_READY_UNITS", "op": "truthy"}]},
-        {"stage": 9, "reason": "In Voyager all-units feed but not available-units feed", "replace_reason": true, "when": [{"field": "__supplemental_unit", "op": "truthy"}]},
-        {"stage": 9, "reason": "Waitlist or Tour Placeholder Unit", "replace_reason": true, "when": [{"field": "__wait_unit", "op": "truthy"}]}
+        {"stage": 9, "reason": "Made-Ready Date: 0/0/0", "when": [{"field": "__made_ready_date_all_zero", "op": "truthy"}], "_source": "__made_ready_date_all_zero: true when the raw Voyager AllUnits_Login/AvailableUnits_Login XML's MadeReadyDate element carries Year=0, Month=0, Day=0 -- Voyager's own convention for an explicitly-unset made-ready date, read directly off that element's attributes."},
+        {"stage": 9, "reason": "Future Availability Cutoff: 1 Year", "when": [{"field": "__direct_stage", "op": "stage_in", "value": [0, 1]}, {"field": "MadeReadyDate", "op": "future_days", "value": 365}], "_source": "__direct_stage: the stage this integration's own direct/direct_rules mapping (declared above) assigns from the raw PMS status field, before any override runs -- not a separate input."},
+        {"stage": 9, "reason": "Invalid Rent", "when": [{"field": "__primary_row", "op": "truthy"}, {"field": "EffectiveRent", "op": "invalid_rent"}], "_source": "__primary_row: true only when this identity has a matching row in the raw primary availability feed for this integration; guards against a field that is absent (not present in the raw API response) being misread as an invalid value."},
+        {"stage": 9, "reason": "Exclude Not Rent Ready Units", "when": [{"field": "__direct_stage", "op": "stage_in", "value": [1]}, {"field": "__building__EXCLUDE_NOT_RENT_READY_UNITS", "op": "truthy"}], "_source": "__direct_stage: the stage this integration's own direct/direct_rules mapping (declared above) assigns from the raw PMS status field, before any override runs -- not a separate input. __building__EXCLUDE_NOT_RENT_READY_UNITS: the raw building-level EXCLUDE_NOT_RENT_READY_UNITS flag, read from Snowflake (see building_fields) -- building information, not the PMS API or unit_details."},
+        {"stage": 9, "reason": "In Voyager all-units feed but not available-units feed", "replace_reason": true, "when": [{"field": "__supplemental_unit", "op": "truthy"}], "_source": "__supplemental_unit: true when this raw identity is found in the supplemental PMS feed (see supplemental_units) but not in this integration's own primary availability feed."},
+        {"stage": 9, "reason": "Waitlist or Tour Placeholder Unit", "replace_reason": true, "when": [{"field": "__wait_unit", "op": "truthy"}], "_source": "__wait_unit: true when the raw PMS identity field named in unit_name_fields (e.g. Voyager's AllUnits_Login/AvailableUnits_Login @IDValue, RentCafe's apartmentName) contains the substring wait -- a tour-scheduling or waitlist placeholder the PMS itself tracks as a pseudo-unit in its raw feed."}
       ]
     },
     "RealPage": {
@@ -118,9 +118,9 @@
       "overrides": [
         {"stage": 9, "reason": "Retail unit", "when": [{"field": "UnitNumber", "op": "contains", "value": "retail"}]},
         {"stage": 9, "reason": "Future availability cutoff", "when": [{"field": "MadeReadyDate", "op": "future_days", "value": 365}]},
-        {"stage": 9, "reason": "Invalid Rent", "when": [{"field": "__primary_row", "op": "truthy"}, {"field": "EffectiveRent", "op": "invalid_rent"}]},
+        {"stage": 9, "reason": "Invalid Rent", "when": [{"field": "__primary_row", "op": "truthy"}, {"field": "EffectiveRent", "op": "invalid_rent"}], "_source": "__primary_row: true only when this identity has a matching row in the raw primary availability feed for this integration; guards against a field that is absent (not present in the raw API response) being misread as an invalid value."},
         {"stage": 9, "reason": "Invalid square footage", "when": [{"field": "RentSqFtCount", "op": "invalid_sqft"}]},
-        {"stage": 9, "reason": "Waitlist or Tour Placeholder Unit", "replace_reason": true, "when": [{"field": "__wait_unit", "op": "truthy"}]}
+        {"stage": 9, "reason": "Waitlist or Tour Placeholder Unit", "replace_reason": true, "when": [{"field": "__wait_unit", "op": "truthy"}], "_source": "__wait_unit: true when the raw PMS identity field named in unit_name_fields (e.g. Voyager's AllUnits_Login/AvailableUnits_Login @IDValue, RentCafe's apartmentName) contains the substring wait -- a tour-scheduling or waitlist placeholder the PMS itself tracks as a pseudo-unit in its raw feed."}
       ]
     },
     "Entrata": {
@@ -145,9 +145,9 @@
       "fallback": {"stage": 9, "reason": "Status: unavailable or unsupported"},
       "overrides": [
         {"stage": 9, "reason": "Missing available date", "when": [{"any": [{"field": "Availability", "op": "truthy"}, {"field": "availabilityStatus", "op": "truthy"}]}, {"all": [{"field": "AvailableOn", "op": "missing"}, {"field": "availableDate", "op": "missing"}]}]},
-        {"stage": 9, "reason": "Future availability cutoff", "when": [{"field": "__direct_stage", "op": "stage_in", "value": [0, 1]}, {"field": "AvailableOn", "op": "future_days", "value": 365}]},
+        {"stage": 9, "reason": "Future availability cutoff", "when": [{"field": "__direct_stage", "op": "stage_in", "value": [0, 1]}, {"field": "AvailableOn", "op": "future_days", "value": 365}], "_source": "__direct_stage: the stage this integration's own direct/direct_rules mapping (declared above) assigns from the raw PMS status field, before any override runs -- not a separate input."},
         {"stage": 9, "reason": "Invalid square footage", "when": [{"field": "Area", "op": "invalid_sqft"}]},
-        {"stage": 9, "reason": "Waitlist or Tour Placeholder Unit", "replace_reason": true, "when": [{"field": "__wait_unit", "op": "truthy"}]}
+        {"stage": 9, "reason": "Waitlist or Tour Placeholder Unit", "replace_reason": true, "when": [{"field": "__wait_unit", "op": "truthy"}], "_source": "__wait_unit: true when the raw PMS identity field named in unit_name_fields (e.g. Voyager's AllUnits_Login/AvailableUnits_Login @IDValue, RentCafe's apartmentName) contains the substring wait -- a tour-scheduling or waitlist placeholder the PMS itself tracks as a pseudo-unit in its raw feed."}
       ]
     },
     "AppFolio": {
@@ -175,12 +175,12 @@
       "fallback": {"stage": 9, "reason": "Status: unavailable or unsupported"},
       "overrides": [
         {"stage": 9, "reason": "Unit Marked as Hidden", "when": [{"field": "HiddenAt", "op": "truthy"}]},
-        {"stage": 9, "reason": "Not Posted to Website", "when": [{"field": "__rollout__appfolio_ignore_listings_for_availability", "op": "equals", "value": "disabled"}, {"all": [{"field": "primary__PostedToWebsite", "op": "falsey"}, {"field": "listing.json.gz__PostedToWebsite", "op": "falsey"}]}]},
+        {"stage": 9, "reason": "Not Posted to Website", "when": [{"field": "__rollout__appfolio_ignore_listings_for_availability", "op": "equals", "value": "disabled"}, {"all": [{"field": "primary__PostedToWebsite", "op": "falsey"}, {"field": "listing.json.gz__PostedToWebsite", "op": "falsey"}]}], "_source": "__rollout__appfolio_ignore_listings_for_availability: the current variant of the tracked rollout of the same name (see rollouts), resolved from Snowflake/DynamoDB."},
         {"stage": 9, "reason": "Missing Available Date", "when": [{"field": "AvailableOn", "op": "missing"}]},
-        {"stage": 9, "reason": "Future Availability Cutoff: 1 Year", "when": [{"field": "__direct_stage", "op": "stage_in", "value": [0, 1]}, {"field": "AvailableOn", "op": "future_days", "value": 365}]},
+        {"stage": 9, "reason": "Future Availability Cutoff: 1 Year", "when": [{"field": "__direct_stage", "op": "stage_in", "value": [0, 1]}, {"field": "AvailableOn", "op": "future_days", "value": 365}], "_source": "__direct_stage: the stage this integration's own direct/direct_rules mapping (declared above) assigns from the raw PMS status field, before any override runs -- not a separate input."},
         {"stage": 9, "reason": "Invalid Rent", "when": [{"all": [{"field": "ListedRent", "op": "invalid_rent"}, {"field": "MarketRent", "op": "invalid_rent"}]}]},
         {"stage": 9, "reason": "Invalid Square Footage", "when": [{"field": "SquareFeet", "op": "invalid_sqft"}]},
-        {"stage": 9, "reason": "Waitlist or Tour Placeholder Unit", "replace_reason": true, "when": [{"field": "__wait_unit", "op": "truthy"}]}
+        {"stage": 9, "reason": "Waitlist or Tour Placeholder Unit", "replace_reason": true, "when": [{"field": "__wait_unit", "op": "truthy"}], "_source": "__wait_unit: true when the raw PMS identity field named in unit_name_fields (e.g. Voyager's AllUnits_Login/AvailableUnits_Login @IDValue, RentCafe's apartmentName) contains the substring wait -- a tour-scheduling or waitlist placeholder the PMS itself tracks as a pseudo-unit in its raw feed."}
       ]
     },
     "ResMan": {
@@ -203,11 +203,11 @@
       "fallback": {"stage": 9, "reason": "Status: unavailable or unsupported"},
       "overrides": [
         {"stage": 9, "reason": "Missing made-ready date", "when": [{"field": "MadeReadyDate", "op": "missing"}]},
-        {"stage": 9, "reason": "Future availability cutoff", "when": [{"field": "__direct_stage", "op": "stage_in", "value": [0, 1]}, {"field": "MadeReadyDate", "op": "future_days", "value": 365}]},
+        {"stage": 9, "reason": "Future availability cutoff", "when": [{"field": "__direct_stage", "op": "stage_in", "value": [0, 1]}, {"field": "MadeReadyDate", "op": "future_days", "value": 365}], "_source": "__direct_stage: the stage this integration's own direct/direct_rules mapping (declared above) assigns from the raw PMS status field, before any override runs -- not a separate input."},
         {"stage": 9, "reason": "Unsupported or leased status", "when": [{"field": "UnitLeasedStatus", "op": "missing"}]},
-        {"stage": 9, "reason": "Invalid Rent", "when": [{"field": "__primary_row", "op": "truthy"}, {"field": "EffectiveRent", "op": "invalid_rent"}]},
+        {"stage": 9, "reason": "Invalid Rent", "when": [{"field": "__primary_row", "op": "truthy"}, {"field": "EffectiveRent", "op": "invalid_rent"}], "_source": "__primary_row: true only when this identity has a matching row in the raw primary availability feed for this integration; guards against a field that is absent (not present in the raw API response) being misread as an invalid value."},
         {"stage": 9, "reason": "Invalid square footage", "when": [{"field": "MinSquareFeet", "op": "invalid_sqft"}]},
-        {"stage": 9, "reason": "Waitlist or Tour Placeholder Unit", "replace_reason": true, "when": [{"field": "__wait_unit", "op": "truthy"}]}
+        {"stage": 9, "reason": "Waitlist or Tour Placeholder Unit", "replace_reason": true, "when": [{"field": "__wait_unit", "op": "truthy"}], "_source": "__wait_unit: true when the raw PMS identity field named in unit_name_fields (e.g. Voyager's AllUnits_Login/AvailableUnits_Login @IDValue, RentCafe's apartmentName) contains the substring wait -- a tour-scheduling or waitlist placeholder the PMS itself tracks as a pseudo-unit in its raw feed."}
       ]
     },
     "EQR MRI": {
@@ -229,9 +229,9 @@
       "fallback": {"stage": -1, "reason": "Status: unsupported or unknown"},
       "overrides": [
         {"stage": 9, "reason": "Missing made-ready date", "when": [{"field": "EarliestAvailable", "op": "missing"}, {"field": "MakeReadyDate", "op": "missing"}]},
-        {"stage": 9, "reason": "Invalid Rent", "when": [{"field": "__primary_row", "op": "truthy"}, {"field": "HTPRent", "op": "invalid_rent"}]},
+        {"stage": 9, "reason": "Invalid Rent", "when": [{"field": "__primary_row", "op": "truthy"}, {"field": "HTPRent", "op": "invalid_rent"}], "_source": "__primary_row: true only when this identity has a matching row in the raw primary availability feed for this integration; guards against a field that is absent (not present in the raw API response) being misread as an invalid value."},
         {"stage": 9, "reason": "Invalid square footage", "when": [{"field": "SquareFeet", "op": "invalid_sqft"}]},
-        {"stage": 9, "reason": "Waitlist or Tour Placeholder Unit", "replace_reason": true, "when": [{"field": "__wait_unit", "op": "truthy"}]}
+        {"stage": 9, "reason": "Waitlist or Tour Placeholder Unit", "replace_reason": true, "when": [{"field": "__wait_unit", "op": "truthy"}], "_source": "__wait_unit: true when the raw PMS identity field named in unit_name_fields (e.g. Voyager's AllUnits_Login/AvailableUnits_Login @IDValue, RentCafe's apartmentName) contains the substring wait -- a tour-scheduling or waitlist placeholder the PMS itself tracks as a pseudo-unit in its raw feed."}
       ]
     },
     "AVB": {
@@ -249,7 +249,7 @@
         {"stage": 9, "reason": "Missing available date", "when": [{"field": "availableDateUnfurnished", "op": "missing"}, {"field": "availableDateFurnished", "op": "missing"}]},
         {"stage": 9, "reason": "Future availability cutoff", "when": [{"field": "availableDateUnfurnished", "op": "future_days", "value": 365}]},
         {"stage": 9, "reason": "Invalid square footage", "when": [{"field": "squareFeet", "op": "invalid_sqft"}]},
-        {"stage": 9, "reason": "Waitlist or Tour Placeholder Unit", "replace_reason": true, "when": [{"field": "__wait_unit", "op": "truthy"}]}
+        {"stage": 9, "reason": "Waitlist or Tour Placeholder Unit", "replace_reason": true, "when": [{"field": "__wait_unit", "op": "truthy"}], "_source": "__wait_unit: true when the raw PMS identity field named in unit_name_fields (e.g. Voyager's AllUnits_Login/AvailableUnits_Login @IDValue, RentCafe's apartmentName) contains the substring wait -- a tour-scheduling or waitlist placeholder the PMS itself tracks as a pseudo-unit in its raw feed."}
       ]
     }
   }

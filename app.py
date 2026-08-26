@@ -2852,24 +2852,16 @@ def _availability_unit_key(row: dict, rule: dict,
     return '-'.join(parts).casefold() if parts else None
 
 
-def _availability_named_wait_unit(row: dict, name_fields: list) -> bool:
-    """True if any of `name_fields` on `row` reads as a wait-list placeholder.
-
-    Split out from `_availability_wait_unit` so the same "wait" substring test
-    can run against fields that live on a row other than the primary feed —
-    e.g. an actual/unit_details row, which does not carry `unit_name_fields`
-    (a primary-feed concept) at all.
-    """
-    for field in name_fields or []:
+def _availability_wait_unit(row: dict, rule: dict) -> bool:
+    """True if `row`'s raw PMS identity field (unit_name_fields) reads as a
+    wait-list/tour-scheduling placeholder. Always evaluated against a raw
+    primary-feed row -- never against unit_details, which has no
+    unit_name_fields concept and must not drive this determination."""
+    for field in rule.get('unit_name_fields') or []:
         value = _availability_value(row, field)
         if value is not None and 'wait' in str(value).casefold():
             return True
     return False
-
-
-def _availability_wait_unit(row: dict, rule: dict) -> bool:
-    """Exclude placeholder/wait-list unit names without inspecting status text."""
-    return _availability_named_wait_unit(row, rule.get('unit_name_fields'))
 
 
 def _availability_file_property_code(filename: str, candidates: list):
@@ -3316,10 +3308,17 @@ def _run_availability_job(job_id: str, integration: str, org: str = '',
                     # Do not turn those non-unit records into unexplained
                     # availability rows.
                     continue
-                if _availability_wait_unit(primary_row, rules):
+                # A wait-list/tour-scheduling placeholder (e.g. Voyager's
+                # WAITTOUR) is a genuine row in the raw feed, identified purely
+                # from its own raw identity field (unit_name_fields). It is
+                # counted here and still matched normally below; __wait_unit
+                # carries the flag into the values dict so the rules can
+                # classify it via a declared override rather than this loop
+                # silently dropping it.
+                is_wait_unit = _availability_wait_unit(primary_row, rules)
+                if is_wait_unit:
                     with lock:
                         wait_filtered += 1
-                    continue
                 primary_keys = _availability_keys(primary_row, primary_key)
                 unit_key = _availability_unit_key(
                     primary_row, rules, phase_prefix_values)
@@ -3379,6 +3378,7 @@ def _run_availability_job(job_id: str, integration: str, org: str = '',
                 # This unit came from the availability (primary) feed, so
                 # rules may gate field tests on the fields actually existing.
                 values['__primary_row'] = True
+                values['__wait_unit'] = is_wait_unit
                 snapshot_datetime = _availability_snapshot_datetime(snapshot)
                 if snapshot_datetime is not None:
                     values['__current_date'] = snapshot_datetime.date().isoformat()
@@ -3475,20 +3475,19 @@ def _run_availability_job(job_id: str, integration: str, org: str = '',
                     pass
                 predicted = None
                 reason = None
-                # A wait-list/tour placeholder can appear directly in
-                # unit_details (Voyager's WAIT/WAITC/WAITTOUR) with no
-                # availability-feed counterpart. Evaluate it via the rules
-                # regardless of predict_unit_details_only so it gets a real,
-                # rules-driven reason instead of a blank "no matching rule" --
-                # the same outcome the sync issues probe already produces.
-                is_wait_unit = _availability_named_wait_unit(
-                    actual_row, actual_key + ['unit_number', 'unitNumber'])
-                if rules.get('predict_unit_details_only') or is_wait_unit:
-                    values = dict(actual_row)
-                    # No availability-feed row: primary fields are absent, not
-                    # empty, so field tests over them must not fire.
+                if rules.get('predict_unit_details_only'):
+                    # This unit has no primary/supplemental raw-feed match at
+                    # all, so there is no raw API data to base a prediction
+                    # on. `values` is deliberately NOT seeded from actual_row:
+                    # unit_details is the destination this tool is trying to
+                    # reproduce, and mapping logic may only read raw API data,
+                    # rollout state, or Snowflake building info -- never the
+                    # destination's own fields. Only the explicit provenance
+                    # flags below (computed from the raw-feed matching process
+                    # itself, not from any unit_details field value) can
+                    # explain such a row.
+                    values = {}
                     values['__primary_row'] = False
-                    values['__wait_unit'] = is_wait_unit
                     values['__supplemental_snapshot_missing'] = not bool(
                         supplemental_targets)
                     values['__supplemental_unit_missing'] = bool(
@@ -4673,8 +4672,11 @@ def _run_sync_issues_analyze_job(job_id: str, syncs: list):
             for primary_row in primary_rows:
                 if required_key and not _availability_keys(primary_row, required_key):
                     continue
-                if _availability_wait_unit(primary_row, rules):
-                    continue
+                # A wait-list/tour-scheduling placeholder (e.g. Voyager's
+                # WAITTOUR) is a genuine row in the raw feed; let it match
+                # normally like any other unit. __wait_unit is set from this
+                # same raw row below, so the rules can classify it via a
+                # declared override.
                 unit_key_p = _availability_unit_key(
                     primary_row, rules, phase_prefix_values)
                 actual_match = actual_by_key.get(unit_key_p)
@@ -4741,15 +4743,6 @@ def _run_sync_issues_analyze_job(job_id: str, syncs: list):
                     unit_key_parts = _availability_keys(actual_row, actual_key)
                     unit_key = str(unit_key_parts[0]) if unit_key_parts else None
 
-                    # unit_details is a PMS export, so a wait-list/tour
-                    # placeholder can appear there directly (Voyager's
-                    # WAIT/WAITC/WAITUNIT) with no availability-feed
-                    # counterpart. It is still a real row the sync marked
-                    # unavailable, so it is counted and classified via the
-                    # rules' own __wait_unit override below -- not skipped.
-                    is_wait_unit = _availability_named_wait_unit(
-                        actual_row, actual_key + ['unit_number', 'unitNumber'])
-
                     local_stage_9  += 1
                     local_analyzed += 1
 
@@ -4759,7 +4752,11 @@ def _run_sync_issues_analyze_job(job_id: str, syncs: list):
                     if p_row:
                         values = dict(p_row)
                         values['__primary_row'] = True
-                        values['__wait_unit'] = is_wait_unit
+                        # Wait/tour placeholders are identified from the raw
+                        # feed's own identity field only (unit_name_fields),
+                        # never from unit_details.
+                        values['__wait_unit'] = _availability_wait_unit(
+                            p_row, rules)
                         values['__current_date'] = ref_date.isoformat()
                         for k, v in p_row.items():
                             values[f'primary__{k}'] = v
@@ -4778,11 +4775,18 @@ def _run_sync_issues_analyze_job(job_id: str, syncs: list):
                                     values[f"{sc['file']}__{k}"] = v
                             values[f"__source_present__{sc['file']}"] = bool(related)
                     else:
-                        # The agent's predict_unit_details_only path: a unit in
-                        # unit_details with no availability-feed row at all.
-                        values = dict(actual_row)
+                        # No primary/supplemental raw-feed match at all, so
+                        # there is no raw API data to base a prediction on.
+                        # `values` is deliberately NOT seeded from actual_row:
+                        # unit_details is the destination this tool models,
+                        # and mapping logic may only read raw API data,
+                        # rollout state, or Snowflake building info -- never
+                        # the destination's own fields. Only the explicit
+                        # provenance flags below (derived from the raw-feed
+                        # matching outcome, not from any unit_details field
+                        # value) can explain such a row.
+                        values = {}
                         values['__primary_row'] = False
-                        values['__wait_unit'] = is_wait_unit
                         values['__current_date'] = ref_date.isoformat()
                         values['__supplemental_snapshot_missing'] = (
                             not bool(supplemental_targets))
