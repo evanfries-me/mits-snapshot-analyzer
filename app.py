@@ -3365,6 +3365,9 @@ def _run_availability_job(job_id: str, integration: str, org: str = '',
                     continue
                 matched_actual_indices.add(actual_index)
                 values = dict(primary_row)
+                # This unit came from the availability (primary) feed, so
+                # rules may gate field tests on the fields actually existing.
+                values['__primary_row'] = True
                 snapshot_datetime = _availability_snapshot_datetime(snapshot)
                 if snapshot_datetime is not None:
                     values['__current_date'] = snapshot_datetime.date().isoformat()
@@ -3463,6 +3466,9 @@ def _run_availability_job(job_id: str, integration: str, org: str = '',
                 reason = None
                 if rules.get('predict_unit_details_only'):
                     values = dict(actual_row)
+                    # No availability-feed row: primary fields are absent, not
+                    # empty, so field tests over them must not fire.
+                    values['__primary_row'] = False
                     values['__supplemental_snapshot_missing'] = not bool(
                         supplemental_targets)
                     values['__supplemental_unit_missing'] = bool(
@@ -4481,6 +4487,14 @@ def _run_sync_issues_analyze_job(job_id: str, syncs: list):
                         primary_body, primary_fields,
                         voyager_units=(integration == 'Voyager'),
                         realpage_units=(integration == 'RealPage'))
+                    # Voyager's unit_key is (file property code, @IDValue), so
+                    # without this the composite key is None for every row and
+                    # nothing joins.
+                    file_property_code = _availability_file_property_code(
+                        primary_actual, primary_candidates)
+                    if file_property_code:
+                        for row in primary_rows:
+                            row['__file_property_code'] = file_property_code
                 except Exception:
                     primary_rows = []
 
@@ -4715,6 +4729,7 @@ def _run_sync_issues_analyze_job(job_id: str, syncs: list):
                     p_row = primary_for_actual.get(idx_a, {})
                     if p_row:
                         values = dict(p_row)
+                        values['__primary_row'] = True
                         values['__current_date'] = ref_date.isoformat()
                         for k, v in p_row.items():
                             values[f'primary__{k}'] = v
@@ -4736,6 +4751,7 @@ def _run_sync_issues_analyze_job(job_id: str, syncs: list):
                         # The agent's predict_unit_details_only path: a unit in
                         # unit_details with no availability-feed row at all.
                         values = dict(actual_row)
+                        values['__primary_row'] = False
                         values['__current_date'] = ref_date.isoformat()
                         values['__supplemental_snapshot_missing'] = (
                             not bool(supplemental_targets))

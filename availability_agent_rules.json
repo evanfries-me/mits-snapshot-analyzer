@@ -55,7 +55,7 @@
         {"stage": 9, "reason": "Missing Available Date", "when": [{"field": "availableDate", "op": "missing"}]},
         {"stage": 9, "reason": "Outside Availability Restriction Window", "when": [{"field": "availableDate", "op": "future_by_field_days", "days_field": "monthsAvailabilityRestrictedTo", "multiplier": 30}]},
         {"stage": 9, "reason": "Future Availability Cutoff: 1 Year", "when": [{"field": "__direct_stage", "op": "stage_in", "value": [0, 1]}, {"field": "availableDate", "op": "future_days", "value": 365}]},
-        {"stage": 9, "reason": "Invalid Rent", "when": [{"field": "minimumRent", "op": "invalid_rent"}]},
+        {"stage": 9, "reason": "Invalid Rent", "when": [{"field": "__primary_row", "op": "truthy"}, {"field": "minimumRent", "op": "invalid_rent"}]},
         {"stage": 9, "reason": "Invalid Square Footage", "when": [{"field": "sqft", "op": "invalid_sqft"}]},
         {"stage": 9, "reason": "Present in Voyager but absent from RentCafe", "replace_reason": true, "when": [{"field": "__supplemental_unit", "op": "truthy"}]},
         {"stage": 9, "reason": "Absent from RentCafe; no Voyager snapshot found", "replace_reason": true, "when": [{"field": "__supplemental_snapshot_missing", "op": "truthy"}]},
@@ -91,7 +91,7 @@
         {"stage": 9, "reason": "Non Revenue Generating Unit", "when": [{"field": "UnitLeasedStatusDescription", "op": "equals", "value": "Non Revenue Generating Unit"}]},
         {"stage": 9, "reason": "Made-Ready Date: 0/0/0", "when": [{"field": "__made_ready_date_all_zero", "op": "truthy"}]},
         {"stage": 9, "reason": "Future Availability Cutoff: 1 Year", "when": [{"field": "__direct_stage", "op": "stage_in", "value": [0, 1]}, {"field": "MadeReadyDate", "op": "future_days", "value": 365}]},
-        {"stage": 9, "reason": "Invalid Rent", "when": [{"field": "EffectiveRent", "op": "invalid_rent"}]},
+        {"stage": 9, "reason": "Invalid Rent", "when": [{"field": "__primary_row", "op": "truthy"}, {"field": "EffectiveRent", "op": "invalid_rent"}]},
         {"stage": 9, "reason": "Exclude Not Rent Ready Units", "when": [{"field": "__direct_stage", "op": "stage_in", "value": [1]}, {"field": "__building__EXCLUDE_NOT_RENT_READY_UNITS", "op": "truthy"}]}
       ]
     },
@@ -114,7 +114,7 @@
       "overrides": [
         {"stage": 9, "reason": "Retail unit", "when": [{"field": "UnitNumber", "op": "contains", "value": "retail"}]},
         {"stage": 9, "reason": "Future availability cutoff", "when": [{"field": "MadeReadyDate", "op": "future_days", "value": 365}]},
-        {"stage": 9, "reason": "Invalid Rent", "when": [{"field": "EffectiveRent", "op": "invalid_rent"}]},
+        {"stage": 9, "reason": "Invalid Rent", "when": [{"field": "__primary_row", "op": "truthy"}, {"field": "EffectiveRent", "op": "invalid_rent"}]},
         {"stage": 9, "reason": "Invalid square footage", "when": [{"field": "RentSqFtCount", "op": "invalid_sqft"}]}
       ]
     },
@@ -198,7 +198,7 @@
         {"stage": 9, "reason": "Missing made-ready date", "when": [{"field": "MadeReadyDate", "op": "missing"}]},
         {"stage": 9, "reason": "Future availability cutoff", "when": [{"field": "__direct_stage", "op": "stage_in", "value": [0, 1]}, {"field": "MadeReadyDate", "op": "future_days", "value": 365}]},
         {"stage": 9, "reason": "Unsupported or leased status", "when": [{"field": "UnitLeasedStatus", "op": "missing"}]},
-        {"stage": 9, "reason": "Invalid Rent", "when": [{"field": "EffectiveRent", "op": "invalid_rent"}]},
+        {"stage": 9, "reason": "Invalid Rent", "when": [{"field": "__primary_row", "op": "truthy"}, {"field": "EffectiveRent", "op": "invalid_rent"}]},
         {"stage": 9, "reason": "Invalid square footage", "when": [{"field": "MinSquareFeet", "op": "invalid_sqft"}]}
       ]
     },
@@ -221,7 +221,7 @@
       "fallback": {"stage": -1, "reason": "Status: unsupported or unknown"},
       "overrides": [
         {"stage": 9, "reason": "Missing made-ready date", "when": [{"field": "EarliestAvailable", "op": "missing"}, {"field": "MakeReadyDate", "op": "missing"}]},
-        {"stage": 9, "reason": "Invalid Rent", "when": [{"field": "HTPRent", "op": "invalid_rent"}]},
+        {"stage": 9, "reason": "Invalid Rent", "when": [{"field": "__primary_row", "op": "truthy"}, {"field": "HTPRent", "op": "invalid_rent"}]},
         {"stage": 9, "reason": "Invalid square footage", "when": [{"field": "SquareFeet", "op": "invalid_sqft"}]}
       ]
     },
