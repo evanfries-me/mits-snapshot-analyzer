@@ -2880,6 +2880,35 @@ def _availability_file_property_code(filename: str, candidates: list):
     return None
 
 
+def _availability_promote_missing_source_units(primary_rows: list,
+                                                source_rows: list,
+                                                rules: dict) -> list:
+    """Add rows from a `sources` entry declared `add_missing_as_units` whose
+    identity (the rules' own unit_key) has no counterpart already in
+    `primary_rows`, flagged __supplemental_unit so they classify the same way
+    RentCafe/Voyager classify a cross-integration all-units supplement (e.g.
+    as lease-signed).
+
+    This is the same-integration variant of that pattern: the supplemental
+    data already lives in a declared `sources` file within this same
+    snapshot -- e.g. RealPage's getallunits alongside getunitlist, both
+    carrying the same raw UnitID -- so no cross-integration/cross-snapshot
+    resolution is needed, unlike supplemental_units.
+    """
+    existing_keys = {_availability_unit_key(row, rules) for row in primary_rows}
+    existing_keys.discard(None)
+    added = []
+    for row in source_rows:
+        key = _availability_unit_key(row, rules)
+        if key is None or key in existing_keys:
+            continue
+        new_row = dict(row)
+        new_row['__supplemental_unit'] = True
+        added.append(new_row)
+        existing_keys.add(key)
+    return added
+
+
 def _availability_supplemental_rows(body: str, config: dict,
                                     primary_rows: list,
                                     property_code: str | None = None) -> list:
@@ -3227,6 +3256,22 @@ def _run_availability_job(job_id: str, integration: str, org: str = '',
                                            source['file'].startswith(
                                                ('AllUnits_Login', 'AvailableUnits_Login'))),
                             realpage_units=integration == 'RealPage')
+                        if source.get('add_missing_as_units'):
+                            # e.g. RealPage's getallunits: a same-integration
+                            # all-units feed that carries units getunitlist
+                            # omits, keyed by the same raw UnitID.
+                            file_property_code = _availability_file_property_code(
+                                actual_source, [source['file']])
+                            tagged_rows = []
+                            for row in source_rows[source['file']]:
+                                row = dict(row)
+                                if (file_property_code and
+                                        not row.get('__file_property_code')):
+                                    row['__file_property_code'] = file_property_code
+                                tagged_rows.append(row)
+                            primary_rows.extend(
+                                _availability_promote_missing_source_units(
+                                    primary_rows, tagged_rows, rules))
                     except Exception:
                         raw_errors += 1
                         source_rows[source['file']] = []
@@ -4583,6 +4628,23 @@ def _run_sync_issues_analyze_job(job_id: str, syncs: list):
                             realpage_units=integration == 'RealPage')
                     except Exception:
                         rows_for_file = []
+                if sc.get('add_missing_as_units') and rows_for_file:
+                    # e.g. RealPage's getallunits: a same-integration
+                    # all-units feed that carries units getunitlist omits,
+                    # keyed by the same raw UnitID.
+                    file_property_code = (
+                        _availability_file_property_code(variant, [sc['file']])
+                        if variant else None)
+                    tagged_rows = []
+                    for row in rows_for_file:
+                        row = dict(row)
+                        if (file_property_code and
+                                not row.get('__file_property_code')):
+                            row['__file_property_code'] = file_property_code
+                        tagged_rows.append(row)
+                    primary_rows.extend(
+                        _availability_promote_missing_source_units(
+                            primary_rows, tagged_rows, rules))
                 keyed: dict = {}
                 join_key = sc.get('join_key')
                 for row in rows_for_file:

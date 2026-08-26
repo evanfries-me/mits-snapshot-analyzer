@@ -108,7 +108,7 @@
       "required_key": ["UnitID"],
       "actual_key": ["building_unique_id", "external_id"],
       "fields": ["PropertyNumberID", "SiteID", "PropertyID", "UnitID", "UnitNumber", "BuildingNumber", "VacantBit", "AvailableBit", "MadeReadyBit", "MadeReadyDate", "EffectiveRent", "UnitMarketRent", "RentSqFtCount", "FloorNumber", "availability_stage"],
-      "sources": [{"file": "getallunits", "join_key": ["UnitNumber"], "primary_key": ["UnitNumber"], "fields": ["UnitNumber", "BuildingNumber", "VacantBit", "AvailableBit", "MadeReadyBit", "MadeReadyDate", "UnitMarketRent", "RentSqFtCount", "FloorNumber"]}],
+      "sources": [{"file": "getallunits", "join_key": ["UnitNumber"], "primary_key": ["UnitNumber"], "fields": ["UnitID", "UnitNumber", "BuildingNumber", "VacantBit", "AvailableBit", "MadeReadyBit", "MadeReadyDate", "UnitMarketRent", "RentSqFtCount", "FloorNumber"], "add_missing_as_units": true}],
       "direct": {"field": "availability_stage", "map": {}},
       "direct_rules": [
         {"stage": 1, "reason": "AvailableBit = true AND VacantBit = true AND MadeReadyDate >= today + 14 days", "when": [{"field": "VacantBit", "op": "truthy"}, {"field": "AvailableBit", "op": "truthy"}, {"field": "MadeReadyDate", "op": "future_or_equal_days", "value": 14}]},
@@ -119,7 +119,8 @@
         {"stage": 9, "reason": "Retail unit", "when": [{"field": "UnitNumber", "op": "contains", "value": "retail"}]},
         {"stage": 9, "reason": "Future availability cutoff", "when": [{"field": "MadeReadyDate", "op": "future_days", "value": 365}]},
         {"stage": 9, "reason": "Invalid Rent", "when": [{"field": "__primary_row", "op": "truthy"}, {"field": "EffectiveRent", "op": "invalid_rent"}], "_source": "__primary_row: true only when this identity has a matching row in the raw primary availability feed for this integration; guards against a field that is absent (not present in the raw API response) being misread as an invalid value."},
-        {"stage": 9, "reason": "Invalid square footage", "when": [{"field": "RentSqFtCount", "op": "invalid_sqft"}]}
+        {"stage": 9, "reason": "Invalid square footage", "when": [{"field": "RentSqFtCount", "op": "invalid_sqft"}]},
+        {"stage": 9, "reason": "Present in getallunits but absent from getunitlist", "replace_reason": true, "when": [{"field": "__supplemental_unit", "op": "truthy"}], "_source": "__supplemental_unit: true when this raw identity (UnitID) is found in the getallunits feed (see sources, add_missing_as_units) but not in getunitlist, this integration's own primary availability feed."}
       ]
     },
     "Entrata": {
