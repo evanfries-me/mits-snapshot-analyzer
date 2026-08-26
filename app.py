@@ -3972,11 +3972,14 @@ SYNC_ISSUES_ENRICH_TIMEOUT = 180
 # Parameters (positional %s in order):
 #   1 audit_date_range_start  (date/timestamp)
 #   2 audit_date_range_end    (date/timestamp)
-#   3 integration filter check  (empty string → match all)
-#   4 integration filter value  (same string used in CONTAINS)
-#   5 new_import_window_minutes (integer)
-#   6 unit_unavailable_threshold (decimal 0–1)
-# LIMIT is formatted in as a safe integer.
+#   3..N one bind param per selected integration (0 params when "All
+#        Integrations" — the {integration_clause} format placeholder becomes
+#        the literal TRUE in that case, so no params are needed there)
+#   N+1 new_import_window_minutes (integer)
+#   N+2 unit_unavailable_threshold (decimal 0–1)
+# LIMIT and the integration clause are both formatted in ({limit} as a safe
+# integer, {integration_clause} as a parameterized SQL fragment — see
+# _sync_issues_integration_clause).
 _SYNC_ISSUES_SQL = """\
 WITH buildings AS (
     SELECT ID AS BUILDING_ID, ORG_ID, ORG_NAME, BUILDING_NAME
@@ -4062,7 +4065,7 @@ scored AS (
 candidate_syncs AS (
     SELECT * FROM scored
     WHERE UNITS_MARKED_UNAVAILABLE >= 10
-        AND (%s = '' OR CONTAINS(UPPER(SOURCES), UPPER(%s)))
+        AND ({integration_clause})
 ),
 snapshot_unit_state_before AS (
     SELECT f.BUILDING_ID, f.CHANGE_GROUP_ID, s.DBT_VALID_FROM,
@@ -4206,6 +4209,23 @@ def _infer_sync_integration(sources: str) -> str | None:
         if mapped and mapped in available:
             return mapped
     return None
+
+
+def _sync_issues_integration_clause(integrations: list) -> tuple[str, list]:
+    """SQL fragment + bind params for filtering candidate_syncs by SOURCES.
+
+    Each selected integration becomes its own CONTAINS(UPPER(SOURCES), ...)
+    check, OR'd together, so any number can be selected at once; e.g.
+    'Voyager' matches 'YardiVoyager' as a substring, mirroring how the old
+    single-select filter already worked without needing an alias lookup.
+    No selections means "All Integrations": the fragment is the literal
+    TRUE and no params are added.
+    """
+    names = [str(n).strip() for n in (integrations or []) if str(n).strip()]
+    if not names:
+        return 'TRUE', []
+    clause = ' OR '.join('CONTAINS(UPPER(SOURCES), UPPER(%s))' for _ in names)
+    return f'({clause})', names
 
 
 def _sync_issues_target(sync):
@@ -5576,8 +5596,16 @@ def sync_issues_query():
     if end_dt < start_dt:
         return jsonify({'error': 'endDate must be on or after startDate'}), 400
 
-    # Integration filter ('' means all)
-    integration_filter = (body.get('integration') or '').strip()
+    # Integration filter (empty list means all). Accepts the new plural
+    # `integrations` array; falls back to the old singular `integration`
+    # string for any caller still using the single-select shape.
+    integrations_raw = body.get('integrations')
+    if integrations_raw is None:
+        single = (body.get('integration') or '').strip()
+        integrations_raw = [single] if single else []
+    if not isinstance(integrations_raw, list):
+        return jsonify({'error': 'integrations must be an array of strings'}), 400
+    integrations = [str(n).strip() for n in integrations_raw if str(n).strip()]
 
     # Unavailability threshold (0–1 fraction, default 0.20)
     try:
@@ -5602,13 +5630,15 @@ def sync_issues_query():
     except (TypeError, ValueError):
         limit = 100
 
+    integration_clause, integration_params = _sync_issues_integration_clause(integrations)
+
     try:
         import snowflake_db
         rows = snowflake_db.query(
-            _SYNC_ISSUES_SQL.format(limit=limit),
+            _SYNC_ISSUES_SQL.format(limit=limit, integration_clause=integration_clause),
             params=(
                 start_dt, end_dt,
-                integration_filter, integration_filter,
+                *integration_params,
                 new_import_window,
                 threshold,
             ),

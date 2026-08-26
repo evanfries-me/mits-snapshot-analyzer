@@ -537,10 +537,13 @@ async function loadIntegrations() {
       '<option value="">Select an integration…</option>' +
       '<option value="__all__">All integrations</option>' +
       supported.map(n => `<option value="${esc(n)}">${esc(n)}</option>`).join('');
-    // Sync Issues integration filter
-    document.getElementById('si-integration').innerHTML =
-      '<option value="">All integrations</option>' +
-      supported.map(n => `<option value="${esc(n)}">${esc(n)}</option>`).join('');
+    // Sync Issues integration filter — a checkbox per integration so any
+    // number can be selected at once; none checked means all integrations.
+    document.getElementById('si-integration-list').innerHTML = supported.map(n =>
+      `<label class="si-integration-check">` +
+        `<input type="checkbox" class="si-integration-cb" value="${esc(n)}" /> ${esc(n)}` +
+      `</label>`
+    ).join('');
     renderAgentLimitFeedback();
     syncAvailabilityButton();
   } catch (e) {
@@ -2626,7 +2629,8 @@ async function runSyncIssuesQuery() {
     siSetSidebarStatus('Please select a start and end date.', true);
     return;
   }
-  const integration = document.getElementById('si-integration').value;
+  const integrations = [...document.querySelectorAll('.si-integration-cb:checked')]
+    .map(cb => cb.value);
   const thresholdPct = parseFloat(document.getElementById('si-threshold').value);
   if (isNaN(thresholdPct) || thresholdPct <= 0 || thresholdPct > 100) {
     siSetSidebarStatus('Threshold must be between 1 and 100.', true);
@@ -2665,7 +2669,7 @@ async function runSyncIssuesQuery() {
     const res = await fetch('/api/sync-issues/query', {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ startDate, endDate, integration, threshold, limit }),
+      body: JSON.stringify({ startDate, endDate, integrations, threshold, limit }),
     });
     const data = await res.json();
     if (!res.ok || data.error) throw new Error(data.error || res.statusText);

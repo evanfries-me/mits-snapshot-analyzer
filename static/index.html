@@ -238,6 +238,19 @@
     #agent-unknown-toggle input { accent-color: #388bfd; cursor: pointer; margin: 0; }
     .agent-toggle { display: flex; align-items: center; gap: 6px; cursor: pointer; font-size: 11.5px; color: #c9d1d9; }
     .agent-toggle input { accent-color: #388bfd; cursor: pointer; margin: 0; }
+    .si-integration-checks {
+      display: flex; flex-direction: column; gap: 4px; padding: 6px 8px;
+      border: 1px solid #30363d; border-radius: 6px; background: #0d1117;
+      max-height: 160px; overflow-y: auto;
+    }
+    .si-integration-check { display: flex; align-items: center; gap: 6px; cursor: pointer; font-size: 11.5px; color: #c9d1d9; }
+    /* .field input sets width:100% generically for text/date/number inputs
+       and is declared later in this stylesheet, so an equal-specificity
+       override loses on source order -- add the container id to win. */
+    #si-integration-list .si-integration-check input {
+      width: auto; flex: 0 0 auto; accent-color: #388bfd; cursor: pointer;
+      margin: 0; padding: 0; background: none; border: none;
+    }
     #agent-optional-filters { border-top: 1px dashed #21262d; padding-top: 10px; }
     #agent-optional-filters summary { font-size: 10px; font-weight: 600; text-transform: uppercase; letter-spacing: .06em; color: #6e7681; cursor: pointer; }
     #agent-optional-body { display: flex; flex-direction: column; gap: 10px; padding-top: 10px; }
@@ -1024,10 +1037,11 @@ AWS_SESSION_TOKEN=IQoJb3...</pre>
           <input type="date" id="si-end-date" autocomplete="off" />
         </div>
         <div class="field">
-          <label for="si-integration">Integration</label>
-          <select id="si-integration">
-            <option value="">All integrations</option>
-          </select>
+          <label>Integrations</label>
+          <div id="si-integration-list" class="si-integration-checks">
+            <span class="field-hint">Loading…</span>
+          </div>
+          <span class="field-hint">None selected means all integrations.</span>
         </div>
         <div class="field">
           <label for="si-threshold">Unavailability threshold</label>
