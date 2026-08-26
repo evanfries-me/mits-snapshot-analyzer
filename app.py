@@ -4776,17 +4776,24 @@ def _run_sync_issues_analyze_job(job_id: str, syncs: list):
                                 (rollout_config or {}).get('default', 'disabled'))
                         values[f'__rollout__{rollout_name}'] = variant
 
-                    # The rules own every reason; "Unknown" is only used when
-                    # they do not predict this unit unavailable at all.
-                    label = 'Unknown'
+                    # The rules own every reason.  "Unknown" is permitted in
+                    # exactly one case: the rules' predicted stage disagrees
+                    # with the unit's actual stage, so they cannot account for
+                    # it being unavailable.  Every other outcome must carry the
+                    # rule's own reason.
                     try:
                         values['__direct_stage'] = (
                             _availability_direct_prediction(rules, values)[0])
                         predicted, reason = _availability_predict(rules, values)
-                        if predicted == 9 and reason:
-                            label = reason.strip()
-                    except Exception:
-                        pass
+                    except Exception as exc:
+                        predicted = None
+                        reason = f'Rule evaluation failed: {exc}'
+                    if predicted != 9:
+                        label = 'Unknown'          # predicted vs actual mismatch
+                    else:
+                        # Stages agree, so a reason must come from the rules;
+                        # defaulting to "Unknown" here would hide a rules gap.
+                        label = (reason or '').strip() or 'No reason given by rule'
 
                     local_reasons[label] = local_reasons.get(label, 0) + 1
 
