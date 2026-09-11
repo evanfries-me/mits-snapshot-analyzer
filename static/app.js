@@ -59,6 +59,10 @@ const dynamicPricing = {
   polling: null,
   result: null,
   open: new Set(),
+  filters: {},
+  sortKey: 'apiCallsSaved',
+  sortDir: 'desc',
+  visualSteps: {},
 };
 
 let csvTable = null;
@@ -72,9 +76,8 @@ let schemaToken     = 0;               // guards field-schema fetches the same w
 
 // ── Boot ─────────────────────────────────────────────────────────────────────
 window.addEventListener('DOMContentLoaded', () => {
-  // Mode tabs
-  document.querySelectorAll('.mode-tab').forEach(tab =>
-    tab.addEventListener('click', () => setMode(tab.dataset.mode))
+  document.getElementById('mode-selector').addEventListener('change', event =>
+    setMode(event.target.value)
   );
   document.querySelectorAll('.saved-toggle').forEach(toggle => {
     toggle.addEventListener('click', () => toggleSavedResults(toggle.dataset.historyKind));
@@ -108,9 +111,42 @@ window.addEventListener('DOMContentLoaded', () => {
   document.getElementById('btn-agent-index').addEventListener('click', buildAgentIndex);
   document.getElementById('btn-run-sync-query').addEventListener('click', runSyncIssuesQuery);
   document.getElementById('btn-run-dynamic-pricing').addEventListener('click', runDynamicPricing);
-  document.getElementById('dp-preview-body').addEventListener('click', ev => {
+  const dpBody = document.getElementById('dp-preview-body');
+  dpBody.addEventListener('click', ev => {
+    const vizStep = ev.target.closest('[data-dp-viz-action]');
+    if (vizStep) {
+      dpSetVisualizerStep(vizStep.dataset.bid, vizStep.dataset.dpVizAction);
+      return;
+    }
     const btn = ev.target.closest('.dp-expand');
-    if (btn) dpToggleCommunity(btn.dataset.bid);
+    if (btn) { dpToggleCommunity(btn.dataset.bid); return; }
+    const sort = ev.target.closest('[data-dp-sort]');
+    if (sort) { dpSetSort(sort.dataset.dpSort); return; }
+    if (ev.target.closest('[data-dp-export]')) { dpExportCsv(); return; }
+    if (ev.target.closest('[data-dp-clear-filters]')) {
+      dynamicPricing.filters = {};
+      dpRenderResult(dynamicPricing.result, !!dynamicPricing.result?.partial);
+    }
+  });
+  dpBody.addEventListener('input', ev => {
+    const slider = ev.target.closest('[data-dp-viz-slider]');
+    if (slider) {
+      dynamicPricing.visualSteps[slider.dataset.bid] = Number(slider.value);
+      dpRenderVisualizer(slider.dataset.bid);
+      return;
+    }
+    const input = ev.target.closest('[data-dp-filter]');
+    if (!input) return;
+    const key = input.dataset.dpFilter;
+    const cursor = input.selectionStart;
+    dynamicPricing.filters[key] = input.value;
+    dpRenderResult(dynamicPricing.result, !!dynamicPricing.result?.partial);
+    const next = [...dpBody.querySelectorAll('[data-dp-filter]')]
+      .find(candidate => candidate.dataset.dpFilter === key);
+    if (next) {
+      next.focus();
+      if (cursor != null) next.setSelectionRange(cursor, cursor);
+    }
   });
   // The syncs table is re-rendered on every query, so delegate the expand click.
   const siBody = document.getElementById('si-preview-body');
@@ -394,9 +430,7 @@ async function tryConnect() {
 function setMode(mode) {
   if (!['search', 'availability', 'sync-issues', 'dynamic-pricing'].includes(mode)) mode = 'search';
   state.mode = mode;
-  document.querySelectorAll('.mode-tab').forEach(t =>
-    t.classList.toggle('active', t.dataset.mode === mode)
-  );
+  document.getElementById('mode-selector').value = mode;
   document.getElementById('pane-search').classList.toggle('active', mode === 'search');
   document.getElementById('pane-availability').classList.toggle('active', mode === 'availability');
   document.getElementById('pane-sync-issues').classList.toggle('active', mode === 'sync-issues');
@@ -2547,6 +2581,23 @@ function escRegex(s) {
 
 // ── Dynamic Pricing Cadence ─────────────────────────────────────────────────
 
+const DP_REPORT_COLUMNS = [
+  {key: 'orgName', label: 'Organization'},
+  {key: 'buildingName', label: 'Community'},
+  {key: 'buildingId', label: 'Building ID'},
+  {key: 'latestSync', label: 'Latest Sync'},
+  {key: 'cadenceDays', label: 'Cadence (Days)', numeric: true},
+  {key: 'cadenceEvidence', label: 'Cadence Evidence'},
+  {key: 'cycleAlignment', label: 'Cycle Alignment'},
+  {key: 'unitCount', label: 'Units', numeric: true},
+  {key: 'currentApiCalls', label: 'Current API Calls', numeric: true},
+  {key: 'bootstrapApiCalls', label: 'Bootstrap Calls', numeric: true},
+  {key: 'apiCallsSaved', label: 'API Calls Saved', numeric: true},
+  {key: 'reconstructionAccuracyPct', label: 'Bootstrap Accuracy (%)', numeric: true},
+  {key: 'retrievalStrategy', label: 'Retrieval Strategy'},
+  {key: 'bootstrapApiCallDates', label: 'Bootstrap Call Dates'},
+];
+
 function dpSetStatus(message, isError = false) {
   const el = document.getElementById('dp-status');
   el.textContent = message;
@@ -2577,124 +2628,457 @@ function dpCadenceHtml(row) {
   return `<span class="si-pending">${esc(row.cadence || '—')}</span>`;
 }
 
-function dpRangeText(priceRange) {
-  const start = priceRange?.start;
-  const end = priceRange?.end;
-  if (!start) return '';
-  if (!end || end === start) return dpFormatShortDate(start);
-  return `${dpFormatShortDate(start)}–${dpFormatShortDate(end)}`;
+function dpCadenceEvidenceText(row) {
+  if (row.error) return 'Unavailable';
+  if (row.pricingDoesNotChange) return 'Pricing Does Not Change';
+  const count = row.cadenceEvidenceRangeCount || 0;
+  const units = row.cadenceEvidenceUnitCount || 0;
+  const lengths = row.cadenceEvidenceLengths || [];
+  const detail = count
+    ? `${count} interior range${count === 1 ? '' : 's'} across ${units} unit${units === 1 ? '' : 's'}; lengths ${lengths.join(', ')} days`
+    : 'no complete interior ranges';
+  return `${row.cadenceConfidence || 'Insufficient Data'} · ${detail}`;
 }
 
-function dpRangesHtml(ranges) {
-  const values = (ranges || []).map(dpRangeText).filter(Boolean);
-  return values.length ? esc(values.join(', ')) : '<span class="si-pending">none</span>';
+function dpColumnText(row, key, forExport = false) {
+  if (key === 'bootstrapApiCallDates') {
+    return (row[key] || []).map(dpFormatShortDate).join(', ');
+  }
+  if (key === 'cadenceEvidence') return dpCadenceEvidenceText(row);
+  if (key === 'latestSync') {
+    return forExport ? String(row.latestSync || '') : dpFormatTimestamp(row.latestSync);
+  }
+  return String(row[key] ?? '');
 }
 
-function dpPerUnitRangesHtml(row) {
-  const units = row.units || [];
-  if (!units.length) return '<span class="si-pending">none</span>';
-  const lines = units.map(unit => {
-    return `<div class="dp-unit-date-line"><strong>${esc(unit.unitId)}:</strong> ${dpRangesHtml(unit.priceRanges)}</div>`;
+function dpMatchesFilter(row, column, query) {
+  const filter = String(query || '').trim();
+  if (!filter) return true;
+  const rawValue = row[column.key];
+  if (column.numeric) {
+    const match = filter.match(/^(<=|>=|!=|=|<|>)?\s*(-?\d+(?:\.\d+)?)$/);
+    if (match) {
+      const actual = Number(rawValue);
+      const expected = Number(match[2]);
+      if (!Number.isFinite(actual)) return false;
+      const op = match[1] || '=';
+      if (op === '<') return actual < expected;
+      if (op === '<=') return actual <= expected;
+      if (op === '>') return actual > expected;
+      if (op === '>=') return actual >= expected;
+      if (op === '!=') return actual !== expected;
+      return actual === expected;
+    }
+  }
+  const haystack = `${dpColumnText(row, column.key)} ${String(rawValue ?? '')}`.toLocaleLowerCase();
+  return haystack.includes(filter.toLocaleLowerCase());
+}
+
+function dpColumnSortValue(row, key) {
+  if (key === 'bootstrapApiCallDates') {
+    return (row[key] || [])[0] || '';
+  }
+  if (key === 'cadenceEvidence') return dpCadenceEvidenceText(row);
+  if (key === 'latestSync') return row.latestSync || '';
+  return row[key];
+}
+
+function dpVisibleRows(rows) {
+  const filtered = (rows || []).filter(row => DP_REPORT_COLUMNS.every(column =>
+    dpMatchesFilter(row, column, dynamicPricing.filters[column.key])
+  ));
+  const column = DP_REPORT_COLUMNS.find(item => item.key === dynamicPricing.sortKey);
+  if (!column) return filtered;
+  return filtered.map((row, index) => ({row, index})).sort((left, right) => {
+    const a = dpColumnSortValue(left.row, column.key);
+    const b = dpColumnSortValue(right.row, column.key);
+    const aEmpty = a == null || a === '';
+    const bEmpty = b == null || b === '';
+    if (aEmpty && bEmpty) return left.index - right.index;
+    if (aEmpty) return 1;
+    if (bEmpty) return -1;
+    let compared;
+    if (column.numeric) {
+      compared = Number(a) - Number(b);
+    } else {
+      compared = String(a).localeCompare(
+        String(b), undefined,
+        {numeric: true, sensitivity: 'base'});
+    }
+    if (!compared) return left.index - right.index;
+    return dynamicPricing.sortDir === 'asc' ? compared : -compared;
+  }).map(item => item.row);
+}
+
+function dpSetSort(key) {
+  if (dynamicPricing.sortKey === key) {
+    dynamicPricing.sortDir = dynamicPricing.sortDir === 'asc' ? 'desc' : 'asc';
+  } else {
+    dynamicPricing.sortKey = key;
+    dynamicPricing.sortDir = 'asc';
+  }
+  dpRenderResult(dynamicPricing.result, !!dynamicPricing.result?.partial);
+}
+
+function dpSortIndicator(key) {
+  if (dynamicPricing.sortKey !== key) return '';
+  return dynamicPricing.sortDir === 'asc' ? ' ▲' : ' ▼';
+}
+
+function dpCsvCell(value) {
+  let text = String(value ?? '');
+  if (/^[=+\-@]/.test(text)) text = `'${text}`;
+  return `"${text.replaceAll('"', '""')}"`;
+}
+
+function dpExportCsv() {
+  const rows = dpVisibleRows(dynamicPricing.result?.rows || []);
+  if (!rows.length) return;
+  const lines = [
+    DP_REPORT_COLUMNS.map(column => dpCsvCell(column.label)).join(','),
+    ...rows.map(row => DP_REPORT_COLUMNS.map(column =>
+      dpCsvCell(dpColumnText(row, column.key, true))).join(',')),
+  ];
+  const blob = new Blob([`\uFEFF${lines.join('\r\n')}`], {type: 'text/csv;charset=utf-8'});
+  const url = URL.createObjectURL(blob);
+  const anchor = document.createElement('a');
+  anchor.href = url;
+  anchor.download = `dynamic-pricing-cadence-${new Date().toISOString().slice(0, 10)}.csv`;
+  document.body.appendChild(anchor);
+  anchor.click();
+  anchor.remove();
+  setTimeout(() => URL.revokeObjectURL(url), 0);
+}
+
+function dpReportHeaderHtml() {
+  return DP_REPORT_COLUMNS.map(column => {
+    const active = dynamicPricing.sortKey === column.key;
+    const ariaSort = active
+      ? (dynamicPricing.sortDir === 'asc' ? 'ascending' : 'descending')
+      : 'none';
+    return `<th class="dp-sortable${column.numeric ? ' dp-num' : ''}" aria-sort="${ariaSort}">`
+      + `<button type="button" data-dp-sort="${esc(column.key)}" title="Sort by ${esc(column.label)}">`
+      + `${esc(column.label)}<span class="dp-sort-indicator">${dpSortIndicator(column.key)}</span></button></th>`;
   }).join('');
-  return `<details class="dp-dates dp-per-unit"><summary>${units.length} units</summary>`
-    + `<div class="dp-date-list">${lines}</div></details>`;
+}
+
+function dpReportFiltersHtml() {
+  return DP_REPORT_COLUMNS.map(column => {
+    const value = dynamicPricing.filters[column.key] || '';
+    const placeholder = column.numeric ? '= 7 or >= 5' : 'Filter…';
+    return `<th class="dp-filter-cell"><input type="text" data-dp-filter="${esc(column.key)}" `
+      + `value="${esc(value)}" placeholder="${esc(placeholder)}" aria-label="Filter ${esc(column.label)}"></th>`;
+  }).join('');
+}
+
+function dpCalendarDates(start, end) {
+  if (!start || !end) return [];
+  const values = [];
+  const cursor = new Date(`${start}T00:00:00Z`);
+  const final = new Date(`${end}T00:00:00Z`);
+  while (cursor <= final) {
+    values.push(cursor.toISOString().slice(0, 10));
+    cursor.setUTCDate(cursor.getUTCDate() + 1);
+  }
+  return values;
+}
+
+function dpVisualizerRangeIndex(unit, day) {
+  return (unit.priceRanges || []).findIndex(range => range.start <= day && day <= range.end);
+}
+
+function dpVisualizerKnownDates(unit, row, step) {
+  const pricingDates = unit.pricingDates || [];
+  const calls = (row.bootstrapApiCallDates || []).slice(0, step);
+  const callSet = new Set(calls);
+  const known = new Set(pricingDates.filter(day => callSet.has(day)));
+  const positions = new Map(pricingDates.map((day, index) => [day, index]));
+  const calledForUnit = pricingDates.filter(day => callSet.has(day));
+
+  // Before phase is known, equal endpoints no more than one cadence apart
+  // prove that every intervening value is equal as well.
+  for (let index = 0; index + 1 < calledForUnit.length; index += 1) {
+    const lower = calledForUnit[index];
+    const upper = calledForUnit[index + 1];
+    const sameRange = (unit.priceRanges || []).some(range =>
+      range.start <= lower && upper <= range.end);
+    if (!sameRange) continue;
+    const lowerIndex = positions.get(lower);
+    const upperIndex = positions.get(upper);
+    for (let position = lowerIndex; position <= upperIndex; position += 1) {
+      known.add(pricingDates[position]);
+    }
+  }
+
+  const phaseAt = unit.cyclePhaseKnownAtCall;
+  const phaseKnown = phaseAt != null && step >= phaseAt;
+  if (phaseKnown) {
+    const boundaries = new Set(unit.cycleBoundaryDates || []);
+    const groups = [];
+    let group = [];
+    pricingDates.forEach(day => {
+      if (group.length && boundaries.has(day)) {
+        groups.push(group);
+        group = [];
+      }
+      group.push(day);
+    });
+    if (group.length) groups.push(group);
+    groups.forEach(days => {
+      if (days.some(day => callSet.has(day))) days.forEach(day => known.add(day));
+    });
+    // A clipped first/last cycle can share its effective price with the
+    // neighboring sampled cycle. The planner folds those edge cells into the
+    // neighbor so they do not require a sub-cadence call.
+    (unit.cycleEdgeInferenceGroups || []).forEach(days => {
+      if (days.some(day => callSet.has(day))) days.forEach(day => known.add(day));
+    });
+  }
+  return known;
+}
+
+function dpVisualizerHtml(row) {
+  const bid = String(row.buildingId || '');
+  const units = row.units || [];
+  const calls = row.bootstrapApiCallDates || [];
+  const requestedStep = Number(dynamicPricing.visualSteps[bid] || 0);
+  const step = Math.max(0, Math.min(requestedStep, calls.length));
+  dynamicPricing.visualSteps[bid] = step;
+  const currentCall = step ? calls[step - 1] : null;
+  const allDates = units.flatMap(unit => unit.pricingDates || []).sort();
+  if (!allDates.length) return '<div class="si-pending">No dated pricing to visualize.</div>';
+  const calendar = dpCalendarDates(allDates[0], allDates[allDates.length - 1]);
+  const called = new Set(calls.slice(0, step));
+  const knownPhaseUnits = units.filter(unit =>
+    unit.cyclePhaseKnownAtCall != null && step >= unit.cyclePhaseKnownAtCall).length;
+  const cadenceStatus = row.pricingDoesNotChange
+    ? 'Pricing does not change'
+    : (row.cadenceKnownAtCall === 0
+        ? `Known before call 1 · ${row.cadenceDays} days`
+        : 'Unknown');
+  let knownCellCount = 0;
+  let totalCellCount = 0;
+
+  const headerCells = calendar.map(day => {
+    const currentClass = day === currentCall ? ' current-call' : '';
+    const calledClass = called.has(day) ? ' called-date' : '';
+    return `<th class="dp-viz-date${currentClass}${calledClass}" title="${esc(day)}">${esc(dpFormatShortDate(day))}</th>`;
+  }).join('');
+
+  const unitRows = units.map(unit => {
+    const active = new Set(unit.pricingDates || []);
+    const known = dpVisualizerKnownDates(unit, row, step);
+    const boundaries = new Set(unit.cycleBoundaryDates || []);
+    const priceChangeStarts = new Set((unit.priceRanges || []).slice(1).map(range => range.start));
+    const phaseAt = unit.cyclePhaseKnownAtCall;
+    const phaseKnown = phaseAt != null && step >= phaseAt;
+    const activeCalls = (unit.pricingDates || []).filter(day => called.has(day));
+    const positions = new Map((unit.pricingDates || []).map((day, index) => [day, index]));
+    const boundaryWindows = new Set();
+    for (let index = 0; index + 1 < activeCalls.length; index += 1) {
+      const lower = activeCalls[index];
+      const upper = activeCalls[index + 1];
+      if (dpVisualizerRangeIndex(unit, lower) === dpVisualizerRangeIndex(unit, upper)) continue;
+      const lowerIndex = positions.get(lower);
+      const upperIndex = positions.get(upper);
+      for (let position = lowerIndex + 1; position <= upperIndex; position += 1) {
+        boundaryWindows.add(unit.pricingDates[position]);
+      }
+    }
+    totalCellCount += active.size;
+    knownCellCount += known.size;
+    let phaseText;
+    if (row.pricingDoesNotChange) phaseText = 'cycle not applicable';
+    else if (phaseAt === 0) phaseText = 'cycle known initially';
+    else if (phaseAt != null && phaseKnown) phaseText = `cycle known at call ${phaseAt}`;
+    else if (phaseAt != null) phaseText = `cycle pending · call ${phaseAt}`;
+    else phaseText = 'cycle not yet observable';
+    const cells = calendar.map(day => {
+      if (!active.has(day)) {
+        return `<td class="dp-viz-cell outside${day === currentCall ? ' current-call' : ''}"></td>`;
+      }
+      const direct = called.has(day);
+      const inferred = !direct && known.has(day);
+      const boundary = phaseKnown && boundaries.has(day);
+      const rangeIndex = dpVisualizerRangeIndex(unit, day);
+      const distinctPriceStart = priceChangeStarts.has(day);
+      const boundaryWindow = !phaseKnown && boundaryWindows.has(day);
+      const classes = [
+        'dp-viz-cell',
+        direct ? 'direct' : (inferred ? 'inferred' : 'unknown'),
+        rangeIndex % 2 ? 'price-band-odd' : 'price-band-even',
+        distinctPriceStart ? 'price-change' : '',
+        boundaryWindow ? 'boundary-window' : '',
+        boundary ? 'cycle-start' : '',
+        day === currentCall ? 'current-call' : '',
+      ].filter(Boolean).join(' ');
+      const state = direct ? 'direct API response' : (inferred ? 'inferred pricing' : 'unknown pricing');
+      const rangeText = rangeIndex >= 0 ? ` · actual price range ${rangeIndex + 1}` : '';
+      const boundaryText = boundaryWindow ? ' · a price boundary is known to fall in this interval' : '';
+      return `<td class="${classes}" title="${esc(`${unit.unitId} · ${day} · ${state}${rangeText}${boundaryText}`)}"></td>`;
+    }).join('');
+    return `<tr>
+      <th class="dp-viz-unit">
+        <strong>${esc(unit.unitId)}</strong>
+        <span>${unit.holdTimeDays || active.size}d hold · available ${esc(dpFormatShortDate(unit.availableDate))}</span>
+        <span>retrieval starts ${esc(dpFormatShortDate(unit.visualStartDate))}</span>
+        <span class="${phaseKnown ? 'phase-known' : 'phase-pending'}">${esc(phaseText)}</span>
+      </th>${cells}
+    </tr>`;
+  }).join('');
+
+  const stepLabel = step
+    ? `Call ${step} of ${calls.length} · ${dpFormatShortDate(currentCall)}`
+    : `Before call 1 · ${calls.length} calls planned`;
+  const phaseStatus = row.pricingDoesNotChange
+    ? 'Starting cycle points not applicable'
+    : `${knownPhaseUnits}/${units.length} unit starting cycle points known`;
+  const completion = totalCellCount
+    ? Math.round(100 * knownCellCount / totalCellCount)
+    : 0;
+
+  return `<div class="dp-algorithm-viz" data-bid="${esc(bid)}">
+    <div class="dp-viz-toolbar">
+      <button type="button" data-dp-viz-action="reset" data-bid="${esc(bid)}"${step === 0 ? ' disabled' : ''}>Reset</button>
+      <button type="button" data-dp-viz-action="prev" data-bid="${esc(bid)}"${step === 0 ? ' disabled' : ''}>Previous</button>
+      <input class="dp-viz-slider" type="range" min="0" max="${calls.length}" value="${step}" data-dp-viz-slider data-bid="${esc(bid)}" aria-label="Algorithm step">
+      <button type="button" data-dp-viz-action="next" data-bid="${esc(bid)}"${step === calls.length ? ' disabled' : ''}>Next API Call</button>
+      <button type="button" data-dp-viz-action="last" data-bid="${esc(bid)}"${step === calls.length ? ' disabled' : ''}>Finish</button>
+      <strong class="dp-viz-step-label">${esc(stepLabel)}</strong>
+    </div>
+    <div class="dp-viz-status">
+      <span><b>Cadence:</b> ${esc(cadenceStatus)}</span>
+      <span><b>Cycle position:</b> ${esc(phaseStatus)}</span>
+      <span><b>Known pricing:</b> ${knownCellCount}/${totalCellCount} cells (${completion}%)</span>
+    </div>
+    <div class="dp-viz-legend" aria-label="Legend">
+      <span><i class="direct"></i>API response</span>
+      <span><i class="inferred"></i>Inferred from known range</span>
+      <span><i class="unknown"></i>Unknown</span>
+      <span><i class="price-change"></i>Distinct pricing begins</span>
+      <span><i class="boundary-window"></i>Boundary lies in interval</span>
+      <span><i class="boundary"></i>Known cycle boundary</span>
+    </div>
+    <div class="dp-viz-grid-wrap">
+      <table class="dp-viz-grid">
+        <thead><tr><th class="dp-viz-corner">Unit / availability and hold</th>${headerCells}</tr></thead>
+        <tbody>${unitRows}</tbody>
+      </table>
+    </div>
+  </div>`;
+}
+
+function dpRenderVisualizer(bid) {
+  const row = (dynamicPricing.result?.rows || [])
+    .find(item => String(item.buildingId || '') === String(bid));
+  const host = document.querySelector(`.dp-algorithm-viz[data-bid="${CSS.escape(String(bid))}"]`);
+  if (row && host) host.outerHTML = dpVisualizerHtml(row);
+}
+
+function dpSetVisualizerStep(bid, action) {
+  const row = (dynamicPricing.result?.rows || [])
+    .find(item => String(item.buildingId || '') === String(bid));
+  if (!row) return;
+  const maximum = (row.bootstrapApiCallDates || []).length;
+  let step = Number(dynamicPricing.visualSteps[bid] || 0);
+  if (action === 'reset') step = 0;
+  else if (action === 'prev') step -= 1;
+  else if (action === 'next') step += 1;
+  else if (action === 'last') step = maximum;
+  dynamicPricing.visualSteps[bid] = Math.max(0, Math.min(step, maximum));
+  dpRenderVisualizer(bid);
 }
 
 function dpUnitDetailHtml(row) {
   if (row.error) {
-    return `<div class="dp-error">Could not read the latest matrix: ${esc(row.error)}</div>`;
+    return `<div class="dp-error">Could not read the sync-matched matrix: ${esc(row.error)}</div>`;
   }
   if (!(row.units || []).length) {
-    return '<div class="si-pending">The latest matrix contains no dated unit pricing.</div>';
+    return '<div class="si-pending">The sync-matched matrix contains no dated unit pricing.</div>';
   }
-  const unitRows = row.units.map(unit => {
-    const cadence = unit.cadenceDays != null ? String(unit.cadenceDays) : unit.cadence;
-    const observedGaps = [...new Set(unit.cadencePattern || [])].sort((a, b) => a - b);
-    const pattern = observedGaps.length > 1
-      ? ` (observed gaps: ${observedGaps.join(', ')} days)`
-      : '';
-    return `<tr>
-      <td class="si-mono">${esc(unit.unitId)}</td>
-      <td>${esc(cadence || '—')}${esc(pattern)}</td>
-      <td class="dp-num">${unit.pricingDateCount || 0}</td>
-      <td class="dp-num">${unit.priceRangeCount || 0}</td>
-      <td class="dp-dates">${dpRangesHtml(unit.priceRanges)}</td>
-    </tr>`;
-  }).join('');
-  return `<table class="dp-table dp-unit-table">
-    <thead><tr>
-      <th>Unit</th><th>Cadence (Days)</th><th class="dp-num">Pricing Dates</th>
-      <th class="dp-num">Price Ranges</th><th>Unit Price Ranges</th>
-    </tr></thead>
-    <tbody>${unitRows}</tbody>
-  </table>`;
+  return dpVisualizerHtml(row);
 }
 
 function dpRenderResult(result, isPartial = false) {
   dynamicPricing.result = result || {};
-  const rows = dynamicPricing.result.rows || [];
+  const allRows = dynamicPricing.result.rows || [];
   const body = document.getElementById('dp-preview-body');
   const status = document.getElementById('dp-preview-status');
   const analyzed = dynamicPricing.result.analyzed || 0;
   const total = dynamicPricing.result.communities || 0;
   status.textContent = isPartial ? `${analyzed} / ${total} analyzed` : `${total} communities`;
 
-  if (!rows.length) {
+  if (!allRows.length) {
     body.innerHTML = `<div class="pane-msg">${isPartial
-      ? 'Loading the latest pricing matrices…'
+      ? 'Matching successful MITS syncs to pricing matrices…'
       : (dynamicPricing.result.excluded
-          ? 'All matched communities were excluded because they had no valid multi-day pricing matrix.'
+          ? 'All matched communities were excluded because they had no successful MITS sync with a valid multi-day pricing matrix.'
           : 'No active Entrata communities with dynamic pricing were found.')}</div>`;
     return;
   }
 
+  const rows = dpVisibleRows(allRows);
   const totalCurrent = rows.reduce((sum, row) => sum + (row.currentApiCalls || 0), 0);
-  const totalNew = rows.reduce((sum, row) => sum + (row.newApiCalls || 0), 0);
+  const totalBootstrap = rows.reduce((sum, row) => sum + (row.bootstrapApiCalls || 0), 0);
   const totalSaved = rows.reduce((sum, row) => sum + (row.apiCallsSaved || 0), 0);
   const tableRows = rows.map(row => {
     const bid = String(row.buildingId || '');
     const isOpen = dynamicPricing.open.has(bid);
-    const dates = row.priceChangeDates || [];
-    const dateCell = dates.length
-      ? `<details class="dp-dates"><summary>${dates.length} API call dates</summary>`
-        + `<div class="dp-date-list">${dpDatesHtml(dates)}</div></details>`
+    const bootstrapDates = row.bootstrapApiCallDates || [];
+    const bootstrapDateCell = bootstrapDates.length
+      ? `<details class="dp-dates"><summary>${bootstrapDates.length} bootstrap dates</summary>`
+        + `<div class="dp-date-list">${dpDatesHtml(bootstrapDates)}</div></details>`
       : '<span class="si-pending">none</span>';
     return `<tr class="dp-community-row" data-bid="${esc(bid)}">
-      <td><button class="dp-expand" data-bid="${esc(bid)}" aria-expanded="${isOpen}">${isOpen ? '▼' : '▶'}</button></td>
+      <td><button class="dp-expand" data-bid="${esc(bid)}" aria-expanded="${isOpen}">${isOpen ? 'Hide' : 'Visualize'}</button></td>
       <td>${esc(row.orgName || '—')}</td>
       <td>${esc(row.buildingName || '—')}</td>
       <td class="si-mono">${esc(bid)}</td>
+      <td>${row.snapshotLink
+        ? `<a href="${esc(row.snapshotLink)}" target="_blank" rel="noopener noreferrer">${esc(dpFormatTimestamp(row.latestSync))}</a>`
+        : esc(dpFormatTimestamp(row.latestSync))}</td>
       <td>${row.error ? '<span class="dp-error">Error</span>' : dpCadenceHtml(row)}</td>
+      <td>${esc(dpCadenceEvidenceText(row))}</td>
+      <td>${esc(row.cycleAlignment || 'Unknown')}</td>
       <td class="dp-num">${row.unitCount || 0}</td>
-      <td>${dateCell}</td>
-      <td class="dp-num">${row.newApiCalls || 0}</td>
-      <td>${dpPerUnitRangesHtml(row)}</td>
       <td class="dp-num">${row.currentApiCalls || 0}</td>
+      <td class="dp-num">${row.bootstrapApiCalls || 0}</td>
       <td class="dp-num dp-saved">${row.apiCallsSaved || 0}</td>
-      <td>${esc(dpFormatTimestamp(row.matrixLastUpdated))}</td>
+      <td class="dp-num">${row.reconstructionAccuracyPct ?? '—'}</td>
+      <td>${esc(row.retrievalStrategy || '—')}</td>
+      <td>${bootstrapDateCell}</td>
     </tr>
     <tr class="dp-detail-row" data-bid="${esc(bid)}"${isOpen ? '' : ' hidden'}>
-      <td colspan="12"><div class="dp-unit-detail">${isOpen ? dpUnitDetailHtml(row) : ''}</div></td>
+      <td colspan="${DP_REPORT_COLUMNS.length + 1}"><div class="dp-unit-detail">${isOpen ? dpUnitDetailHtml(row) : ''}</div></td>
     </tr>`;
-  }).join('');
+  }).join('') || `<tr><td class="dp-no-results" colspan="${DP_REPORT_COLUMNS.length + 1}">No communities match the column filters.</td></tr>`;
+
+  const activeFilters = Object.values(dynamicPricing.filters).some(value => String(value || '').trim());
+  const loadedLabel = rows.length === allRows.length
+    ? `${rows.length} loaded`
+    : `${rows.length} of ${allRows.length} shown`;
 
   body.innerHTML = `<div class="dp-summary">
-      <span>${rows.length} loaded</span>
-      <span>${totalNew} new API calls</span>
+      <span>${loadedLabel}</span>
+      <span>${totalBootstrap} bootstrap calls</span>
       <span>${totalCurrent} current API calls</span>
       <span>${totalSaved} API calls saved</span>
       ${dynamicPricing.result.excluded ? `<span>${dynamicPricing.result.excluded} invalid or single-day communities excluded</span>` : ''}
       ${dynamicPricing.result.errors ? `<span style="color:#f85149">${dynamicPricing.result.errors} errors</span>` : ''}
       ${dynamicPricing.result.unitNumberError ? '<span style="color:#d29922">Unit numbers unavailable; showing matrix IDs</span>' : ''}
+      <div class="dp-summary-actions">
+        <button type="button" data-dp-clear-filters${activeFilters ? '' : ' disabled'}>Clear Filters</button>
+        <button type="button" class="dp-export" data-dp-export${rows.length ? '' : ' disabled'}>Export CSV</button>
+      </div>
+    </div>
+    <div class="dp-method-note">
+      Cadence uses the shortest complete interior price range; first and last ranges are excluded because the retrieved window can truncate them. Community-aligned properties use one shared cadence grid across all units. Unit-specific properties use cadence-spaced anchors and adaptively search intervals whose endpoint prices differ. Every sparse plan is verified against the retrieved matrix; an inexact plan falls back to daily calls. API Calls Saved equals Current API Calls minus Bootstrap Calls.
     </div>
     <div class="dp-table-wrap"><table class="dp-table">
-      <thead><tr>
-        <th></th><th>Organization</th><th>Community</th><th>Building ID</th>
-        <th>Cadence (Days)</th><th class="dp-num">Units</th><th>Price Change Dates</th>
-        <th class="dp-num">New API Calls</th><th>Price Ranges Per Unit</th>
-        <th class="dp-num">Current API Calls</th><th class="dp-num">API Calls Saved</th>
-        <th>Latest Matrix</th>
-      </tr></thead>
+      <thead>
+        <tr><th></th>${dpReportHeaderHtml()}</tr>
+        <tr class="dp-filter-row"><th></th>${dpReportFiltersHtml()}</tr>
+      </thead>
       <tbody>${tableRows}</tbody>
     </table></div>`;
 }
@@ -2712,23 +3096,41 @@ async function runDynamicPricing() {
     dpSetStatus('Maximum communities must be between 1 and 5,000.', true);
     return;
   }
+  const orgText = document.getElementById('dp-org-ids').value.trim();
+  const orgTokens = orgText ? orgText.split(/[\s,]+/).filter(Boolean) : [];
+  const invalidOrgId = orgTokens.find(value => !/^\d+$/.test(value) || Number(value) <= 0);
+  if (invalidOrgId) {
+    dpSetStatus(`Organization IDs must be positive integers; check “${invalidOrgId}”.`, true);
+    return;
+  }
+  const orgIds = [...new Set(orgTokens)];
+  if (orgIds.length > 5000) {
+    dpSetStatus('Enter at most 5,000 organization IDs.', true);
+    return;
+  }
   if (dynamicPricing.polling) clearInterval(dynamicPricing.polling);
   dynamicPricing.jobId = null;
   dynamicPricing.polling = null;
   dynamicPricing.result = null;
   dynamicPricing.open.clear();
+  dynamicPricing.visualSteps = {};
+  dynamicPricing.filters = {};
+  dynamicPricing.sortKey = 'apiCallsSaved';
+  dynamicPricing.sortDir = 'desc';
 
   const button = document.getElementById('btn-run-dynamic-pricing');
   button.disabled = true;
-  dpSetStatus('Finding Entrata communities in Snowflake…');
+  dpSetStatus(orgIds.length
+    ? `Finding Entrata communities for ${orgIds.length} organization${orgIds.length === 1 ? '' : 's'}…`
+    : 'Finding Entrata communities in Snowflake…');
   document.getElementById('dp-preview-status').textContent = 'Starting…';
   document.getElementById('dp-preview-body').innerHTML =
-    '<div class="pane-msg">Loading the most recent pricing matrices…</div>';
+    '<div class="pane-msg">Matching successful MITS syncs to pricing matrices…</div>';
   try {
     const response = await fetch('/api/dynamic-pricing/analyze', {
       method: 'POST',
       headers: {'Content-Type': 'application/json'},
-      body: JSON.stringify({limit}),
+      body: JSON.stringify({limit, orgIds}),
     });
     const data = await response.json();
     if (!response.ok || data.error) throw new Error(data.error || response.statusText);

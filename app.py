@@ -4430,6 +4430,7 @@ WHERE COALESCE(
         building_flag.VALUE, org_flag.VALUE, default_flag.VALUE, FALSE) = TRUE
     AND b.IS_ACTIVE = TRUE
     AND COALESCE(b.IS_TEST, FALSE) = FALSE
+    {org_filter}
     AND UPPER(COALESCE(
         b.PRICING_USED, b.PMS_USED_NAME, b.CRM_USED_NAME, '')) = 'ENTRATA'
 ORDER BY b.ID
@@ -4470,7 +4471,7 @@ def _dynamic_pricing_signature(prices):
 
 
 def _dynamic_pricing_unit_result(matrix, ordinal):
-    """Extract dated prices and the shortest observed price-change interval."""
+    """Extract dated prices and their actual contiguous signature ranges."""
     if not isinstance(matrix, dict):
         return None
     price_matrix = matrix.get('priceMatrix') or {}
@@ -4490,12 +4491,25 @@ def _dynamic_pricing_unit_result(matrix, ordinal):
         return None
 
     change_dates = []
-    previous = None
+    price_ranges = []
+    previous_signature = None
+    range_start = None
+    previous_day = None
     for day in pricing_dates:
         signature = _dynamic_pricing_signature(by_date[day])
-        if previous is None or signature != previous:
+        if previous_signature is None or signature != previous_signature:
             change_dates.append(day)
-        previous = signature
+            if range_start is not None:
+                price_ranges.append({
+                    'start': range_start,
+                    'end': previous_day,
+                })
+            range_start = day
+        previous_signature = signature
+        previous_day = day
+    if range_start is not None:
+        price_ranges.append({'start': range_start, 'end': previous_day})
+    _dynamic_pricing_add_range_lengths(price_ranges)
 
     observed_gaps = [
         (date.fromisoformat(current) - date.fromisoformat(previous_day)).days
@@ -4514,35 +4528,30 @@ def _dynamic_pricing_unit_result(matrix, ordinal):
         'cadencePattern': observed_gaps,
         'pricingDates': pricing_dates,
         'pricingDateCount': len(pricing_dates),
-        # Retained for transparency in the unit drilldown. The report's final
-        # change dates are cadence-spaced in the community-level second pass.
+        'priceRanges': price_ranges,
+        'priceRangeCount': len(price_ranges),
+        'priceRangeLengths': [
+            price_range.get('lengthDays') for price_range in price_ranges
+        ],
         'observedChangeDates': change_dates,
+        # Kept only while the server builds and verifies the retrieval plan;
+        # removed before the result is sent to the browser.
+        '_pricingSignatures': {
+            day: _dynamic_pricing_signature(by_date[day])
+            for day in pricing_dates
+        },
     }
 
 
-def _dynamic_pricing_min_date_gap(units):
-    """Fallback cadence when prices never differ: shortest retrieved interval."""
-    gaps = []
-    for unit in units:
-        pricing_dates = unit.get('pricingDates') or []
-        gaps.extend(
-            (date.fromisoformat(current) - date.fromisoformat(previous)).days
-            for previous, current in zip(pricing_dates, pricing_dates[1:])
-        )
-    return min((gap for gap in gaps if gap > 0), default=1)
-
-
-def _dynamic_pricing_cadence_ranges(pricing_dates, cadence_days):
-    """Partition a unit's pricing horizon into inclusive cadence-day ranges."""
-    if not pricing_dates:
-        return []
-    start = date.fromisoformat(pricing_dates[0])
-    final = date.fromisoformat(pricing_dates[-1])
-    ranges = []
-    while start <= final:
-        end = min(start + timedelta(days=cadence_days - 1), final)
-        ranges.append({'start': start.isoformat(), 'end': end.isoformat()})
-        start = end + timedelta(days=1)
+def _dynamic_pricing_add_range_lengths(ranges):
+    """Add inclusive day counts for each actual price-signature range."""
+    for price_range in ranges:
+        try:
+            start = date.fromisoformat(price_range['start'])
+            end = date.fromisoformat(price_range['end'])
+            price_range['lengthDays'] = (end - start).days + 1
+        except (KeyError, TypeError, ValueError):
+            price_range['lengthDays'] = None
     return ranges
 
 
@@ -4572,8 +4581,373 @@ def _dynamic_pricing_minimum_range_dates(units):
     return selected
 
 
-def _dynamic_pricing_analyze_payload(community, payload, last_modified=None):
-    """Summarize the most recent S3 matrix for one Entrata community."""
+def _dynamic_pricing_cycle_range_units(units, cadence_days, shared_phase=None):
+    """Partition each unit horizon into the cadence ranges to be sampled."""
+    cycle_units = []
+    for unit in units:
+        unit['cycleEdgeInferenceGroups'] = []
+        pricing_dates = unit.get('pricingDates') or []
+        phase = shared_phase
+        if phase is None:
+            phase = unit.get('_cyclePhase')
+        if phase is None and pricing_dates:
+            # A unit with no visible price boundary has no observable phase.
+            # Sampling cadence-sized slices from its first returned date still
+            # guarantees that its whole horizon is checked.
+            phase = date.fromisoformat(pricing_dates[0]).toordinal() % cadence_days
+            unit['_cyclePhase'] = phase
+
+        groups = []
+        current_key = None
+        current_dates = []
+        for day in pricing_dates:
+            parsed = date.fromisoformat(day)
+            cycle_key = (parsed.toordinal() - phase) // cadence_days
+            if current_key is not None and cycle_key != current_key:
+                groups.append(current_dates)
+                current_dates = []
+            current_key = cycle_key
+            current_dates.append(day)
+        if current_dates:
+            groups.append(current_dates)
+
+        # A horizon may begin or end in the middle of a cadence range. If
+        # that clipped edge has the same effective price as its neighboring
+        # range, it does not need its own near-duplicate API call. Fold it
+        # into the neighbor before enforcing cadence spacing.
+        signatures = unit.get('_pricingSignatures') or {}
+
+        def same_effective_price(left, right):
+            values = {
+                signatures.get(day) for day in (left + right)
+            }
+            return len(values) == 1
+
+        if (len(groups) > 1 and len(groups[0]) < cadence_days
+                and same_effective_price(groups[0], groups[1])):
+            groups[1] = groups[0] + groups[1]
+            unit['cycleEdgeInferenceGroups'].append(list(groups[1]))
+            groups.pop(0)
+        if (len(groups) > 1 and len(groups[-1]) < cadence_days
+                and same_effective_price(groups[-2], groups[-1])):
+            groups[-2] = groups[-2] + groups[-1]
+            unit['cycleEdgeInferenceGroups'].append(list(groups[-2]))
+            groups.pop()
+        cycle_units.append({
+            'priceRanges': [
+                {'start': days[0], 'end': days[-1]}
+                for days in groups if days
+            ],
+            '_cycleDateGroups': groups,
+            '_pricingSignatures': signatures,
+        })
+    return cycle_units
+
+
+def _dynamic_pricing_cadence_spaced_range_dates(units, cadence_days):
+    """Return a range cover whose calls are at least one cadence apart.
+
+    Once cadence and unit phase are known, one response anywhere inside each
+    cadence range fills that entire range. This dynamic program picks the
+    fewest property dates that intersect every required range while enforcing
+    cadence-sized spacing between consecutive calls. It avoids the redundant
+    per-unit anchor grids that previously produced calls such as 10/27 and
+    10/29 for a three-day cadence.
+
+    A strict spacing solution can be impossible when two different units have
+    non-overlapping, truncated edge ranges less than one cadence apart.  In
+    that genuine edge case, retain the unconstrained exact interval cover
+    rather than claim that an incomplete matrix is accurate.
+    """
+    if not isinstance(cadence_days, int) or cadence_days <= 0:
+        return _dynamic_pricing_minimum_range_dates(units), False
+
+    intervals = []
+    for unit in units:
+        for price_range in unit.get('priceRanges') or []:
+            try:
+                start = date.fromisoformat(price_range['start']).toordinal()
+                end = date.fromisoformat(price_range['end']).toordinal()
+            except (KeyError, TypeError, ValueError):
+                continue
+            if start <= end:
+                intervals.append((start, end))
+    if not intervals:
+        return [], True
+    intervals.sort(key=lambda interval: (interval[1], interval[0]))
+
+    # Given the last selected point, every interval beginning on or before it
+    # is already covered. The earliest-ending remaining interval constrains
+    # the next point; exploring the dates inside only that interval is enough
+    # to find the globally smallest feasible sequence.
+    memo = {}
+
+    def solve(last_selected):
+        if last_selected in memo:
+            return memo[last_selected]
+        remaining = [
+            interval for interval in intervals if interval[0] > last_selected
+        ]
+        if not remaining:
+            memo[last_selected] = ()
+            return ()
+        start, end = min(remaining, key=lambda interval: interval[1])
+        lower = max(start, last_selected + cadence_days)
+        best = None
+        for candidate in range(lower, end + 1):
+            tail = solve(candidate)
+            if tail is None:
+                continue
+            proposed = (candidate,) + tail
+            if (best is None or len(proposed) < len(best)
+                    or (len(proposed) == len(best) and proposed > best)):
+                # On equal call counts, later dates cover more future ranges.
+                best = proposed
+        memo[last_selected] = best
+        return best
+
+    first_start, first_end = min(intervals, key=lambda interval: interval[1])
+    best = None
+    for first_call in range(first_start, first_end + 1):
+        tail = solve(first_call)
+        if tail is None:
+            continue
+        proposed = (first_call,) + tail
+        if (best is None or len(proposed) < len(best)
+                or (len(proposed) == len(best) and proposed > best)):
+            best = proposed
+    if best is None:
+        return _dynamic_pricing_minimum_range_dates(units), False
+    return [date.fromordinal(day).isoformat() for day in best], True
+
+
+def _dynamic_pricing_range_plan_accuracy(units, calls):
+    """Measure reconstruction when each hit cadence range uses its response."""
+    call_set = set(calls)
+    total = correct = 0
+    for unit in units:
+        signatures = unit.get('_pricingSignatures') or {}
+        for days in unit.get('_cycleDateGroups') or []:
+            selected = next((day for day in days if day in call_set), None)
+            inferred = signatures.get(selected) if selected else None
+            total += len(days)
+            correct += sum(signatures.get(day) == inferred for day in days)
+    return round(100 * correct / total, 3) if total else 0.0
+
+
+def _dynamic_pricing_adaptive_retrieval_dates(units, cadence_days):
+    """Simulate an exact, phase-agnostic retrieval once cadence is known.
+
+    A cadence-sized gap contains at most one effective price boundary for a
+    unit.  We therefore query each unit's first day, cadence-spaced anchors,
+    and final day. Equal signatures at adjacent anchors prove every day
+    between them has the same effective price. When they differ, query the
+    date that bisects the most unresolved unit intervals; every property-date
+    call answers all units, so one probe can advance many binary searches.
+
+    This is the safe bootstrap plan. Once actual unit ranges have been
+    learned, ``_dynamic_pricing_minimum_range_dates`` is the lower-call
+    steady-state plan. Hidden cycle boundaries whose adjacent prices happen
+    to be equal do not affect matrix reconstruction and need no extra call.
+    """
+    if not isinstance(cadence_days, int) or cadence_days <= 0:
+        dates = sorted({
+            day for unit in units for day in (unit.get('pricingDates') or [])
+        })
+        return dates, 100.0 if dates else 0.0
+
+    base_calls = set()
+    for unit in units:
+        pricing_dates = unit.get('pricingDates') or []
+        if not pricing_dates:
+            continue
+        start = date.fromisoformat(pricing_dates[0])
+        end = date.fromisoformat(pricing_dates[-1])
+        cursor = start
+        while cursor <= end:
+            base_calls.add(cursor.isoformat())
+            cursor += timedelta(days=cadence_days)
+        base_calls.add(end.isoformat())
+    call_order = sorted(base_calls)
+    calls = set(call_order)
+
+    def unresolved_intervals():
+        unresolved = []
+        for unit_index, unit in enumerate(units):
+            signatures = unit.get('_pricingSignatures') or {}
+            known = [
+                day for day in (unit.get('pricingDates') or [])
+                if day in calls
+            ]
+            for lower, upper in zip(known, known[1:]):
+                gap = (date.fromisoformat(upper)
+                       - date.fromisoformat(lower)).days
+                if (gap > 1
+                        and signatures.get(lower) != signatures.get(upper)):
+                    unresolved.append((unit_index, lower, upper))
+        return unresolved
+
+    while True:
+        unresolved = unresolved_intervals()
+        if not unresolved:
+            break
+
+        candidates = set()
+        for unit_index, lower, upper in unresolved:
+            candidates.update(
+                day for day in (units[unit_index].get('pricingDates') or [])
+                if lower < day < upper and day not in calls
+            )
+
+        # Prefer a call useful to the largest number of units. The balance
+        # tiebreaker keeps each binary search shallow; the date tiebreaker is
+        # deterministic for repeatable reports and CSV exports.
+        best_date = None
+        best_rank = None
+        for candidate in candidates:
+            candidate_day = date.fromisoformat(candidate)
+            covered = 0
+            balance = 0
+            for unit_index, lower, upper in unresolved:
+                lower_day = date.fromisoformat(lower)
+                upper_day = date.fromisoformat(upper)
+                signatures = units[unit_index].get('_pricingSignatures') or {}
+                if (candidate in signatures
+                        and lower_day < candidate_day < upper_day):
+                    covered += 1
+                    balance += min(
+                        (candidate_day - lower_day).days,
+                        (upper_day - candidate_day).days)
+            rank = (covered, balance, candidate)
+            if best_rank is None or rank > best_rank:
+                best_rank = rank
+                best_date = candidate
+        if best_date is None:
+            break
+        calls.add(best_date)
+        call_order.append(best_date)
+
+    correct = 0
+    total = 0
+    for unit in units:
+        pricing_dates = unit.get('pricingDates') or []
+        signatures = unit.get('_pricingSignatures') or {}
+        known = [day for day in pricing_dates if day in calls]
+        positions = {day: index for index, day in enumerate(pricing_dates)}
+        reconstructed = {day: signatures.get(day) for day in known}
+        for lower, upper in zip(known, known[1:]):
+            lower_signature = signatures.get(lower)
+            upper_signature = signatures.get(upper)
+            if lower_signature == upper_signature:
+                for day in pricing_dates[positions[lower]:positions[upper] + 1]:
+                    reconstructed[day] = lower_signature
+        total += len(pricing_dates)
+        correct += sum(
+            reconstructed.get(day) == signatures.get(day)
+            for day in pricing_dates
+        )
+    accuracy = round(100 * correct / total, 3) if total else 0.0
+    return call_order, accuracy
+
+
+def _dynamic_pricing_aligned_retrieval_dates(units, cadence_days, phase):
+    """Return one shared cadence-grid plan for a community-aligned matrix.
+
+    All unit cycle boundaries share ``phase`` (an ordinal modulo cadence), so
+    each unit's horizon can be partitioned into the same calendar cycles. A
+    minimum interval-stabbing pass then chooses property dates that cover all
+    unit-cycle slices, including truncated first and last slices.
+    """
+    if not isinstance(cadence_days, int) or cadence_days <= 0:
+        return [], 0.0
+
+    cycle_units = []
+    for unit in units:
+        groups = []
+        current_key = None
+        current_dates = []
+        for day in unit.get('pricingDates') or []:
+            parsed = date.fromisoformat(day)
+            cycle_key = (parsed.toordinal() - phase) // cadence_days
+            if current_key is not None and cycle_key != current_key:
+                groups.append(current_dates)
+                current_dates = []
+            current_key = cycle_key
+            current_dates.append(day)
+        if current_dates:
+            groups.append(current_dates)
+        cycle_units.append({
+            'priceRanges': [
+                {'start': days[0], 'end': days[-1]}
+                for days in groups if days
+            ],
+            '_cycleDateGroups': groups,
+            '_pricingSignatures': unit.get('_pricingSignatures') or {},
+        })
+
+    calls = _dynamic_pricing_minimum_range_dates(cycle_units)
+    call_set = set(calls)
+    total = 0
+    correct = 0
+    for unit in cycle_units:
+        signatures = unit['_pricingSignatures']
+        for days in unit['_cycleDateGroups']:
+            selected = next((day for day in days if day in call_set), None)
+            inferred = signatures.get(selected) if selected else None
+            total += len(days)
+            correct += sum(signatures.get(day) == inferred for day in days)
+    accuracy = round(100 * correct / total, 3) if total else 0.0
+    return calls, accuracy
+
+
+def _dynamic_pricing_visualizer_metadata(
+        units, cadence_days, cycle_alignment, cycle_phases, call_sequence):
+    """Attach compact step-through metadata before signatures are discarded."""
+    shared_phase = (next(iter(cycle_phases))
+                    if cycle_alignment == 'Community-Aligned'
+                    and len(cycle_phases) == 1 else None)
+    for unit in units:
+        unit['holdTimeDays'] = unit.get('pricingDateCount') or 0
+        unit['visualStartDate'] = unit.get('firstPricingDate')
+        unit_phase = shared_phase
+        if unit_phase is None:
+            unit_phase = unit.get('_cyclePhase')
+        if unit_phase is None and cadence_days:
+            for price_range in (unit.get('priceRanges') or [])[1:]:
+                try:
+                    unit_phase = (
+                        date.fromisoformat(price_range['start']).toordinal()
+                        % cadence_days)
+                    break
+                except (KeyError, TypeError, ValueError):
+                    continue
+        unit['cyclePhase'] = unit_phase
+        unit['cycleBoundaryDates'] = []
+        if unit_phase is not None and cadence_days:
+            unit['cycleBoundaryDates'] = [
+                day for day in (unit.get('pricingDates') or [])
+                if date.fromisoformat(day).toordinal() % cadence_days == unit_phase
+            ]
+        # Each property-date response covers every unit active on that date.
+        # A unit's phase is settled no later than its cadence-th property-wide
+        # sample; do not wait for a later pair of adjacent calls. A shorter
+        # complete retrieval plan can settle it on its final active sample.
+        # Calls before a future unit is available do not count toward that
+        # unit's bootstrap evidence.
+        active_dates = set(unit.get('pricingDates') or [])
+        active_call_indexes = [
+            index for index, call in enumerate(call_sequence, 1)
+            if call in active_dates
+        ]
+        samples_needed = min(cadence_days, len(active_call_indexes))
+        unit['cyclePhaseKnownAtCall'] = (
+            active_call_indexes[samples_needed - 1]
+            if unit_phase is not None and samples_needed else None)
+
+
+def _dynamic_pricing_analyze_payload(community, payload, latest_sync=None,
+                                     snapshot_link='', unit_details=None):
+    """Summarize the matrix corresponding to one Entrata community's sync."""
     matrices = payload.get('priceMatrices') if isinstance(payload, dict) else []
     if not isinstance(matrices, list):
         matrices = []
@@ -4582,10 +4956,17 @@ def _dynamic_pricing_analyze_payload(community, payload, last_modified=None):
         valid_value is True
         or str(valid_value).strip().casefold() in ('true', '1', 'yes')
     )
+    unit_details = unit_details or {}
     units = []
     for ordinal, matrix in enumerate(matrices, 1):
         unit = _dynamic_pricing_unit_result(matrix, ordinal)
         if unit:
+            details = unit_details.get(str(unit.get('sourceUnitId') or '')) or {}
+            unit_number = details.get('unit_number') or details.get('unitNumber')
+            if unit_number not in (None, ''):
+                unit['unitId'] = str(unit_number)
+            unit['availableDate'] = _dynamic_pricing_iso_date(
+                details.get('date_available') or details.get('dateAvailable'))
             units.append(unit)
 
     # A matrix with no forward-looking range offers no cadence or API-call
@@ -4594,63 +4975,371 @@ def _dynamic_pricing_analyze_payload(community, payload, last_modified=None):
     excluded = not payload_valid or not units or all(
         unit['pricingDateCount'] <= 1 for unit in units)
 
-    observed_cadences = [
-        unit['cadenceDays'] for unit in units
-        if unit.get('cadenceDays') is not None
+    pricing_does_not_change = bool(units) and all(
+        len(unit.get('observedChangeDates') or []) <= 1 for unit in units)
+    cadence_evidence = [
+        (unit, price_range.get('lengthDays'))
+        for unit in units
+        for price_range in (unit.get('priceRanges') or [])[1:-1]
+        if isinstance(price_range.get('lengthDays'), int)
+        and price_range.get('lengthDays') > 0
     ]
-    cadence_days = (min(observed_cadences) if observed_cadences
-                    else _dynamic_pricing_min_date_gap(units))
+    cadence_lengths = [length for _unit, length in cadence_evidence]
+    cadence_days = (None if pricing_does_not_change or not cadence_lengths
+                    else min(cadence_lengths))
+    cadence_evidence_units = len({
+        str(unit.get('sourceUnitId') or unit.get('unitId') or '')
+        for unit, _length in cadence_evidence
+    })
+    cadence_is_consistent = bool(cadence_days) and all(
+        length % cadence_days == 0 for length in cadence_lengths)
+    can_project_cycle = bool(cadence_days and cadence_is_consistent)
+    if pricing_does_not_change:
+        cadence_confidence = 'Pricing Does Not Change'
+    elif not cadence_lengths:
+        cadence_confidence = 'Insufficient Data'
+    elif len(cadence_lengths) == 1:
+        cadence_confidence = 'Limited Evidence'
+    elif cadence_is_consistent:
+        cadence_confidence = 'Reliable'
+    else:
+        cadence_confidence = 'Mixed'
 
-    # Apply the community's minimum cadence to every unit. Each range covers
-    # one cadence period, except the final truncated range at the end of that
-    # unit's retrieved pricing horizon.
+    sync_date = latest_sync.astimezone(timezone.utc).date() if isinstance(
+        latest_sync, datetime) else None
+    cycle_phases = set()
+    predictable_units = 0
+    future_units = future_starts_at_availability = 0
+    already_units = already_starts_at_sync = 0
+
+    # The ranges remain the exact observed runs of equal pricing. Cadence is
+    # inferred only from complete interior runs; the first and last runs can
+    # be truncated by the unit's availability and the retrieved horizon.
     for unit in units:
         unit['cadenceDays'] = cadence_days
-        unit['cadence'] = str(cadence_days)
-        unit['priceRanges'] = _dynamic_pricing_cadence_ranges(
-            unit['pricingDates'], cadence_days)
-        unit['priceRangeCount'] = len(unit['priceRanges'])
+        unit['cadence'] = ('Pricing Does Not Change'
+                           if pricing_does_not_change
+                           else (str(cadence_days) if cadence_days else None))
+        ranges = unit.get('priceRanges') or []
+        first_range = ranges[0] if ranges else {}
+        last_range = ranges[-1] if ranges else {}
+        first_pricing_date = unit['pricingDates'][0]
+        last_pricing_date = unit['pricingDates'][-1]
+        available_date = unit.get('availableDate')
+        unit['firstPricingDate'] = first_pricing_date
+        unit['lastPricingDate'] = last_pricing_date
+        unit['firstRangeDays'] = first_range.get('lengthDays')
+        unit['lastRangeDays'] = last_range.get('lengthDays')
+
+        available_day = (date.fromisoformat(available_date)
+                         if available_date else None)
+        if available_day is None or sync_date is None:
+            unit['availabilityTiming'] = 'Unknown'
+        elif available_day > sync_date:
+            unit['availabilityTiming'] = 'Future Available'
+            future_units += 1
+        else:
+            unit['availabilityTiming'] = 'Already Available'
+            already_units += 1
+
+        if available_date and first_pricing_date == available_date:
+            unit['pricingWindowStartsAt'] = 'Availability Date'
+            if unit['availabilityTiming'] == 'Future Available':
+                future_starts_at_availability += 1
+        elif sync_date and first_pricing_date == sync_date.isoformat():
+            unit['pricingWindowStartsAt'] = 'Sync Date'
+            if unit['availabilityTiming'] == 'Already Available':
+                already_starts_at_sync += 1
+        else:
+            unit['pricingWindowStartsAt'] = 'Other / Unknown'
+
+        next_change = ranges[1].get('start') if len(ranges) > 1 else None
+        unit['nextObservedPriceChangeDate'] = next_change
+        unit['cycleDayAtWindowStart'] = None
+        unit['nextProjectedCycleDate'] = None
+        unit['_cyclePhase'] = None
+        if can_project_cycle and next_change:
+            first_length = first_range.get('lengthDays')
+            if isinstance(first_length, int) and first_length > 0:
+                offset = (cadence_days - (first_length % cadence_days)) % cadence_days
+                unit['cycleDayAtWindowStart'] = offset + 1
+            for price_range in ranges[1:]:
+                try:
+                    observed_phase = (
+                        date.fromisoformat(price_range['start']).toordinal()
+                        % cadence_days)
+                    cycle_phases.add(observed_phase)
+                    if unit['_cyclePhase'] is None:
+                        unit['_cyclePhase'] = observed_phase
+                except (KeyError, TypeError, ValueError):
+                    continue
+            try:
+                projected = date.fromisoformat(last_range['start'])
+                last_day = date.fromisoformat(last_range['end'])
+                while projected <= last_day:
+                    projected += timedelta(days=cadence_days)
+                unit['nextProjectedCycleDate'] = projected.isoformat()
+            except (KeyError, TypeError, ValueError):
+                pass
+            predictable_units += 1
+
+        if pricing_does_not_change:
+            unit['predictionStatus'] = 'No price changes observed'
+        elif not cadence_days:
+            unit['predictionStatus'] = 'Observed ranges only; cadence unavailable'
+        elif not cadence_is_consistent:
+            unit['predictionStatus'] = 'Observed ranges only; cadence evidence is mixed'
+        elif next_change:
+            unit['predictionStatus'] = 'Cycle phase inferred from an observed change'
+        else:
+            unit['predictionStatus'] = (
+                'Availability date alone does not establish cycle phase')
+
+    if pricing_does_not_change:
+        cycle_alignment = 'No Changes'
+    elif not can_project_cycle or not cycle_phases:
+        cycle_alignment = 'Unknown'
+    elif len(cycle_phases) == 1:
+        cycle_alignment = 'Community-Aligned'
+    else:
+        cycle_alignment = f'Unit-Specific ({len(cycle_phases)} phases)'
 
     all_pricing_dates = sorted({
         day for unit in units for day in unit['pricingDates']
     })
-    all_change_dates = _dynamic_pricing_minimum_range_dates(units)
+    shared_phase = (next(iter(cycle_phases))
+                    if cycle_alignment == 'Community-Aligned'
+                    and len(cycle_phases) == 1 else None)
+    cycle_range_units = (
+        _dynamic_pricing_cycle_range_units(
+            units, cadence_days, shared_phase=shared_phase)
+        if can_project_cycle else [])
+    cadence_spaced_dates, cadence_spacing_strict = (
+        _dynamic_pricing_cadence_spaced_range_dates(
+            cycle_range_units, cadence_days)
+        if can_project_cycle else ([], False))
+    all_change_dates = (
+        all_pricing_dates[:1] if pricing_does_not_change
+        else (cadence_spaced_dates if can_project_cycle
+              else _dynamic_pricing_minimum_range_dates(units)))
     current_calls = len(all_pricing_dates)
-    new_calls = len(all_change_dates)
+    new_calls = 1 if pricing_does_not_change else len(all_change_dates)
+    if pricing_does_not_change:
+        bootstrap_dates = all_pricing_dates[:1]
+        bootstrap_accuracy = 100.0
+        retrieval_strategy = 'One learned constant-price call'
+    elif can_project_cycle:
+        bootstrap_dates = cadence_spaced_dates
+        bootstrap_accuracy = _dynamic_pricing_range_plan_accuracy(
+            cycle_range_units, bootstrap_dates)
+        retrieval_strategy = (
+            'Cadence-spaced property range cover'
+            if cadence_spacing_strict else
+            'Exact range cover; truncated-edge spacing exception')
+    else:
+        # A phase-agnostic sparse plan is unsafe when cadence is unresolved.
+        # Retain daily retrieval as the correctness-preserving fallback.
+        bootstrap_dates = all_pricing_dates
+        bootstrap_accuracy = 100.0
+        retrieval_strategy = 'Daily fallback; cadence unresolved'
+    if bootstrap_accuracy != 100.0:
+        # A larger apparent cadence can hide shorter equal-price cycles, and
+        # malformed date gaps can violate the one-boundary assumption. Never
+        # publish an inexact sparse bootstrap plan.
+        bootstrap_dates = all_pricing_dates
+        bootstrap_accuracy = 100.0
+        retrieval_strategy = (
+            'Daily fallback; sparse cadence plan failed verification')
+    bootstrap_calls = len(bootstrap_dates)
+    _dynamic_pricing_visualizer_metadata(
+        units, cadence_days, cycle_alignment, cycle_phases, bootstrap_dates)
+
+    # Comparable price signatures are an internal verification aid, not
+    # report data. Removing them also keeps large report payloads manageable.
+    for unit in units:
+        unit.pop('_pricingSignatures', None)
+        unit.pop('_cyclePhase', None)
     return {
         'buildingId': str(community.get('BUILDING_ID') or ''),
         'buildingName': community.get('BUILDING_NAME') or '',
         'orgId': community.get('ORG_ID'),
         'orgName': community.get('ORG_NAME') or '',
         'cadenceDays': cadence_days,
-        'cadence': str(cadence_days),
+        'cadence': ('Pricing Does Not Change'
+                    if pricing_does_not_change
+                    else (str(cadence_days) if cadence_days
+                          else 'Insufficient Data')),
+        'pricingDoesNotChange': pricing_does_not_change,
+        'cadenceConfidence': cadence_confidence,
+        'cadenceEvidenceRangeCount': len(cadence_lengths),
+        'cadenceEvidenceUnitCount': cadence_evidence_units,
+        'cadenceEvidenceLengths': sorted(set(cadence_lengths)),
+        'cycleAlignment': cycle_alignment,
+        'predictableUnitCount': predictable_units,
+        'predictionCoveragePct': round(
+            100 * predictable_units / len(units), 1) if units else 0,
+        'futureUnitCount': future_units,
+        'futureStartsAtAvailabilityCount': future_starts_at_availability,
+        'alreadyAvailableUnitCount': already_units,
+        'alreadyAvailableStartsAtSyncCount': already_starts_at_sync,
         'unitCount': len(units),
         'priceChangeDates': all_change_dates,
         'newApiCalls': new_calls,
         'currentApiCalls': current_calls,
-        'apiCallsSaved': current_calls - new_calls,
-        'matrixLastUpdated': (
-            last_modified.isoformat() if hasattr(last_modified, 'isoformat')
-            else last_modified),
+        'apiCallsSaved': current_calls - bootstrap_calls,
+        'bootstrapApiCallDates': bootstrap_dates,
+        'bootstrapApiCalls': bootstrap_calls,
+        'bootstrapApiCallsSaved': current_calls - bootstrap_calls,
+        'reconstructionAccuracyPct': bootstrap_accuracy,
+        'retrievalStrategy': retrieval_strategy,
+        'cadenceKnownAtCall': 0 if cadence_days else None,
+        'latestSync': (
+            latest_sync.isoformat() if hasattr(latest_sync, 'isoformat')
+            else latest_sync),
+        'snapshotLink': snapshot_link,
         'units': units,
         'excluded': excluded,
         'error': None,
     }
 
 
-def _dynamic_pricing_fetch_community(community):
-    """GET only the latest version of a community's single matrix key."""
+def _dynamic_pricing_latest_mits_sync(community):
+    """Return the latest successful Entrata MITS snapshot name and timestamp."""
     building_id = str(community.get('BUILDING_ID') or '')
+    entity = f'building_{building_id}'
+    entity_prefix = f'{ROOT}Entrata/{entity}/'
+    snapshot = _latest_snapshot_seeked(
+        entity_prefix, _cutoff_stamps(), full_fallback=True)
+    if not snapshot:
+        return None, None, ''
     try:
-        response = s3().get_object(
-            Bucket=DYNAMIC_PRICING_BUCKET,
-            Key=f'building_{building_id}.json')
+        sync_at = _snapshot_dt(snapshot)
+    except (TypeError, ValueError):
+        return None, None, ''
+    return snapshot, sync_at, _snapshot_link(
+        entity, snapshot, community.get('ORG_ID'))
+
+
+def _dynamic_pricing_snapshot_unit_details(building_id, snapshot):
+    """Read point-in-time unit metadata from the same Entrata MITS snapshot."""
+    if not snapshot:
+        return {}
+    key = (f'{ROOT}Entrata/building_{building_id}/{snapshot}/'
+           'unit-details.json.gz')
+    try:
+        response = s3().get_object(Bucket=BUCKET, Key=key)
         raw = response['Body'].read()
         if raw[:2] == b'\x1f\x8b':
             raw = gzip_module.decompress(raw)
         payload = json.loads(raw.decode('utf-8'))
+    except Exception:
+        # Availability context is diagnostic enrichment. A valid pricing
+        # matrix remains reportable when its companion details file is absent.
+        return {}
+
+    if isinstance(payload, dict):
+        details = {}
+        for source_id, value in payload.items():
+            if not isinstance(value, dict):
+                continue
+            unit_id = value.get('id')
+            details[str(unit_id if unit_id not in (None, '') else source_id)] = value
+        return details
+    if isinstance(payload, list):
+        return {
+            str(value.get('id')): value
+            for value in payload
+            if isinstance(value, dict) and value.get('id') not in (None, '')
+        }
+    return {}
+
+
+def _dynamic_pricing_matrix_version_for_sync(key, sync_at):
+    """Find the matrix version closest to a MITS sync on the same UTC date.
+
+    Entrata writes the versioned dynamic-pricing object immediately after its
+    MITS snapshot. Restricting the match to the sync's UTC calendar date avoids
+    silently substituting a newer matrix when a community has stopped syncing.
+    """
+    target_date = sync_at.astimezone(timezone.utc).date()
+    kwargs = {
+        'Bucket': DYNAMIC_PRICING_BUCKET,
+        'Prefix': key,
+        'MaxKeys': PAGE_SIZE,
+    }
+    best = None
+    while True:
+        response = s3().list_object_versions(**kwargs)
+        page_dates = []
+        for version in response.get('Versions', []):
+            if version.get('Key') != key:
+                continue
+            modified = version.get('LastModified')
+            if not isinstance(modified, datetime):
+                continue
+            if modified.tzinfo is None:
+                modified = modified.replace(tzinfo=timezone.utc)
+            modified = modified.astimezone(timezone.utc)
+            page_dates.append(modified.date())
+            if modified.date() != target_date:
+                continue
+            # Prefer the smallest timestamp gap. An equally close post-sync
+            # version wins because pricing matrices are normally written just
+            # after the MITS snapshot is committed.
+            rank = (abs((modified - sync_at).total_seconds()),
+                    modified < sync_at, modified)
+            if best is None or rank < best[0]:
+                best = (rank, version)
+
+        # Versions are returned newest first. Once a page has crossed below
+        # the target date, no later page can contain a same-day candidate.
+        if page_dates and min(page_dates) < target_date:
+            break
+        if not response.get('IsTruncated'):
+            break
+        kwargs['KeyMarker'] = response.get('NextKeyMarker')
+        next_version_marker = response.get('NextVersionIdMarker')
+        if next_version_marker:
+            kwargs['VersionIdMarker'] = next_version_marker
+    return best[1] if best else None
+
+
+def _dynamic_pricing_fetch_community(community):
+    """GET the matrix version corresponding to the latest Entrata MITS sync."""
+    building_id = str(community.get('BUILDING_ID') or '')
+    latest_sync = None
+    snapshot_link = ''
+    try:
+        snapshot, latest_sync, snapshot_link = (
+            _dynamic_pricing_latest_mits_sync(community))
+        if latest_sync is None:
+            return {
+                'buildingId': building_id,
+                'buildingName': community.get('BUILDING_NAME') or '',
+                'excluded': True,
+                'error': None,
+            }
+        key = f'building_{building_id}.json'
+        version = _dynamic_pricing_matrix_version_for_sync(key, latest_sync)
+        if version is None:
+            return {
+                'buildingId': building_id,
+                'buildingName': community.get('BUILDING_NAME') or '',
+                'excluded': True,
+                'error': None,
+            }
+        response = s3().get_object(
+            Bucket=DYNAMIC_PRICING_BUCKET,
+            Key=key,
+            VersionId=version['VersionId'])
+        raw = response['Body'].read()
+        if raw[:2] == b'\x1f\x8b':
+            raw = gzip_module.decompress(raw)
+        payload = json.loads(raw.decode('utf-8'))
+        unit_details = _dynamic_pricing_snapshot_unit_details(
+            building_id, snapshot)
         return _dynamic_pricing_analyze_payload(
-            community, payload, response.get('LastModified'))
+            community, payload, latest_sync, snapshot_link, unit_details)
     except ClientError as exc:
         code = str((exc.response.get('Error') or {}).get('Code') or '')
         if code in ('NoSuchKey', '404', 'NotFound'):
@@ -4672,7 +5361,10 @@ def _dynamic_pricing_fetch_community(community):
             'newApiCalls': 0,
             'currentApiCalls': 0,
             'apiCallsSaved': 0,
-            'matrixLastUpdated': None,
+            'latestSync': (
+                latest_sync.isoformat()
+                if hasattr(latest_sync, 'isoformat') else latest_sync),
+            'snapshotLink': snapshot_link,
             'units': [],
             'excluded': False,
             'error': str(exc),
@@ -4697,7 +5389,10 @@ def _dynamic_pricing_fetch_community(community):
             'newApiCalls': 0,
             'currentApiCalls': 0,
             'apiCallsSaved': 0,
-            'matrixLastUpdated': None,
+            'latestSync': (
+                latest_sync.isoformat()
+                if hasattr(latest_sync, 'isoformat') else latest_sync),
+            'snapshotLink': snapshot_link,
             'units': [],
             'excluded': False,
             'error': str(exc),
@@ -4719,6 +5414,7 @@ def _dynamic_pricing_apply_unit_numbers(rows):
         for row in rows
         for unit in (row.get('units') or [])
         if str(unit.get('sourceUnitId') or '').isdigit()
+        and str(unit.get('unitId') or '') == str(unit.get('sourceUnitId') or '')
     })
     number_by_id = {}
     chunk_size = 1000
@@ -4741,15 +5437,23 @@ def _dynamic_pricing_apply_unit_numbers(rows):
             unit['unitId'] = number_by_id.get(source_id, unit['unitId'])
 
 
-def _run_dynamic_pricing_job(job_id: str, limit: int):
+def _run_dynamic_pricing_job(job_id: str, limit: int, org_ids=None):
     try:
         _job_update(job_id, note='Finding Entrata communities in Snowflake…')
+        org_ids = org_ids or []
+        org_filter = ''
+        if org_ids:
+            placeholders = ', '.join('%s' for _ in org_ids)
+            org_filter = f'AND b.ORG_ID IN ({placeholders})'
         communities = snowflake_db.query(
-            _DYNAMIC_PRICING_COMMUNITIES_SQL.format(limit=int(limit)),
+            _DYNAMIC_PRICING_COMMUNITIES_SQL.format(
+                org_filter=org_filter, limit=int(limit)),
+            params=org_ids or None,
             timeout=SYNC_ISSUES_QUERY_TIMEOUT)
         total = len(communities)
         _job_update(job_id, total=total,
-                    note=f'Loading the latest pricing matrix for {total} communities…')
+                    note=(f'Matching the latest successful MITS sync to a pricing '
+                          f'matrix for {total} communities…'))
 
         rows = []
         progress = {'done': 0, 'excluded': 0}
@@ -6103,7 +6807,7 @@ def sync_issues_analyze():
 
 @app.route('/api/dynamic-pricing/analyze', methods=['POST'])
 def dynamic_pricing_analyze():
-    """Analyze the latest pricing matrix for dynamic-pricing Entrata sites."""
+    """Analyze the pricing matrix matched to each site's latest MITS sync."""
     body = request.get_json(silent=True) or {}
     try:
         limit = int(body.get('limit', 25))
@@ -6115,10 +6819,30 @@ def dynamic_pricing_analyze():
                       f'{DYNAMIC_PRICING_MAX_COMMUNITIES}')
         }), 400
 
+    raw_org_ids = body.get('orgIds', [])
+    if raw_org_ids in (None, ''):
+        raw_org_ids = []
+    if not isinstance(raw_org_ids, list) or len(raw_org_ids) > 5000:
+        return jsonify({
+            'error': 'orgIds must be a list of at most 5,000 organization IDs'
+        }), 400
+    org_ids = []
+    seen_org_ids = set()
+    for value in raw_org_ids:
+        text = str(value).strip()
+        if not re.fullmatch(r'\d+', text) or int(text) <= 0:
+            return jsonify({
+                'error': 'orgIds must contain only positive integer organization IDs'
+            }), 400
+        org_id = int(text)
+        if org_id not in seen_org_ids:
+            seen_org_ids.add(org_id)
+            org_ids.append(org_id)
+
     job_id = _job_new('dynamic_pricing', '', total=0)
     threading.Thread(
         target=_run_dynamic_pricing_job,
-        args=(job_id, limit),
+        args=(job_id, limit, org_ids),
         daemon=True,
     ).start()
     return jsonify({'jobId': job_id})
