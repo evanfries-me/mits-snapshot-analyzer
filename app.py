@@ -43,6 +43,10 @@ REGION    = 'us-west-2'
 BUCKET    = 'elise-snapshots'
 ROOT      = 'elise-mits/'
 PAGE_SIZE = 1000    # S3 max items per API call (hard limit)
+DYNAMIC_PRICING_BUCKET = os.environ.get(
+    'DYNAMIC_PRICING_BUCKET', 'elise-dynamic-pricing')
+DYNAMIC_PRICING_MAX_COMMUNITIES = 5000
+DYNAMIC_PRICING_WORKERS = 16
 
 INDEX_DIR     = os.path.join(os.path.dirname(os.path.abspath(__file__)), 'index')
 INDEX_WORKERS = 64  # parallel LISTs while indexing
@@ -4361,7 +4365,8 @@ def _sync_issues_building_detail(sync, integration=None, snapshot=None,
                                  skip_reason=None, stage_9=0, analyzed=0,
                                  reasons=None, units=None, reasons_new=None,
                                  newly_marked=0, baseline_snapshot=None,
-                                 baseline_available=False):
+                                 baseline_available=False,
+                                 excluded_from_issues=False):
     """Shape one building's analysis outcome for the per-sync expand view."""
     reasons     = reasons or {}
     reasons_new = reasons_new or {}
@@ -4379,6 +4384,10 @@ def _sync_issues_building_detail(sync, integration=None, snapshot=None,
         'snapshot':     snapshot,
         'status':       'skipped' if skip_reason else 'ok',
         'skipReason':   skip_reason,
+        # Some Snowflake candidates cannot be verified as sync issues from
+        # MITS alone.  In particular, without a pre-sync snapshot there is no
+        # evidence that the analysed sync newly caused the unavailable state.
+        'excludedFromIssues': bool(excluded_from_issues),
         'unavailableUnits':  stage_9,
         'newlyMarkedUnits':  newly_marked,
         'preExistingUnits':  max(0, stage_9 - newly_marked),
@@ -4392,6 +4401,408 @@ def _sync_issues_building_detail(sync, integration=None, snapshot=None,
         'reportedUnitsBeforeSync':   sync.get('TOTAL_UNITS_BEFORE_SYNC'),
         'reasons': rows,
     }
+
+
+# ── Dynamic Pricing Cadence ──────────────────────────────────────────────────
+
+_DYNAMIC_PRICING_COMMUNITIES_SQL = """\
+WITH dynamic_pricing_flags AS (
+    SELECT ID, ID_TYPE, VALUE
+    FROM ELISE.FANSCAN_PUBLIC.CONVERSATION_FEATURE_FLAGS
+    WHERE FEATURE_FLAG_NAME = 'leasing_dynamic_pricing'
+        AND COALESCE(_FIVETRAN_DELETED, FALSE) = FALSE
+)
+SELECT
+    b.ID AS BUILDING_ID,
+    b.BUILDING_NAME,
+    b.ORG_ID,
+    b.ORG_NAME
+FROM ELISE.DA.DIM_BUILDINGS AS b
+LEFT JOIN dynamic_pricing_flags AS building_flag
+    ON building_flag.ID_TYPE = 'building'
+    AND TRY_TO_NUMBER(building_flag.ID) = b.ID
+LEFT JOIN dynamic_pricing_flags AS org_flag
+    ON org_flag.ID_TYPE = 'organization'
+    AND TRY_TO_NUMBER(org_flag.ID) = b.ORG_ID
+LEFT JOIN dynamic_pricing_flags AS default_flag
+    ON default_flag.ID_TYPE = 'default'
+WHERE COALESCE(
+        building_flag.VALUE, org_flag.VALUE, default_flag.VALUE, FALSE) = TRUE
+    AND b.IS_ACTIVE = TRUE
+    AND COALESCE(b.IS_TEST, FALSE) = FALSE
+    AND UPPER(COALESCE(
+        b.PRICING_USED, b.PMS_USED_NAME, b.CRM_USED_NAME, '')) = 'ENTRATA'
+ORDER BY b.ID
+LIMIT {limit}
+"""
+
+
+def _dynamic_pricing_iso_date(value):
+    """Return YYYY-MM-DD for one matrix date, or None when it is invalid."""
+    text = str(value or '').strip()
+    if not text:
+        return None
+    try:
+        return date.fromisoformat(text[:10]).isoformat()
+    except ValueError:
+        for fmt in ('%m/%d/%Y', '%m/%d/%y'):
+            try:
+                return datetime.strptime(text, fmt).date().isoformat()
+            except ValueError:
+                continue
+    return None
+
+
+def _dynamic_pricing_signature(prices):
+    """Comparable lease-term/rent signature for one availability date."""
+    signature = []
+    for price in prices:
+        if not isinstance(price, dict):
+            continue
+        term = price.get('leaseTermLength')
+        rent = price.get('rent')
+        try:
+            rent = float(rent)
+        except (TypeError, ValueError):
+            rent = str(rent or '')
+        signature.append((str(term or ''), rent))
+    return tuple(sorted(signature, key=lambda item: (item[0], str(item[1]))))
+
+
+def _dynamic_pricing_unit_result(matrix, ordinal):
+    """Extract dated prices and the shortest observed price-change interval."""
+    if not isinstance(matrix, dict):
+        return None
+    price_matrix = matrix.get('priceMatrix') or {}
+    prices = price_matrix.get('prices') if isinstance(price_matrix, dict) else []
+    if not isinstance(prices, list):
+        prices = []
+
+    by_date = {}
+    for price in prices:
+        if not isinstance(price, dict):
+            continue
+        day = _dynamic_pricing_iso_date(price.get('dateAvailable'))
+        if day:
+            by_date.setdefault(day, []).append(price)
+    pricing_dates = sorted(by_date)
+    if not pricing_dates:
+        return None
+
+    change_dates = []
+    previous = None
+    for day in pricing_dates:
+        signature = _dynamic_pricing_signature(by_date[day])
+        if previous is None or signature != previous:
+            change_dates.append(day)
+        previous = signature
+
+    observed_gaps = [
+        (date.fromisoformat(current) - date.fromisoformat(previous_day)).days
+        for previous_day, current in zip(change_dates, change_dates[1:])
+    ]
+    cadence_days = min(observed_gaps) if observed_gaps else None
+    source_unit_id = matrix.get('unitId') or matrix.get('id')
+    unit_id = (matrix.get('unitNumber') or matrix.get('apartmentName')
+               or source_unit_id or f'Unit {ordinal}')
+    return {
+        'unitId': str(unit_id),
+        'sourceUnitId': (
+            str(source_unit_id) if source_unit_id not in (None, '') else None),
+        'cadenceDays': cadence_days,
+        'cadence': str(cadence_days) if cadence_days is not None else None,
+        'cadencePattern': observed_gaps,
+        'pricingDates': pricing_dates,
+        'pricingDateCount': len(pricing_dates),
+        # Retained for transparency in the unit drilldown. The report's final
+        # change dates are cadence-spaced in the community-level second pass.
+        'observedChangeDates': change_dates,
+    }
+
+
+def _dynamic_pricing_min_date_gap(units):
+    """Fallback cadence when prices never differ: shortest retrieved interval."""
+    gaps = []
+    for unit in units:
+        pricing_dates = unit.get('pricingDates') or []
+        gaps.extend(
+            (date.fromisoformat(current) - date.fromisoformat(previous)).days
+            for previous, current in zip(pricing_dates, pricing_dates[1:])
+        )
+    return min((gap for gap in gaps if gap > 0), default=1)
+
+
+def _dynamic_pricing_cadence_ranges(pricing_dates, cadence_days):
+    """Partition a unit's pricing horizon into inclusive cadence-day ranges."""
+    if not pricing_dates:
+        return []
+    start = date.fromisoformat(pricing_dates[0])
+    final = date.fromisoformat(pricing_dates[-1])
+    ranges = []
+    while start <= final:
+        end = min(start + timedelta(days=cadence_days - 1), final)
+        ranges.append({'start': start.isoformat(), 'end': end.isoformat()})
+        start = end + timedelta(days=1)
+    return ranges
+
+
+def _dynamic_pricing_minimum_range_dates(units):
+    """Return a minimum set of dates intersecting every unit pricing range.
+
+    For intervals, greedily choosing the earliest uncovered range's end date
+    is optimal: that point also covers every later-ending range containing it.
+    """
+    ranges = []
+    for unit in units:
+        for price_range in unit.get('priceRanges') or []:
+            try:
+                start = date.fromisoformat(price_range['start'])
+                end = date.fromisoformat(price_range['end'])
+            except (KeyError, TypeError, ValueError):
+                continue
+            ranges.append((end, start))
+    ranges.sort()
+
+    selected = []
+    selected_day = None
+    for end, start in ranges:
+        if selected_day is None or not start <= selected_day <= end:
+            selected_day = end
+            selected.append(selected_day.isoformat())
+    return selected
+
+
+def _dynamic_pricing_analyze_payload(community, payload, last_modified=None):
+    """Summarize the most recent S3 matrix for one Entrata community."""
+    matrices = payload.get('priceMatrices') if isinstance(payload, dict) else []
+    if not isinstance(matrices, list):
+        matrices = []
+    valid_value = payload.get('isValid', True) if isinstance(payload, dict) else False
+    payload_valid = (
+        valid_value is True
+        or str(valid_value).strip().casefold() in ('true', '1', 'yes')
+    )
+    units = []
+    for ordinal, matrix in enumerate(matrices, 1):
+        unit = _dynamic_pricing_unit_result(matrix, ordinal)
+        if unit:
+            units.append(unit)
+
+    # A matrix with no forward-looking range offers no cadence or API-call
+    # savings to analyze. Exclude the community when every unit has at most
+    # its initial pricing day.
+    excluded = not payload_valid or not units or all(
+        unit['pricingDateCount'] <= 1 for unit in units)
+
+    observed_cadences = [
+        unit['cadenceDays'] for unit in units
+        if unit.get('cadenceDays') is not None
+    ]
+    cadence_days = (min(observed_cadences) if observed_cadences
+                    else _dynamic_pricing_min_date_gap(units))
+
+    # Apply the community's minimum cadence to every unit. Each range covers
+    # one cadence period, except the final truncated range at the end of that
+    # unit's retrieved pricing horizon.
+    for unit in units:
+        unit['cadenceDays'] = cadence_days
+        unit['cadence'] = str(cadence_days)
+        unit['priceRanges'] = _dynamic_pricing_cadence_ranges(
+            unit['pricingDates'], cadence_days)
+        unit['priceRangeCount'] = len(unit['priceRanges'])
+
+    all_pricing_dates = sorted({
+        day for unit in units for day in unit['pricingDates']
+    })
+    all_change_dates = _dynamic_pricing_minimum_range_dates(units)
+    current_calls = len(all_pricing_dates)
+    new_calls = len(all_change_dates)
+    return {
+        'buildingId': str(community.get('BUILDING_ID') or ''),
+        'buildingName': community.get('BUILDING_NAME') or '',
+        'orgId': community.get('ORG_ID'),
+        'orgName': community.get('ORG_NAME') or '',
+        'cadenceDays': cadence_days,
+        'cadence': str(cadence_days),
+        'unitCount': len(units),
+        'priceChangeDates': all_change_dates,
+        'newApiCalls': new_calls,
+        'currentApiCalls': current_calls,
+        'apiCallsSaved': current_calls - new_calls,
+        'matrixLastUpdated': (
+            last_modified.isoformat() if hasattr(last_modified, 'isoformat')
+            else last_modified),
+        'units': units,
+        'excluded': excluded,
+        'error': None,
+    }
+
+
+def _dynamic_pricing_fetch_community(community):
+    """GET only the latest version of a community's single matrix key."""
+    building_id = str(community.get('BUILDING_ID') or '')
+    try:
+        response = s3().get_object(
+            Bucket=DYNAMIC_PRICING_BUCKET,
+            Key=f'building_{building_id}.json')
+        raw = response['Body'].read()
+        if raw[:2] == b'\x1f\x8b':
+            raw = gzip_module.decompress(raw)
+        payload = json.loads(raw.decode('utf-8'))
+        return _dynamic_pricing_analyze_payload(
+            community, payload, response.get('LastModified'))
+    except ClientError as exc:
+        code = str((exc.response.get('Error') or {}).get('Code') or '')
+        if code in ('NoSuchKey', '404', 'NotFound'):
+            return {
+                'buildingId': building_id,
+                'buildingName': community.get('BUILDING_NAME') or '',
+                'excluded': True,
+                'error': None,
+            }
+        return {
+            'buildingId': building_id,
+            'buildingName': community.get('BUILDING_NAME') or '',
+            'orgId': community.get('ORG_ID'),
+            'orgName': community.get('ORG_NAME') or '',
+            'cadenceDays': None,
+            'cadence': 'Unavailable',
+            'unitCount': 0,
+            'priceChangeDates': [],
+            'newApiCalls': 0,
+            'currentApiCalls': 0,
+            'apiCallsSaved': 0,
+            'matrixLastUpdated': None,
+            'units': [],
+            'excluded': False,
+            'error': str(exc),
+        }
+    except (ValueError, TypeError, UnicodeError, gzip_module.BadGzipFile):
+        return {
+            'buildingId': building_id,
+            'buildingName': community.get('BUILDING_NAME') or '',
+            'excluded': True,
+            'error': None,
+        }
+    except Exception as exc:
+        return {
+            'buildingId': building_id,
+            'buildingName': community.get('BUILDING_NAME') or '',
+            'orgId': community.get('ORG_ID'),
+            'orgName': community.get('ORG_NAME') or '',
+            'cadenceDays': None,
+            'cadence': 'Unavailable',
+            'unitCount': 0,
+            'priceChangeDates': [],
+            'newApiCalls': 0,
+            'currentApiCalls': 0,
+            'apiCallsSaved': 0,
+            'matrixLastUpdated': None,
+            'units': [],
+            'excluded': False,
+            'error': str(exc),
+        }
+
+
+def _dynamic_pricing_sorted_rows(rows):
+    return sorted(rows, key=lambda row: (
+        -(row.get('apiCallsSaved') or 0),
+        (row.get('buildingName') or '').casefold(),
+        row.get('buildingId') or '',
+    ))
+
+
+def _dynamic_pricing_apply_unit_numbers(rows):
+    """Replace matrix unit IDs with unit numbers from Snowflake in batches."""
+    source_ids = sorted({
+        int(unit['sourceUnitId'])
+        for row in rows
+        for unit in (row.get('units') or [])
+        if str(unit.get('sourceUnitId') or '').isdigit()
+    })
+    number_by_id = {}
+    chunk_size = 1000
+    for offset in range(0, len(source_ids), chunk_size):
+        chunk = source_ids[offset:offset + chunk_size]
+        placeholders = ', '.join('%s' for _ in chunk)
+        mapped = snowflake_db.query(
+            'SELECT ID AS UNIT_ID, UNIT_NUMBER '
+            'FROM ELISE.FANSCAN_LOGICAL_PUBLIC.UNIT_DETAILS '
+            f'WHERE ID IN ({placeholders})',
+            params=chunk,
+            timeout=SYNC_ISSUES_QUERY_TIMEOUT)
+        for item in mapped:
+            unit_number = item.get('UNIT_NUMBER')
+            if unit_number not in (None, ''):
+                number_by_id[str(item.get('UNIT_ID'))] = str(unit_number)
+    for row in rows:
+        for unit in (row.get('units') or []):
+            source_id = str(unit.get('sourceUnitId') or '')
+            unit['unitId'] = number_by_id.get(source_id, unit['unitId'])
+
+
+def _run_dynamic_pricing_job(job_id: str, limit: int):
+    try:
+        _job_update(job_id, note='Finding Entrata communities in Snowflake…')
+        communities = snowflake_db.query(
+            _DYNAMIC_PRICING_COMMUNITIES_SQL.format(limit=int(limit)),
+            timeout=SYNC_ISSUES_QUERY_TIMEOUT)
+        total = len(communities)
+        _job_update(job_id, total=total,
+                    note=f'Loading the latest pricing matrix for {total} communities…')
+
+        rows = []
+        progress = {'done': 0, 'excluded': 0}
+        lock = threading.Lock()
+
+        def fetch(community):
+            row = _dynamic_pricing_fetch_community(community)
+            with lock:
+                progress['done'] += 1
+                if row.get('excluded'):
+                    progress['excluded'] += 1
+                else:
+                    rows.append(row)
+                done = progress['done']
+                ordered = _dynamic_pricing_sorted_rows(rows)
+                errors = sum(1 for item in rows if item.get('error'))
+                _job_update(job_id, done=done, result={
+                    'partial': True,
+                    'rows': ordered,
+                    'communities': total,
+                    'analyzed': done,
+                    'excluded': progress['excluded'],
+                    'errors': errors,
+                }, note=f'{done}/{total} communities analyzed')
+
+        max_workers = min(DYNAMIC_PRICING_WORKERS, max(total, 1))
+        with ThreadPoolExecutor(max_workers=max_workers) as pool:
+            list(pool.map(fetch, communities))
+
+        unit_number_error = None
+        try:
+            _job_update(job_id, note='Resolving unit numbers in Snowflake…')
+            _dynamic_pricing_apply_unit_numbers(rows)
+        except Exception as exc:
+            # The report remains useful with matrix IDs if this optional label
+            # lookup fails, so keep the successfully analyzed pricing rows.
+            unit_number_error = str(exc)
+
+        ordered = _dynamic_pricing_sorted_rows(rows)
+        errors = sum(1 for item in ordered if item.get('error'))
+        _job_update(job_id, status='done', done=total,
+                    finished=time.time(), result={
+                        'partial': False,
+                        'rows': ordered,
+                        'communities': total,
+                        'analyzed': total,
+                        'excluded': progress['excluded'],
+                        'errors': errors,
+                        'unitNumberError': unit_number_error,
+                    }, note=f'{total} communities analyzed')
+    except Exception as exc:
+        _job_update(job_id, status='error', error=str(exc),
+                    finished=time.time())
 
 
 def _run_sync_issues_analyze_job(job_id: str, syncs: list):
@@ -4534,7 +4945,9 @@ def _run_sync_issues_analyze_job(job_id: str, syncs: list):
                     units=local_units, reasons_new=local_reasons_new,
                     newly_marked=local_new,
                     baseline_snapshot=baseline_snapshot,
-                    baseline_available=baseline_available)
+                    baseline_available=baseline_available,
+                    excluded_from_issues=(
+                        skip_reason == 'No pre-sync snapshot found'))
 
                 # Publish a live partial result on every completion so the
                 # frontend can render an updating distribution table.
@@ -4808,6 +5221,14 @@ def _run_sync_issues_analyze_job(job_id: str, syncs: list):
                     except Exception:
                         baseline_stage9 = None
                         baseline_snapshot = None
+
+            # A pre-sync snapshot is required to establish that this sync
+            # newly caused the unavailable state.  Without that baseline the
+            # Snowflake row is only an unverified candidate, not a Sync Issue.
+            if baseline_stage9 is None:
+                _finish(sync, intg=integration, snapshot=snapshot,
+                        skip_reason='No pre-sync snapshot found')
+                return
 
             # ── Run availability rules ────────────────────────────────────────
             ref_date = (snap_dt.date() if snap_dt
@@ -5675,6 +6096,29 @@ def sync_issues_analyze():
     threading.Thread(
         target=_run_sync_issues_analyze_job,
         args=(job_id, syncs),
+        daemon=True,
+    ).start()
+    return jsonify({'jobId': job_id})
+
+
+@app.route('/api/dynamic-pricing/analyze', methods=['POST'])
+def dynamic_pricing_analyze():
+    """Analyze the latest pricing matrix for dynamic-pricing Entrata sites."""
+    body = request.get_json(silent=True) or {}
+    try:
+        limit = int(body.get('limit', 25))
+    except (TypeError, ValueError):
+        return jsonify({'error': 'limit must be an integer'}), 400
+    if not (1 <= limit <= DYNAMIC_PRICING_MAX_COMMUNITIES):
+        return jsonify({
+            'error': ('limit must be between 1 and '
+                      f'{DYNAMIC_PRICING_MAX_COMMUNITIES}')
+        }), 400
+
+    job_id = _job_new('dynamic_pricing', '', total=0)
+    threading.Thread(
+        target=_run_dynamic_pricing_job,
+        args=(job_id, limit),
         daemon=True,
     ).start()
     return jsonify({'jobId': job_id})

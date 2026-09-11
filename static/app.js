@@ -54,6 +54,13 @@ const search = {
 
 const historyState = { entries: [] };
 
+const dynamicPricing = {
+  jobId: null,
+  polling: null,
+  result: null,
+  open: new Set(),
+};
+
 let csvTable = null;
 let csvTableToken = 0;
 let csvFilterTimer = null;
@@ -100,6 +107,11 @@ window.addEventListener('DOMContentLoaded', () => {
   document.getElementById('btn-stop-availability').addEventListener('click', stopAvailabilityAgent);
   document.getElementById('btn-agent-index').addEventListener('click', buildAgentIndex);
   document.getElementById('btn-run-sync-query').addEventListener('click', runSyncIssuesQuery);
+  document.getElementById('btn-run-dynamic-pricing').addEventListener('click', runDynamicPricing);
+  document.getElementById('dp-preview-body').addEventListener('click', ev => {
+    const btn = ev.target.closest('.dp-expand');
+    if (btn) dpToggleCommunity(btn.dataset.bid);
+  });
   // The syncs table is re-rendered on every query, so delegate the expand click.
   const siBody = document.getElementById('si-preview-body');
   siBody.addEventListener('click', ev => {
@@ -380,7 +392,7 @@ async function tryConnect() {
 
 // ── Mode switching ────────────────────────────────────────────────────────────
 function setMode(mode) {
-  if (!['search', 'availability', 'sync-issues'].includes(mode)) mode = 'search';
+  if (!['search', 'availability', 'sync-issues', 'dynamic-pricing'].includes(mode)) mode = 'search';
   state.mode = mode;
   document.querySelectorAll('.mode-tab').forEach(t =>
     t.classList.toggle('active', t.dataset.mode === mode)
@@ -388,12 +400,15 @@ function setMode(mode) {
   document.getElementById('pane-search').classList.toggle('active', mode === 'search');
   document.getElementById('pane-availability').classList.toggle('active', mode === 'availability');
   document.getElementById('pane-sync-issues').classList.toggle('active', mode === 'sync-issues');
+  document.getElementById('pane-dynamic-pricing').classList.toggle('active', mode === 'dynamic-pricing');
 
   // Show/hide the right-side preview areas
   const isSI = mode === 'sync-issues';
-  document.getElementById('preview-header').style.display = isSI ? 'none' : '';
-  document.getElementById('preview-content').style.display = isSI ? 'none' : '';
+  const isDP = mode === 'dynamic-pricing';
+  document.getElementById('preview-header').style.display = (isSI || isDP) ? 'none' : '';
+  document.getElementById('preview-content').style.display = (isSI || isDP) ? 'none' : '';
   document.getElementById('si-preview').style.display     = isSI ? 'flex' : 'none';
+  document.getElementById('dp-preview').style.display     = isDP ? 'flex' : 'none';
 }
 
 // ── Explore mode ──────────────────────────────────────────────────────────────
@@ -2530,6 +2545,235 @@ function escRegex(s) {
   return String(s).replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
 }
 
+// ── Dynamic Pricing Cadence ─────────────────────────────────────────────────
+
+function dpSetStatus(message, isError = false) {
+  const el = document.getElementById('dp-status');
+  el.textContent = message;
+  el.style.color = isError ? '#f85149' : '#8b949e';
+}
+
+function dpFormatShortDate(value) {
+  const match = String(value || '').match(/^(\d{4})-(\d{2})-(\d{2})/);
+  return match ? `${Number(match[2])}/${Number(match[3])}` : String(value || '—');
+}
+
+function dpFormatTimestamp(value) {
+  if (!value) return '—';
+  const parsed = new Date(value);
+  return Number.isNaN(parsed.getTime()) ? String(value) : parsed.toLocaleString();
+}
+
+function dpDatesHtml(dates) {
+  const values = dates || [];
+  if (!values.length) return '<span class="si-pending">none</span>';
+  return values.map(day => esc(dpFormatShortDate(day))).join(', ');
+}
+
+function dpCadenceHtml(row) {
+  if (row.cadenceDays != null) {
+    return `<span class="dp-cadence-common">${esc(String(row.cadenceDays))}</span>`;
+  }
+  return `<span class="si-pending">${esc(row.cadence || '—')}</span>`;
+}
+
+function dpRangeText(priceRange) {
+  const start = priceRange?.start;
+  const end = priceRange?.end;
+  if (!start) return '';
+  if (!end || end === start) return dpFormatShortDate(start);
+  return `${dpFormatShortDate(start)}–${dpFormatShortDate(end)}`;
+}
+
+function dpRangesHtml(ranges) {
+  const values = (ranges || []).map(dpRangeText).filter(Boolean);
+  return values.length ? esc(values.join(', ')) : '<span class="si-pending">none</span>';
+}
+
+function dpPerUnitRangesHtml(row) {
+  const units = row.units || [];
+  if (!units.length) return '<span class="si-pending">none</span>';
+  const lines = units.map(unit => {
+    return `<div class="dp-unit-date-line"><strong>${esc(unit.unitId)}:</strong> ${dpRangesHtml(unit.priceRanges)}</div>`;
+  }).join('');
+  return `<details class="dp-dates dp-per-unit"><summary>${units.length} units</summary>`
+    + `<div class="dp-date-list">${lines}</div></details>`;
+}
+
+function dpUnitDetailHtml(row) {
+  if (row.error) {
+    return `<div class="dp-error">Could not read the latest matrix: ${esc(row.error)}</div>`;
+  }
+  if (!(row.units || []).length) {
+    return '<div class="si-pending">The latest matrix contains no dated unit pricing.</div>';
+  }
+  const unitRows = row.units.map(unit => {
+    const cadence = unit.cadenceDays != null ? String(unit.cadenceDays) : unit.cadence;
+    const observedGaps = [...new Set(unit.cadencePattern || [])].sort((a, b) => a - b);
+    const pattern = observedGaps.length > 1
+      ? ` (observed gaps: ${observedGaps.join(', ')} days)`
+      : '';
+    return `<tr>
+      <td class="si-mono">${esc(unit.unitId)}</td>
+      <td>${esc(cadence || '—')}${esc(pattern)}</td>
+      <td class="dp-num">${unit.pricingDateCount || 0}</td>
+      <td class="dp-num">${unit.priceRangeCount || 0}</td>
+      <td class="dp-dates">${dpRangesHtml(unit.priceRanges)}</td>
+    </tr>`;
+  }).join('');
+  return `<table class="dp-table dp-unit-table">
+    <thead><tr>
+      <th>Unit</th><th>Cadence (Days)</th><th class="dp-num">Pricing Dates</th>
+      <th class="dp-num">Price Ranges</th><th>Unit Price Ranges</th>
+    </tr></thead>
+    <tbody>${unitRows}</tbody>
+  </table>`;
+}
+
+function dpRenderResult(result, isPartial = false) {
+  dynamicPricing.result = result || {};
+  const rows = dynamicPricing.result.rows || [];
+  const body = document.getElementById('dp-preview-body');
+  const status = document.getElementById('dp-preview-status');
+  const analyzed = dynamicPricing.result.analyzed || 0;
+  const total = dynamicPricing.result.communities || 0;
+  status.textContent = isPartial ? `${analyzed} / ${total} analyzed` : `${total} communities`;
+
+  if (!rows.length) {
+    body.innerHTML = `<div class="pane-msg">${isPartial
+      ? 'Loading the latest pricing matrices…'
+      : (dynamicPricing.result.excluded
+          ? 'All matched communities were excluded because they had no valid multi-day pricing matrix.'
+          : 'No active Entrata communities with dynamic pricing were found.')}</div>`;
+    return;
+  }
+
+  const totalCurrent = rows.reduce((sum, row) => sum + (row.currentApiCalls || 0), 0);
+  const totalNew = rows.reduce((sum, row) => sum + (row.newApiCalls || 0), 0);
+  const totalSaved = rows.reduce((sum, row) => sum + (row.apiCallsSaved || 0), 0);
+  const tableRows = rows.map(row => {
+    const bid = String(row.buildingId || '');
+    const isOpen = dynamicPricing.open.has(bid);
+    const dates = row.priceChangeDates || [];
+    const dateCell = dates.length
+      ? `<details class="dp-dates"><summary>${dates.length} API call dates</summary>`
+        + `<div class="dp-date-list">${dpDatesHtml(dates)}</div></details>`
+      : '<span class="si-pending">none</span>';
+    return `<tr class="dp-community-row" data-bid="${esc(bid)}">
+      <td><button class="dp-expand" data-bid="${esc(bid)}" aria-expanded="${isOpen}">${isOpen ? '▼' : '▶'}</button></td>
+      <td>${esc(row.orgName || '—')}</td>
+      <td>${esc(row.buildingName || '—')}</td>
+      <td class="si-mono">${esc(bid)}</td>
+      <td>${row.error ? '<span class="dp-error">Error</span>' : dpCadenceHtml(row)}</td>
+      <td class="dp-num">${row.unitCount || 0}</td>
+      <td>${dateCell}</td>
+      <td class="dp-num">${row.newApiCalls || 0}</td>
+      <td>${dpPerUnitRangesHtml(row)}</td>
+      <td class="dp-num">${row.currentApiCalls || 0}</td>
+      <td class="dp-num dp-saved">${row.apiCallsSaved || 0}</td>
+      <td>${esc(dpFormatTimestamp(row.matrixLastUpdated))}</td>
+    </tr>
+    <tr class="dp-detail-row" data-bid="${esc(bid)}"${isOpen ? '' : ' hidden'}>
+      <td colspan="12"><div class="dp-unit-detail">${isOpen ? dpUnitDetailHtml(row) : ''}</div></td>
+    </tr>`;
+  }).join('');
+
+  body.innerHTML = `<div class="dp-summary">
+      <span>${rows.length} loaded</span>
+      <span>${totalNew} new API calls</span>
+      <span>${totalCurrent} current API calls</span>
+      <span>${totalSaved} API calls saved</span>
+      ${dynamicPricing.result.excluded ? `<span>${dynamicPricing.result.excluded} invalid or single-day communities excluded</span>` : ''}
+      ${dynamicPricing.result.errors ? `<span style="color:#f85149">${dynamicPricing.result.errors} errors</span>` : ''}
+      ${dynamicPricing.result.unitNumberError ? '<span style="color:#d29922">Unit numbers unavailable; showing matrix IDs</span>' : ''}
+    </div>
+    <div class="dp-table-wrap"><table class="dp-table">
+      <thead><tr>
+        <th></th><th>Organization</th><th>Community</th><th>Building ID</th>
+        <th>Cadence (Days)</th><th class="dp-num">Units</th><th>Price Change Dates</th>
+        <th class="dp-num">New API Calls</th><th>Price Ranges Per Unit</th>
+        <th class="dp-num">Current API Calls</th><th class="dp-num">API Calls Saved</th>
+        <th>Latest Matrix</th>
+      </tr></thead>
+      <tbody>${tableRows}</tbody>
+    </table></div>`;
+}
+
+function dpToggleCommunity(bid) {
+  if (dynamicPricing.open.has(bid)) dynamicPricing.open.delete(bid);
+  else dynamicPricing.open.add(bid);
+  dpRenderResult(dynamicPricing.result, !!dynamicPricing.result?.partial);
+}
+
+async function runDynamicPricing() {
+  const input = document.getElementById('dp-limit');
+  const limit = Number.parseInt(input.value, 10);
+  if (!Number.isInteger(limit) || limit < 1 || limit > 5000) {
+    dpSetStatus('Maximum communities must be between 1 and 5,000.', true);
+    return;
+  }
+  if (dynamicPricing.polling) clearInterval(dynamicPricing.polling);
+  dynamicPricing.jobId = null;
+  dynamicPricing.polling = null;
+  dynamicPricing.result = null;
+  dynamicPricing.open.clear();
+
+  const button = document.getElementById('btn-run-dynamic-pricing');
+  button.disabled = true;
+  dpSetStatus('Finding Entrata communities in Snowflake…');
+  document.getElementById('dp-preview-status').textContent = 'Starting…';
+  document.getElementById('dp-preview-body').innerHTML =
+    '<div class="pane-msg">Loading the most recent pricing matrices…</div>';
+  try {
+    const response = await fetch('/api/dynamic-pricing/analyze', {
+      method: 'POST',
+      headers: {'Content-Type': 'application/json'},
+      body: JSON.stringify({limit}),
+    });
+    const data = await response.json();
+    if (!response.ok || data.error) throw new Error(data.error || response.statusText);
+    dynamicPricing.jobId = data.jobId;
+    dynamicPricing.polling = setInterval(pollDynamicPricing, 1500);
+    await pollDynamicPricing();
+  } catch (error) {
+    button.disabled = false;
+    dpSetStatus(`Analysis failed: ${error.message}`, true);
+    document.getElementById('dp-preview-status').textContent = 'Error';
+    document.getElementById('dp-preview-body').innerHTML =
+      `<div class="pane-msg" style="color:#f85149">${esc(error.message)}</div>`;
+  }
+}
+
+async function pollDynamicPricing() {
+  if (!dynamicPricing.jobId) return;
+  try {
+    const response = await fetch(`/api/job?id=${encodeURIComponent(dynamicPricing.jobId)}`);
+    const job = await response.json();
+    if (!response.ok || !job.status) throw new Error(job.error || response.statusText);
+    if (job.result) dpRenderResult(job.result, job.status === 'running');
+    dpSetStatus(job.note || 'Analyzing pricing cadence…');
+    if (job.status === 'running') return;
+
+    clearInterval(dynamicPricing.polling);
+    dynamicPricing.polling = null;
+    dynamicPricing.jobId = null;
+    document.getElementById('btn-run-dynamic-pricing').disabled = false;
+    if (job.status === 'error') throw new Error(job.error || 'Unknown analysis error');
+    const result = job.result || {};
+    dpRenderResult(result, false);
+    dpSetStatus(`Done — ${result.analyzed || 0} communities analyzed`
+      + (result.excluded ? ` · ${result.excluded} excluded` : '')
+      + (result.errors ? ` · ${result.errors} errors` : ''));
+  } catch (error) {
+    if (dynamicPricing.polling) clearInterval(dynamicPricing.polling);
+    dynamicPricing.polling = null;
+    dynamicPricing.jobId = null;
+    document.getElementById('btn-run-dynamic-pricing').disabled = false;
+    dpSetStatus(`Analysis failed: ${error.message}`, true);
+    document.getElementById('dp-preview-status').textContent = 'Error';
+  }
+}
+
 // ── Sync Issues ────────────────────────────────────────────────────────────────
 
 const syncIssues = {
@@ -2749,6 +2993,11 @@ function siCompare(a, b, col, dir) {
 function siVisibleSyncs() {
   const min = syncIssues.minPct;
   const kept = syncIssues.syncs.filter(s => {
+    const detail = syncIssues.buildings[String(s.BUILDING_ID ?? '')];
+    // Until analysis resolves the candidate, keep it visible with its loading
+    // state. Once we know it has no pre-sync snapshot, it is not a verified
+    // sync issue and must disappear from the flagged list entirely.
+    if (detail && detail.excludedFromIssues) return false;
     const v = parseFloat(s.PCT_UNITS_MARKED_UNAVAILABLE);
     return Number.isNaN(v) ? true : v >= min - 1e-9;
   });
@@ -2798,7 +3047,10 @@ function buildSyncsTableHtml(syncs) {
     </tr>`;
   }).join('');
 
-  const total = syncIssues.syncs.length;
+  const total = syncIssues.syncs.filter(s => {
+    const detail = syncIssues.buildings[String(s.BUILDING_ID ?? '')];
+    return !(detail && detail.excludedFromIssues);
+  }).length;
   const shownNote = syncs.length === total
     ? `${total}` : `${syncs.length} of ${total}`;
   const heads = SI_SYNC_COLUMNS.map(c =>
@@ -2835,7 +3087,10 @@ function siRenderSyncsTable() {
   siRefreshBuildingRows();
   const countEl = document.getElementById('si-pct-count');
   if (countEl) {
-    const total = syncIssues.syncs.length;
+    const total = syncIssues.syncs.filter(s => {
+      const detail = syncIssues.buildings[String(s.BUILDING_ID ?? '')];
+      return !(detail && detail.excludedFromIssues);
+    }).length;
     countEl.textContent = visible.length === total
       ? `all ${total} sync${total === 1 ? '' : 's'}`
       : `${visible.length} of ${total} syncs`;
@@ -3187,12 +3442,12 @@ async function pollSyncIssuesJob() {
     const r = result || {};
     syncIssues.buildings  = r.buildings || {};
     syncIssues.lastResult = r;
-    siSetSidebarStatus(
-      `Done — ${r.newlyMarkedUnits || 0} newly marked / ${r.unavailableUnits || 0} unavailable`, false);
-
     // Re-render through the shared path so an active slider / sort / scope
     // selection is preserved when the job finishes.
     siRepaint();
+    const agg = siAggregateVisibleResult();
+    siSetSidebarStatus(
+      `Done — ${agg.newlyMarkedUnits || 0} newly marked / ${agg.unavailableUnits || 0} unavailable`, false);
   } catch (e) {
     // Stop the loop and show the failure rather than polling forever in silence.
     clearInterval(syncIssues.polling);
