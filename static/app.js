@@ -57,17 +57,234 @@ const historyState = { entries: [] };
 const dynamicPricing = {
   jobId: null,
   polling: null,
+  validationJobId: null,
+  validationPolling: null,
+  validationResultId: null,
+  validationResult: null,
+  validationVisualizerRows: new Map(),
+  validationOpen: new Set(),
   result: null,
   open: new Set(),
   filters: {},
-  sortKey: 'apiCallsSaved',
+  sortKey: 'knownApiCallsSaved',
   sortDir: 'desc',
+  validationSortKey: 'unknownApiCallsSaved',
+  validationSortDir: 'desc',
+  validationView: 'community',
   visualSteps: {},
+  visualModes: {},
+  visualFullscreen: new Set(),
+  visualColorOff: new Set(),
+  activeVisualizer: null,
 };
 
 let csvTable = null;
 let csvTableToken = 0;
 let csvFilterTimer = null;
+let dpVisualizerResizeTimer = null;
+let dpAlgorithmDialogTrigger = null;
+
+const DP_ALGORITHM_DOCUMENTS = {
+  known: {
+    title: 'Known Mode Algorithm',
+    pseudocode: `INPUT
+  units: available date and hold time for every unit
+  supplied cadence C: exact cadence, or a documented lower bound
+
+STATE
+  responses[date][unit] = unknown until that property date is called
+  active window[unit] = max(available date, sync date) through hold time
+  phase[unit] = unknown
+
+CALL(date, reason)
+  Request the property for date.
+  Record only the prices returned by this response, for every unit.
+
+  FOR EACH unit:
+    IF adjacent observed dates change from no price to a real price:
+      Treat this as an availability-window edge, not a price-cycle boundary.
+      Move the unit's active window to that first priced date.
+      Preserve the unit's full hold time.
+
+VERIFY CADENCE
+  Process future-available units before currently-available units.
+
+  FOR EACH future unit whose window starts on its available date:
+    CALL(available date + C - 1, "test predicted boundary")
+    CALL(available date + C,     "test predicted boundary")
+
+    IF both calls return real, different prices:
+      The availability-date alignment hypothesis is confirmed.
+    ELSE:
+      Do not project a boundary from availability alone.
+
+  UNTIL cadence C is verified:
+    Probe dates at cadence-spaced anchors.
+
+    IF two observed prices differ with unchecked dates between them:
+      Bisect that proven differing-price interval.
+      Continue until the exact adjacent boundary is observed.
+
+    IF an observed internal response conflicts with an apparently equal span:
+      Bisect again; do not allow a skipped shorter cycle to verify C.
+
+    Verify exact C only when two observed adjacent price boundaries are
+    separated by C and the observed responses inside the cycle are consistent.
+
+    IF C is only a lower bound and exact cadence cannot be proven:
+      Retain the lower bound and retrieve every date not safely inferable.
+
+LOCATE UNIT PHASES
+  Process future-available units first; leave currently-available units last.
+
+  FOR EACH unresolved unit:
+    Probe cadence-spaced anchors.
+    Bisect only intervals whose returned prices prove they contain a change.
+    Set phase[unit] only after adjacent queried dates return different prices.
+
+    IF no valid probe remains and no state changed:
+      Mark this pass exhausted instead of selecting the unit forever.
+      Reconsider it if another property-wide call adds useful evidence.
+
+INFER AND COMPLETE
+  IF equal real-price responses are no farther than C apart:
+    Infer the dates between them.
+
+  IF a response-derived lower bound L is available:
+    After an observed boundary, infer up to L dates on each side.
+
+  FOR EACH unit with a proven phase:
+    Partition its active window into cadence groups.
+
+  Choose the minimum set of property dates that places at least one call
+  inside every still-unfilled cadence group.
+
+  Use the complete stored matrix only to answer CALL and score accuracy.
+  API Calls Saved = Current API Calls - Known Bootstrap Calls.`,
+  },
+  unknown: {
+    title: 'Unknown Mode Algorithm',
+    pseudocode: `INPUT
+  units: available date and hold time for every unit
+  no cadence value
+
+STATE
+  responses[date][unit] = unknown until that property date is called
+  cadence lower bound L = 0
+  discovered cadence C = unknown
+  phase[unit] = unknown
+
+CALL(date, reason)
+  Request the property for date.
+  Record only the prices returned by this response, for every unit.
+
+  FOR EACH unit:
+    IF adjacent observed dates change from no price to a real price:
+      Treat this as an availability-window edge, not a price-cycle boundary.
+      Move the unit's active window to that first priced date.
+      Preserve the unit's full hold time.
+
+DISCOVER FROM FUTURE-AVAILABLE UNITS
+  future units = units whose active window begins on their future available date
+
+  FOR EACH future unit, before any currently-available unit:
+    Assume provisionally that availability is cycle day 1.
+    CALL(first date, "open discovery interval")
+    CALL(last date,  "open discovery interval")
+
+    IF both endpoints return the same real price:
+      Infer the entire window for this unit.
+      Record hold time as a provisional property lower bound L.
+      Treat it as unit-local if another unit's returned prices contradict it.
+      Continue with another future unit.
+
+    IF the endpoint prices differ:
+      Binary-search the interval until the first price boundary is proven by
+      two adjacent calls.
+      candidate cadence K = days from available date to that boundary.
+
+      IF K >= half of the hold time:
+        Check the post-boundary tail.
+        IF all observed tail evidence retains one price:
+          Keep K as a one-boundary candidate.
+        ELSE:
+          Bisect the conflicting interval to find the shorter candidate.
+
+      IF K < half of the hold time:
+        Search near boundary + K for the next boundary.
+        Bisect every proven differing-price interval until adjacent.
+
+      Accept K as an exact cadence only when:
+        - two consecutive observed boundaries are K days apart, and
+        - observed responses inside that complete cycle are consistent.
+
+      Before accepting K, test every price already returned by the same
+      property calls. For each unit, every observed differing-price interval
+      must permit one common K-day boundary phase.
+
+      IF no phase can intersect all of a unit's differing-price intervals:
+        Reject K without another API call.
+        Bisect that unit's existing intervals to expose the shorter cycle.
+
+  Prefer any exact two-boundary candidate immediately.
+  Accept a valid one-boundary candidate only after all future units have had
+  an opportunity to provide stronger evidence.
+
+CALENDAR-MONTH CADENCE
+  IF a 28-31 day candidate has consecutive boundaries on the same day of month:
+    Check the next monthly edge once for the property, not once per unit.
+    Three same-day monthly boundaries for one unit, or two corroborating
+    boundary pairs across units, establish a calendar-month cadence.
+    Partition ranges by that calendar day so 30/31-day months remain exact.
+    If the proving unit ends too early, retrieve that possible monthly edge
+    across the property horizon; those calls directly populate the ranges.
+
+INVALIDATE AND REDISCOVER
+  Treat every discovered cadence or property lower bound as provisional.
+  Do not make calls whose sole purpose is to re-check cadence per unit.
+  Passively evaluate every normal property response against C.
+
+  IF later normal responses cannot fit one C-day phase for any unit:
+      Reject C (or L).
+      Preserve every API response already retrieved.
+      Clear phases that were projected from the rejected cadence.
+      Re-enter discovery without allowing the rejected cadence to be accepted
+      again from the same evidence.
+
+DISCOVER WITHOUT FUTURE UNITS
+  Adaptively probe currently-available units using interval search.
+  A price-cycle boundary exists only after adjacent queried dates return
+  different real prices.
+
+  IF two consecutive boundaries are observed:
+    C = distance between them.
+  ELSE:
+    Retain L = largest response-observed equal-price range.
+
+PROPAGATE PARTIAL KNOWLEDGE
+  Whenever equal real-price endpoints are no farther apart than L:
+    Infer the dates between them.
+
+  Whenever a boundary is observed:
+    Infer up to L dates on both sides without sequential calls.
+
+LOCATE PHASES AND COMPLETE
+  IF exact cadence C was discovered:
+    Process future units first and currently-available units last.
+    Locate only the cycle phase or delayed active-window start still needed
+    for each unit; do not independently re-verify C for that unit.
+    Set phase only after an adjacent price change is queried.
+    Equal responses no farther than C apart prove their intervening dates.
+    Partition proven phases into cadence groups.
+    Call the minimum set of dates covering every unfilled group.
+  ELSE:
+    Keep the lower-bound result and call every date that cannot be inferred.
+
+  Never reuse a unit without a new valid probe or new response evidence.
+  Use the complete stored matrix only to answer CALL and score accuracy.
+  API Calls Saved = Current API Calls - Unknown Bootstrap Calls.`,
+  },
+};
 
 const STALE_MS = 6 * 60 * 60 * 1000;   // index older than this is flagged stale
 const AGENT_INDEX_MAX_AGE_MS = 24 * 60 * 60 * 1000;
@@ -111,15 +328,38 @@ window.addEventListener('DOMContentLoaded', () => {
   document.getElementById('btn-agent-index').addEventListener('click', buildAgentIndex);
   document.getElementById('btn-run-sync-query').addEventListener('click', runSyncIssuesQuery);
   document.getElementById('btn-run-dynamic-pricing').addEventListener('click', runDynamicPricing);
+  document.getElementById('btn-validate-dynamic-pricing').addEventListener('click', runDynamicPricingValidation);
   const dpBody = document.getElementById('dp-preview-body');
   dpBody.addEventListener('click', ev => {
+    const algorithm = ev.target.closest('[data-dp-algorithm]');
+    if (algorithm) {
+      dpOpenAlgorithmDocument(algorithm.dataset.dpAlgorithm, algorithm);
+      return;
+    }
+    const visualizer = ev.target.closest('.dp-algorithm-viz');
+    if (visualizer) dynamicPricing.activeVisualizer = visualizer.dataset.bid;
     const vizStep = ev.target.closest('[data-dp-viz-action]');
     if (vizStep) {
       dpSetVisualizerStep(vizStep.dataset.bid, vizStep.dataset.dpVizAction);
       return;
     }
+    const validationViz = ev.target.closest('[data-dp-validation-viz]');
+    if (validationViz) {
+      dpToggleValidationVisualizer(validationViz.dataset.dpValidationViz);
+      return;
+    }
     const btn = ev.target.closest('.dp-expand');
     if (btn) { dpToggleCommunity(btn.dataset.bid); return; }
+    const validationSort = ev.target.closest('[data-dp-validation-sort]');
+    if (validationSort) {
+      dpSetValidationSort(validationSort.dataset.dpValidationSort);
+      return;
+    }
+    const validationView = ev.target.closest('[data-dp-validation-view]');
+    if (validationView) {
+      dpSetValidationView(validationView.dataset.dpValidationView);
+      return;
+    }
     const sort = ev.target.closest('[data-dp-sort]');
     if (sort) { dpSetSort(sort.dataset.dpSort); return; }
     if (ev.target.closest('[data-dp-export]')) { dpExportCsv(); return; }
@@ -131,6 +371,7 @@ window.addEventListener('DOMContentLoaded', () => {
   dpBody.addEventListener('input', ev => {
     const slider = ev.target.closest('[data-dp-viz-slider]');
     if (slider) {
+      dynamicPricing.activeVisualizer = slider.dataset.bid;
       dynamicPricing.visualSteps[slider.dataset.bid] = Number(slider.value);
       dpRenderVisualizer(slider.dataset.bid);
       return;
@@ -147,6 +388,50 @@ window.addEventListener('DOMContentLoaded', () => {
       next.focus();
       if (cursor != null) next.setSelectionRange(cursor, cursor);
     }
+  });
+  dpBody.addEventListener('change', ev => {
+    const mode = ev.target.closest('[data-dp-viz-mode]');
+    if (!mode) return;
+    const bid = mode.dataset.bid;
+    dynamicPricing.activeVisualizer = bid;
+    dynamicPricing.visualModes[bid] = mode.value;
+    dynamicPricing.visualSteps[bid] = 0;
+    dpRenderVisualizer(bid);
+  });
+  document.addEventListener('keydown', ev => {
+    if (ev.key === 'Escape') {
+      const algorithmDialog = document.getElementById('dp-algorithm-dialog');
+      if (algorithmDialog.open) {
+        dpCloseAlgorithmDocument();
+        return;
+      }
+      const fullscreenBid = dynamicPricing.activeVisualizer;
+      if (fullscreenBid && dynamicPricing.visualFullscreen.has(fullscreenBid)) {
+        dynamicPricing.visualFullscreen.delete(fullscreenBid);
+        dpRenderVisualizer(fullscreenBid);
+      }
+      return;
+    }
+    if (ev.key !== 'ArrowLeft' && ev.key !== 'ArrowRight') return;
+    const target = ev.target;
+    if (target instanceof HTMLElement && (
+      target.isContentEditable || ['INPUT', 'TEXTAREA', 'SELECT'].includes(target.tagName))) return;
+    const bid = dynamicPricing.activeVisualizer
+      || [...dynamicPricing.open][0]
+      || [...dynamicPricing.validationOpen][0];
+    if (!bid || (!dynamicPricing.open.has(String(bid))
+        && !dynamicPricing.validationOpen.has(String(bid)))) return;
+    ev.preventDefault();
+    dpSetVisualizerStep(String(bid), ev.key === 'ArrowLeft' ? 'prev' : 'next');
+  });
+  window.addEventListener('resize', () => {
+    clearTimeout(dpVisualizerResizeTimer);
+    dpVisualizerResizeTimer = setTimeout(() => {
+      new Set([
+        ...dynamicPricing.open,
+        ...dynamicPricing.validationOpen,
+      ]).forEach(dpRenderVisualizer);
+    }, 100);
   });
   // The syncs table is re-rendered on every query, so delegate the expand click.
   const siBody = document.getElementById('si-preview-body');
@@ -400,9 +685,34 @@ window.addEventListener('DOMContentLoaded', () => {
   document.getElementById('btn-cancel-credentials').addEventListener('click', closeSnowflakeCredentials);
   document.getElementById('btn-save-credentials').addEventListener('click', saveSnowflakeCredentials);
   document.getElementById('credential-auth').addEventListener('change', renderCredentialAuth);
+  const algorithmDialog = document.getElementById('dp-algorithm-dialog');
+  document.getElementById('dp-algorithm-close').addEventListener('click', dpCloseAlgorithmDocument);
+  algorithmDialog.addEventListener('click', event => {
+    if (event.target === algorithmDialog) dpCloseAlgorithmDocument();
+  });
+  algorithmDialog.addEventListener('close', () => {
+    if (dpAlgorithmDialogTrigger?.isConnected) dpAlgorithmDialogTrigger.focus();
+    dpAlgorithmDialogTrigger = null;
+  });
 
   tryConnect();
 });
+
+function dpOpenAlgorithmDocument(mode, trigger) {
+  const documentContent = DP_ALGORITHM_DOCUMENTS[mode];
+  if (!documentContent) return;
+  const dialog = document.getElementById('dp-algorithm-dialog');
+  dpAlgorithmDialogTrigger = trigger || document.activeElement;
+  document.getElementById('dp-algorithm-title').textContent = documentContent.title;
+  document.getElementById('dp-algorithm-code').textContent = documentContent.pseudocode;
+  if (!dialog.open) dialog.showModal();
+  document.getElementById('dp-algorithm-close').focus();
+}
+
+function dpCloseAlgorithmDocument() {
+  const dialog = document.getElementById('dp-algorithm-dialog');
+  if (dialog.open) dialog.close();
+}
 
 async function tryConnect() {
   setStatus('spin', 'Connecting…');
@@ -1914,7 +2224,11 @@ async function loadHistory() {
 }
 
 function toggleSavedResults(kind) {
-  const panel = document.getElementById(kind === 'availability' ? 'saved-availability' : 'saved-search');
+  const panelId = kind === 'availability'
+    ? 'saved-availability'
+    : (kind === 'dynamic_pricing_validation'
+      ? 'saved-dynamic-pricing-validation' : 'saved-search');
+  const panel = document.getElementById(panelId);
   const toggle = panel?.querySelector('.saved-toggle');
   if (!panel || !toggle) return;
   const open = panel.classList.toggle('open');
@@ -1923,13 +2237,17 @@ function toggleSavedResults(kind) {
 
 function historyTitle(entry) {
   if (entry.name) return entry.name;
+  if (entry.kind === 'dynamic_pricing_validation') {
+    const status = String(entry.details?.validationStatus || '').replace('-', ' ');
+    return `Unknown-mode validation${status ? ` · ${status}` : ''}`;
+  }
   return entry.kind === 'availability'
     ? `Availability · ${entry.integration || 'Unknown integration'}`
     : `Search · ${entry.fileName || entry.integration || 'CSV export'}`;
 }
 
 function renderSavedHistory() {
-  ['fields', 'availability'].forEach(kind => {
+  ['fields', 'availability', 'dynamic_pricing_validation'].forEach(kind => {
     const entries = historyState.entries
       .filter(entry => entry.kind === kind)
       .sort((a, b) => Number(b.favorite) - Number(a.favorite) ||
@@ -1941,21 +2259,30 @@ function renderSavedHistory() {
 }
 
 function renderHistoryList(kind, entries) {
-  const list = document.getElementById(kind === 'availability'
-    ? 'history-availability-list' : 'history-search-list');
+  const listId = kind === 'availability'
+    ? 'history-availability-list'
+    : (kind === 'dynamic_pricing_validation'
+      ? 'history-dynamic-pricing-validation-list' : 'history-search-list');
+  const list = document.getElementById(listId);
   if (!list) return;
   if (!entries.length) {
-    list.innerHTML = `<div class="history-empty">No saved ${kind === 'availability' ? 'Availability Agent results' : 'Search results'}</div>`;
+    const label = kind === 'availability'
+      ? 'Availability Agent results'
+      : (kind === 'dynamic_pricing_validation'
+        ? 'Unknown-mode validations' : 'Search results');
+    list.innerHTML = `<div class="history-empty">No saved ${label}</div>`;
     return;
   }
   list.innerHTML = entries.map(entry => {
     const when = entry.createdAt ? new Date(entry.createdAt).toLocaleString() : '';
     const count = Number(entry.rowCount || 0).toLocaleString();
     const status = entry.available ? '' : ' · expired';
+    const integration = entry.kind === 'dynamic_pricing_validation'
+      ? `${count} matrices tested` : `${entry.integration || ''} · ${count} rows`;
     return `<div class="history-item ${entry.available ? '' : 'expired'}" data-history-id="${esc(entry.id)}" role="button" tabindex="0">
       <button type="button" class="history-star ${entry.favorite ? 'favorite' : ''}" data-history-favorite="${esc(entry.id)}" title="${entry.favorite ? 'Unfavorite' : 'Favorite'}">${entry.favorite ? '★' : '☆'}</button>
       <div class="history-copy"><div class="history-title">${esc(historyTitle(entry))}</div>
-        <div class="history-meta">${esc(entry.integration || '')} · ${count} rows · ${esc(when)}${status}</div></div>
+        <div class="history-meta">${esc(integration)} · ${esc(when)}${status}</div></div>
       <button type="button" class="history-rename" data-history-rename="${esc(entry.id)}" title="Rename">✎</button>
       <button type="button" class="history-delete" data-history-delete="${esc(entry.id)}" title="Delete">×</button>
       <span class="history-open">${entry.available ? 'View' : '—'}</span>
@@ -2047,9 +2374,13 @@ async function deleteHistory(jobId) {
   }
 }
 
-function openHistoryEntry(jobId) {
+async function openHistoryEntry(jobId) {
   const entry = historyState.entries.find(item => item.id === jobId);
   if (!entry || !entry.available) return;
+  if (entry.kind === 'dynamic_pricing_validation') {
+    await openDynamicPricingValidationHistory(entry);
+    return;
+  }
   const data = {
     integration: entry.integration,
     rowCount: entry.rowCount || 0,
@@ -2588,15 +2919,55 @@ const DP_REPORT_COLUMNS = [
   {key: 'latestSync', label: 'Latest Sync'},
   {key: 'cadenceDays', label: 'Cadence (Days)', numeric: true},
   {key: 'cadenceEvidence', label: 'Cadence Evidence'},
+  {key: 'knownCadenceStatus', label: 'Known Verification'},
+  {key: 'unknownCadenceStatus', label: 'Unknown Discovery'},
   {key: 'cycleAlignment', label: 'Cycle Alignment'},
   {key: 'unitCount', label: 'Units', numeric: true},
   {key: 'currentApiCalls', label: 'Current API Calls', numeric: true},
-  {key: 'bootstrapApiCalls', label: 'Bootstrap Calls', numeric: true},
-  {key: 'apiCallsSaved', label: 'API Calls Saved', numeric: true},
-  {key: 'reconstructionAccuracyPct', label: 'Bootstrap Accuracy (%)', numeric: true},
-  {key: 'retrievalStrategy', label: 'Retrieval Strategy'},
-  {key: 'bootstrapApiCallDates', label: 'Bootstrap Call Dates'},
+  {key: 'knownBootstrapApiCalls', label: 'Known Mode Calls', numeric: true},
+  {key: 'trustedBootstrapApiCalls', label: 'Trusted Mode Calls', numeric: true},
+  {key: 'unknownBootstrapApiCalls', label: 'Unknown Mode Calls', numeric: true},
+  {key: 'knownApiCallsSaved', label: 'Known Mode Saved', numeric: true},
+  {key: 'trustedApiCallsSaved', label: 'Trusted Mode Saved', numeric: true},
+  {key: 'unknownApiCallsSaved', label: 'Unknown Mode Saved', numeric: true},
+  {key: 'knownApiCallsSavedPct', label: 'Known Saved (%)', numeric: true},
+  {key: 'trustedApiCallsSavedPct', label: 'Trusted Saved (%)', numeric: true},
+  {key: 'unknownApiCallsSavedPct', label: 'Unknown Saved (%)', numeric: true},
+  {key: 'knownReconstructionAccuracyPct', label: 'Known Accuracy (%)', numeric: true},
+  {key: 'trustedReconstructionAccuracyPct', label: 'Trusted Accuracy (%)', numeric: true},
+  {key: 'unknownReconstructionAccuracyPct', label: 'Unknown Accuracy (%)', numeric: true},
+  {key: 'knownBootstrapApiCallDates', label: 'Known Call Dates'},
+  {key: 'trustedBootstrapApiCallDates', label: 'Trusted Call Dates'},
+  {key: 'unknownBootstrapApiCallDates', label: 'Unknown Call Dates'},
 ];
+const DP_VALIDATION_COLUMNS = [
+  {key: 'orgName', label: 'Organization'},
+  {key: 'buildingName', label: 'Community'},
+  {key: 'buildingId', label: 'Building ID', numeric: true},
+  {key: 'latestSync', label: 'Latest Sync'},
+  {key: 'cadenceDays', label: 'Cadence', numeric: true},
+  {key: 'unitCount', label: 'Units', numeric: true},
+  {key: 'currentApiCalls', label: 'Current Calls', numeric: true},
+  {key: 'unknownBootstrapApiCalls', label: 'Unknown Calls', numeric: true},
+  {key: 'unknownApiCallsSaved', label: 'Calls Saved', numeric: true},
+  {key: 'unknownApiCallsSavedPct', label: '% Saved', numeric: true},
+  {key: 'unknownReconstructionAccuracyPct', label: 'Accuracy', numeric: true},
+  {key: 'unknownCadenceStatus', label: 'Cadence Result'},
+];
+const DP_VALIDATION_ORG_COLUMNS = [
+  {key: 'orgName', label: 'Organization'},
+  {key: 'orgId', label: 'Org ID', numeric: true},
+  {key: 'communityCount', label: 'Communities', numeric: true},
+  {key: 'currentApiCalls', label: 'Current Calls', numeric: true},
+  {key: 'unknownBootstrapApiCalls', label: 'Unknown Calls', numeric: true},
+  {key: 'unknownApiCallsSaved', label: 'Calls Saved', numeric: true},
+  {key: 'unknownApiCallsSavedPct', label: '% Saved', numeric: true},
+  {key: 'unknownReconstructionAccuracyPct', label: 'Accuracy', numeric: true},
+  {key: 'matricesPassed', label: 'Passed', numeric: true},
+  {key: 'matricesFailed', label: 'Failed', numeric: true},
+];
+const DP_PRICE_GRADIENT_START_HUE = 125;
+const DP_PRICE_GRADIENT_END_HUE = 350;
 
 function dpSetStatus(message, isError = false) {
   const el = document.getElementById('dp-status');
@@ -2622,6 +2993,9 @@ function dpDatesHtml(dates) {
 }
 
 function dpCadenceHtml(row) {
+  if (row.cadenceIsLowerBound && row.cadenceDays != null) {
+    return `<span class="dp-cadence-common">≥ ${esc(String(row.cadenceDays))}</span>`;
+  }
   if (row.cadenceDays != null) {
     return `<span class="dp-cadence-common">${esc(String(row.cadenceDays))}</span>`;
   }
@@ -2630,6 +3004,12 @@ function dpCadenceHtml(row) {
 
 function dpCadenceEvidenceText(row) {
   if (row.error) return 'Unavailable';
+  if (row.cadenceIsLowerBound) {
+    const prefix = row.pricingDoesNotChange
+      ? 'No price changes observed'
+      : 'No complete interior ranges';
+    return `${prefix} · cadence is at least ${row.cadenceLowerBoundDays || row.cadenceDays} days`;
+  }
   if (row.pricingDoesNotChange) return 'Pricing Does Not Change';
   const count = row.cadenceEvidenceRangeCount || 0;
   const units = row.cadenceEvidenceUnitCount || 0;
@@ -2641,7 +3021,7 @@ function dpCadenceEvidenceText(row) {
 }
 
 function dpColumnText(row, key, forExport = false) {
-  if (key === 'bootstrapApiCallDates') {
+  if (key.endsWith('BootstrapApiCallDates')) {
     return (row[key] || []).map(dpFormatShortDate).join(', ');
   }
   if (key === 'cadenceEvidence') return dpCadenceEvidenceText(row);
@@ -2675,7 +3055,7 @@ function dpMatchesFilter(row, column, query) {
 }
 
 function dpColumnSortValue(row, key) {
-  if (key === 'bootstrapApiCallDates') {
+  if (key.endsWith('BootstrapApiCallDates')) {
     return (row[key] || [])[0] || '';
   }
   if (key === 'cadenceEvidence') return dpCadenceEvidenceText(row);
@@ -2723,6 +3103,75 @@ function dpSetSort(key) {
 function dpSortIndicator(key) {
   if (dynamicPricing.sortKey !== key) return '';
   return dynamicPricing.sortDir === 'asc' ? ' ▲' : ' ▼';
+}
+
+function dpValidationActiveColumns() {
+  return dynamicPricing.validationView === 'organization'
+    ? DP_VALIDATION_ORG_COLUMNS : DP_VALIDATION_COLUMNS;
+}
+
+function dpValidationSortedRows(rows) {
+  const column = dpValidationActiveColumns().find(
+    item => item.key === dynamicPricing.validationSortKey);
+  if (!column) return rows || [];
+  return (rows || []).map((row, index) => ({row, index})).sort((left, right) => {
+    const a = dpColumnSortValue(left.row, column.key);
+    const b = dpColumnSortValue(right.row, column.key);
+    const aEmpty = a == null || a === '';
+    const bEmpty = b == null || b === '';
+    if (aEmpty && bEmpty) return left.index - right.index;
+    if (aEmpty) return 1;
+    if (bEmpty) return -1;
+    const compared = column.numeric
+      ? Number(a) - Number(b)
+      : String(a).localeCompare(
+          String(b), undefined, {numeric: true, sensitivity: 'base'});
+    if (!compared) return left.index - right.index;
+    return dynamicPricing.validationSortDir === 'asc' ? compared : -compared;
+  }).map(item => item.row);
+}
+
+function dpSetValidationSort(key) {
+  if (dynamicPricing.validationSortKey === key) {
+    dynamicPricing.validationSortDir =
+      dynamicPricing.validationSortDir === 'asc' ? 'desc' : 'asc';
+  } else {
+    dynamicPricing.validationSortKey = key;
+    dynamicPricing.validationSortDir = 'asc';
+  }
+  dpRenderValidationResult(
+    dynamicPricing.validationResult,
+    dynamicPricing.validationResult?.partial === true);
+}
+
+function dpSetValidationView(view) {
+  const next = view === 'organization' ? 'organization' : 'community';
+  if (dynamicPricing.validationView === next) return;
+  dynamicPricing.validationView = next;
+  const columns = dpValidationActiveColumns();
+  if (!columns.some(column => column.key === dynamicPricing.validationSortKey)) {
+    dynamicPricing.validationSortKey = 'unknownApiCallsSaved';
+    dynamicPricing.validationSortDir = 'desc';
+  }
+  dpRenderValidationResult(
+    dynamicPricing.validationResult,
+    dynamicPricing.validationResult?.partial === true);
+}
+
+function dpValidationHeaderHtml() {
+  return dpValidationActiveColumns().map(column => {
+    const active = dynamicPricing.validationSortKey === column.key;
+    const ariaSort = active
+      ? (dynamicPricing.validationSortDir === 'asc'
+          ? 'ascending' : 'descending')
+      : 'none';
+    const indicator = active
+      ? (dynamicPricing.validationSortDir === 'asc' ? ' ▲' : ' ▼')
+      : '';
+    return `<th class="dp-sortable${column.numeric ? ' dp-num' : ''}" aria-sort="${ariaSort}">`
+      + `<button type="button" data-dp-validation-sort="${esc(column.key)}" title="Sort by ${esc(column.label)}">`
+      + `${esc(column.label)}<span class="dp-sort-indicator">${indicator}</span></button></th>`;
+  }).join('');
 }
 
 function dpCsvCell(value) {
@@ -2783,37 +3232,82 @@ function dpCalendarDates(start, end) {
   return values;
 }
 
-function dpVisualizerRangeIndex(unit, day) {
-  return (unit.priceRanges || []).findIndex(range => range.start <= day && day <= range.end);
+function dpVisualizerSignatureId(unit, day) {
+  const value = unit.pricingSignatureIds?.[day];
+  return value == null ? null : Number(value);
 }
 
-function dpVisualizerKnownDates(unit, row, step) {
-  const pricingDates = unit.pricingDates || [];
-  const calls = (row.bootstrapApiCallDates || []).slice(0, step);
+function dpUnitPricingDates(unit) {
+  return unit.visualPricingDates || unit.pricingDates || [];
+}
+
+function dpVisualizerMode(row, bid) {
+  const selected = dynamicPricing.visualModes[bid] || 'known';
+  if (row.retrievalPlans?.[selected]) return selected;
+  return row.retrievalPlans?.known ? 'known' : (row.cadenceMode || 'known');
+}
+
+function dpVisualizerPlan(row, bid) {
+  const mode = dpVisualizerMode(row, bid);
+  return row.retrievalPlans?.[mode] || {
+    mode,
+    bootstrapApiCallDates: row.bootstrapApiCallDates || [],
+    algorithmCallSteps: row.algorithmCallSteps || [],
+    cadenceKnownAtCall: row.cadenceKnownAtCall,
+    cadenceVerifiedAtCall: row.cadenceVerifiedAtCall,
+    effectiveCadenceDays: row.cadenceDays,
+    unitPhaseKnownAtCall: Object.fromEntries(
+      (row.units || []).map((unit, index) => [index, unit.cyclePhaseKnownAtCall])),
+    unitCycleBoundaryDates: Object.fromEntries(
+      (row.units || []).map((unit, index) => [index, unit.cycleBoundaryDates || []])),
+    unitBoundaryNotRequired: [],
+    unitFutureAvailabilityAlignment: {},
+    unitEndpointEqualityAtCall: {},
+    unitLowerBoundInferenceAtCall: {},
+    cadenceInvalidations: [],
+  };
+}
+
+function dpVisualizerKnownDates(unit, row, step, plan, unitIndex) {
+  const pricingDates = dpUnitPricingDates(unit);
+  const calls = (plan.bootstrapApiCallDates || []).slice(0, step);
   const callSet = new Set(calls);
   const known = new Set(pricingDates.filter(day => callSet.has(day)));
-  const positions = new Map(pricingDates.map((day, index) => [day, index]));
-  const calledForUnit = pricingDates.filter(day => callSet.has(day));
 
-  // Before phase is known, equal endpoints no more than one cadence apart
-  // prove that every intervening value is equal as well.
-  for (let index = 0; index + 1 < calledForUnit.length; index += 1) {
-    const lower = calledForUnit[index];
-    const upper = calledForUnit[index + 1];
-    const sameRange = (unit.priceRanges || []).some(range =>
-      range.start <= lower && upper <= range.end);
-    if (!sameRange) continue;
-    const lowerIndex = positions.get(lower);
-    const upperIndex = positions.get(upper);
-    for (let position = lowerIndex; position <= upperIndex; position += 1) {
-      known.add(pricingDates[position]);
+  const endpointEqualityAt = plan.unitEndpointEqualityAtCall?.[unitIndex];
+  if (endpointEqualityAt != null && step >= endpointEqualityAt) {
+    pricingDates.forEach(day => known.add(day));
+  }
+  Object.entries(plan.unitLowerBoundInferenceAtCall?.[unitIndex] || {})
+    .forEach(([day, proofCall]) => {
+      if (step >= proofCall) known.add(day);
+    });
+
+  const cadence = plan.effectiveCadenceDays ?? row.cadenceDays;
+  const cadenceReadyAt = plan.cadenceReadyAtCall;
+  const cadenceReady = cadence && (
+    plan.mode === 'trusted'
+    || (cadenceReadyAt != null && step >= cadenceReadyAt));
+  if (cadenceReady) {
+    const positions = new Map(pricingDates.map((day, index) => [day, index]));
+    const calledForUnit = pricingDates.filter(day => callSet.has(day));
+    for (let index = 0; index + 1 < calledForUnit.length; index += 1) {
+      const leftDay = calledForUnit[index];
+      const rightDay = calledForUnit[index + 1];
+      const left = positions.get(leftDay);
+      const right = positions.get(rightDay);
+      if (right - left > cadence) continue;
+      if (dpVisualizerSignatureId(unit, leftDay) !== dpVisualizerSignatureId(unit, rightDay)) continue;
+      for (let position = left; position <= right; position += 1) {
+        known.add(pricingDates[position]);
+      }
     }
   }
 
-  const phaseAt = unit.cyclePhaseKnownAtCall;
+  const phaseAt = plan.unitPhaseKnownAtCall?.[unitIndex];
   const phaseKnown = phaseAt != null && step >= phaseAt;
   if (phaseKnown) {
-    const boundaries = new Set(unit.cycleBoundaryDates || []);
+    const boundaries = new Set(plan.unitCycleBoundaryDates?.[unitIndex] || []);
     const groups = [];
     let group = [];
     pricingDates.forEach(day => {
@@ -2827,12 +3321,6 @@ function dpVisualizerKnownDates(unit, row, step) {
     groups.forEach(days => {
       if (days.some(day => callSet.has(day))) days.forEach(day => known.add(day));
     });
-    // A clipped first/last cycle can share its effective price with the
-    // neighboring sampled cycle. The planner folds those edge cells into the
-    // neighbor so they do not require a sub-cadence call.
-    (unit.cycleEdgeInferenceGroups || []).forEach(days => {
-      if (days.some(day => callSet.has(day))) days.forEach(day => known.add(day));
-    });
   }
   return known;
 }
@@ -2840,58 +3328,149 @@ function dpVisualizerKnownDates(unit, row, step) {
 function dpVisualizerHtml(row) {
   const bid = String(row.buildingId || '');
   const units = row.units || [];
-  const calls = row.bootstrapApiCallDates || [];
+  const fullscreen = dynamicPricing.visualFullscreen.has(bid);
+  const colorMode = !dynamicPricing.visualColorOff.has(bid);
+  const mode = dpVisualizerMode(row, bid);
+  dynamicPricing.visualModes[bid] = mode;
+  const plan = dpVisualizerPlan(row, bid);
+  const calls = plan.bootstrapApiCallDates || [];
   const requestedStep = Number(dynamicPricing.visualSteps[bid] || 0);
   const step = Math.max(0, Math.min(requestedStep, calls.length));
   dynamicPricing.visualSteps[bid] = step;
   const currentCall = step ? calls[step - 1] : null;
-  const allDates = units.flatMap(unit => unit.pricingDates || []).sort();
+  const allDates = units.flatMap(dpUnitPricingDates).sort();
   if (!allDates.length) return '<div class="si-pending">No dated pricing to visualize.</div>';
   const calendar = dpCalendarDates(allDates[0], allDates[allDates.length - 1]);
+  const gridHeightBudget = fullscreen
+    ? Math.max(240, window.innerHeight - 190)
+    : Math.max(180, Math.min(window.innerHeight * 0.58, 640));
+  const rowHeight = Math.max(6, Math.min(25,
+    Math.floor((gridHeightBudget - 46) / Math.max(units.length, 1))));
+  const denseClass = rowHeight < 18 ? ' dp-viz-dense' : '';
+  const unitColumnWidth = fullscreen ? 210 : (calendar.length > 120 ? 150 : 190);
+  const dateFontSize = calendar.length > 140 ? 6 : (calendar.length > 100 ? 7 : 8);
   const called = new Set(calls.slice(0, step));
-  const knownPhaseUnits = units.filter(unit =>
-    unit.cyclePhaseKnownAtCall != null && step >= unit.cyclePhaseKnownAtCall).length;
-  const cadenceStatus = row.pricingDoesNotChange
-    ? 'Pricing does not change'
-    : (row.cadenceKnownAtCall === 0
-        ? `Known before call 1 · ${row.cadenceDays} days`
-        : 'Unknown');
+  const currentStep = step ? (plan.algorithmCallSteps || [])[step - 1] : null;
+  const knownPhaseUnits = units.filter((_unit, index) => {
+    const phaseAt = plan.unitPhaseKnownAtCall?.[index];
+    return phaseAt != null && step >= phaseAt;
+  }).length;
+  const boundaryNotRequired = new Set(plan.unitBoundaryNotRequired || []);
+  const boundaryNotRequiredCount = units.filter(
+    (_unit, index) => boundaryNotRequired.has(index)).length;
+  const fullyRetrievedUnits = units.filter(unit =>
+    dpUnitPricingDates(unit).every(day => called.has(day))).length;
+  let cadenceStatus;
+  const effectiveCadence = plan.effectiveCadenceDays ?? row.cadenceDays;
+  const responseCadenceLowerBound = units.reduce((largest, unit, index) => {
+    const proofCall = plan.unitEndpointEqualityAtCall?.[index];
+    return proofCall != null && step >= proofCall
+      ? Math.max(largest, dpUnitPricingDates(unit).length)
+      : largest;
+  }, 0);
+  if (mode === 'trusted') {
+    cadenceStatus = row.cadenceIsLowerBound
+      ? `Supplied lower bound ≥ ${row.cadenceDays} days · trusted without verification`
+      : `Known and trusted before call 1 · ${effectiveCadence || '—'} days`;
+  } else if (mode === 'unknown') {
+    const activeInvalidation = (plan.cadenceInvalidations || [])
+      .filter(item => step >= Number(item.atCall || 0))
+      .at(-1);
+    const activeRejection = (plan.cadenceCandidateRejections || [])
+      .filter(item => step >= Number(item.atCall || 0))
+      .at(-1);
+    cadenceStatus = activeInvalidation
+      && (plan.cadenceKnownAtCall == null || step < plan.cadenceKnownAtCall)
+      ? `Invalidated ${activeInvalidation.cadenceDays}-day cadence at call ${activeInvalidation.atCall} · discovery resumed`
+      : activeRejection
+        && (plan.cadenceKnownAtCall == null || step < plan.cadenceKnownAtCall)
+      ? `Rejected ${activeRejection.cadenceDays}-day candidate at call ${activeRejection.atCall} from existing property responses · discovery continued`
+      : plan.cadenceKnownAtCall != null && step >= plan.cadenceKnownAtCall
+      ? (plan.cadenceStatus || `Discovered at call ${plan.cadenceKnownAtCall} · ${effectiveCadence} days`)
+      : (step === calls.length
+          ? (plan.cadenceIsLowerBound
+              ? plan.cadenceStatus
+              : `Not discoverable · full retrieval establishes only ≥ ${row.cadenceDays || '—'} days`)
+          : (responseCadenceLowerBound
+              ? `Exact cadence unknown · established lower bound ≥ ${responseCadenceLowerBound} days`
+              : 'Unknown · testing future-unit endpoints'));
+  } else {
+    const suppliedLabel = row.cadenceIsLowerBound
+      ? `supplied lower bound ≥ ${row.cadenceDays}`
+      : `supplied cadence ${row.cadenceDays}`;
+    cadenceStatus = plan.cadenceVerifiedAtCall != null && step >= plan.cadenceVerifiedAtCall
+      ? `Verified at call ${plan.cadenceVerifiedAtCall} · ${effectiveCadence} days`
+      : (step === calls.length
+          ? `${suppliedLabel} days could not be verified · full retrieval used`
+          : `${suppliedLabel} days · verification in progress`);
+  }
   let knownCellCount = 0;
   let totalCellCount = 0;
 
   const headerCells = calendar.map(day => {
     const currentClass = day === currentCall ? ' current-call' : '';
     const calledClass = called.has(day) ? ' called-date' : '';
-    return `<th class="dp-viz-date${currentClass}${calledClass}" title="${esc(day)}">${esc(dpFormatShortDate(day))}</th>`;
+    return `<th class="dp-viz-date${currentClass}${calledClass}" title="${esc(day)}"><span>${esc(dpFormatShortDate(day))}</span></th>`;
   }).join('');
 
-  const unitRows = units.map(unit => {
-    const active = new Set(unit.pricingDates || []);
-    const known = dpVisualizerKnownDates(unit, row, step);
-    const boundaries = new Set(unit.cycleBoundaryDates || []);
-    const priceChangeStarts = new Set((unit.priceRanges || []).slice(1).map(range => range.start));
-    const phaseAt = unit.cyclePhaseKnownAtCall;
+  const unitRows = units.map((unit, unitIndex) => {
+    const pricingDates = dpUnitPricingDates(unit);
+    const active = new Set(pricingDates);
+    const known = dpVisualizerKnownDates(unit, row, step, plan, unitIndex);
+    // Anchor every unit's first and last price signatures to fixed gradient
+    // endpoints. Intermediate signatures keep the same proportional position
+    // at every algorithm step; unknown cells remain uncolored.
+    const signatureOrder = [];
+    const signatureIndexes = new Map();
+    pricingDates.forEach(day => {
+      const signatureId = dpVisualizerSignatureId(unit, day);
+      if (signatureId == null || signatureIndexes.has(signatureId)) return;
+      signatureIndexes.set(signatureId, signatureOrder.length);
+      signatureOrder.push(signatureId);
+    });
+    const boundaries = new Set(plan.unitCycleBoundaryDates?.[unitIndex] || []);
+    const phaseAt = plan.unitPhaseKnownAtCall?.[unitIndex];
     const phaseKnown = phaseAt != null && step >= phaseAt;
-    const activeCalls = (unit.pricingDates || []).filter(day => called.has(day));
-    const positions = new Map((unit.pricingDates || []).map((day, index) => [day, index]));
+    const endpointEqualityAt = plan.unitEndpointEqualityAtCall?.[unitIndex];
+    const endpointEqualityKnown = endpointEqualityAt != null && step >= endpointEqualityAt;
+    const lowerBoundInference = plan.unitLowerBoundInferenceAtCall?.[unitIndex] || {};
+    const lowerBoundInferenceKnown = Object.values(lowerBoundInference)
+      .some(proofCall => step >= proofCall);
+    const unitBoundaryNotRequired = boundaryNotRequired.has(unitIndex);
+    const availabilityAlignment = plan.unitFutureAvailabilityAlignment?.[unitIndex];
+    const activeCalls = pricingDates.filter(day => called.has(day));
+    const positions = new Map(pricingDates.map((day, index) => [day, index]));
+    const observedBoundaryStarts = new Set();
+    for (let index = 0; index + 1 < pricingDates.length; index += 1) {
+      const previous = pricingDates[index];
+      const current = pricingDates[index + 1];
+      if (called.has(previous) && called.has(current)
+          && dpVisualizerSignatureId(unit, previous) !== dpVisualizerSignatureId(unit, current)) {
+        observedBoundaryStarts.add(current);
+      }
+    }
     const boundaryWindows = new Set();
     for (let index = 0; index + 1 < activeCalls.length; index += 1) {
       const lower = activeCalls[index];
       const upper = activeCalls[index + 1];
-      if (dpVisualizerRangeIndex(unit, lower) === dpVisualizerRangeIndex(unit, upper)) continue;
+      if (dpVisualizerSignatureId(unit, lower) === dpVisualizerSignatureId(unit, upper)) continue;
       const lowerIndex = positions.get(lower);
       const upperIndex = positions.get(upper);
+      if (upperIndex - lowerIndex <= 1) continue;
       for (let position = lowerIndex + 1; position <= upperIndex; position += 1) {
-        boundaryWindows.add(unit.pricingDates[position]);
+        boundaryWindows.add(pricingDates[position]);
       }
     }
     totalCellCount += active.size;
     knownCellCount += known.size;
     let phaseText;
-    if (row.pricingDoesNotChange) phaseText = 'cycle not applicable';
+    if (endpointEqualityKnown) phaseText = 'full window inferred · first and last prices match';
+    else if (lowerBoundInferenceKnown) phaseText = 'range inferred from observed cadence lower bound';
+    else if (unitBoundaryNotRequired) phaseText = 'no boundary needed · cadence exceeds hold';
     else if (phaseAt === 0) phaseText = 'cycle known initially';
     else if (phaseAt != null && phaseKnown) phaseText = `cycle known at call ${phaseAt}`;
     else if (phaseAt != null) phaseText = `cycle pending · call ${phaseAt}`;
+    else if (pricingDates.every(day => called.has(day))) phaseText = 'full window retrieved · no boundary observed';
     else phaseText = 'cycle not yet observable';
     const cells = calendar.map(day => {
       if (!active.has(day)) {
@@ -2900,29 +3479,44 @@ function dpVisualizerHtml(row) {
       const direct = called.has(day);
       const inferred = !direct && known.has(day);
       const boundary = phaseKnown && boundaries.has(day);
-      const rangeIndex = dpVisualizerRangeIndex(unit, day);
-      const distinctPriceStart = priceChangeStarts.has(day);
+      const signatureId = known.has(day) ? dpVisualizerSignatureId(unit, day) : null;
+      const signatureIndex = signatureId == null
+        ? null : signatureIndexes.get(signatureId);
+      const signaturePosition = signatureOrder.length > 1
+        ? signatureIndex / (signatureOrder.length - 1) : 0;
+      const signatureHue = Math.round(
+        DP_PRICE_GRADIENT_START_HUE
+        + (DP_PRICE_GRADIENT_END_HUE - DP_PRICE_GRADIENT_START_HUE)
+          * signaturePosition);
+      const signatureClass = signatureId == null || !colorMode
+        ? '' : 'price-signature';
+      const signatureStyle = signatureId == null || !colorMode
+        ? '' : ` style="--dp-price-hue:${signatureHue}"`;
+      const observedPriceChange = observedBoundaryStarts.has(day);
       const boundaryWindow = !phaseKnown && boundaryWindows.has(day);
       const classes = [
         'dp-viz-cell',
         direct ? 'direct' : (inferred ? 'inferred' : 'unknown'),
-        rangeIndex % 2 ? 'price-band-odd' : 'price-band-even',
-        distinctPriceStart ? 'price-change' : '',
+        signatureClass,
+        observedPriceChange ? 'observed-change' : '',
         boundaryWindow ? 'boundary-window' : '',
         boundary ? 'cycle-start' : '',
         day === currentCall ? 'current-call' : '',
       ].filter(Boolean).join(' ');
       const state = direct ? 'direct API response' : (inferred ? 'inferred pricing' : 'unknown pricing');
-      const rangeText = rangeIndex >= 0 ? ` · actual price range ${rangeIndex + 1}` : '';
+      const signatureText = signatureId == null
+        ? '' : ` · price pattern ${signatureIndex + 1} of ${signatureOrder.length}`;
       const boundaryText = boundaryWindow ? ' · a price boundary is known to fall in this interval' : '';
-      return `<td class="${classes}" title="${esc(`${unit.unitId} · ${day} · ${state}${rangeText}${boundaryText}`)}"></td>`;
+      return `<td class="${classes}"${signatureStyle} title="${esc(`${unit.unitId} · ${day} · ${state}${signatureText}${boundaryText}`)}"></td>`;
     }).join('');
+    const alignmentText = availabilityAlignment && step >= availabilityAlignment.atCall
+      ? ` · availability alignment ${availabilityAlignment.status.toLowerCase()}`
+      : '';
+    const unitSummary = `${unit.holdTimeDays || active.size}d hold · available ${dpFormatShortDate(unit.availableDate)} · retrieval starts ${dpFormatShortDate(unit.visualStartDate)} · ${phaseText}${alignmentText}`;
     return `<tr>
-      <th class="dp-viz-unit">
+      <th class="dp-viz-unit" title="${esc(`${unit.unitId} · ${unitSummary}`)}">
         <strong>${esc(unit.unitId)}</strong>
-        <span>${unit.holdTimeDays || active.size}d hold · available ${esc(dpFormatShortDate(unit.availableDate))}</span>
-        <span>retrieval starts ${esc(dpFormatShortDate(unit.visualStartDate))}</span>
-        <span class="${phaseKnown ? 'phase-known' : 'phase-pending'}">${esc(phaseText)}</span>
+        <span class="${phaseKnown || endpointEqualityKnown || lowerBoundInferenceKnown ? 'phase-known' : 'phase-pending'}">${esc(unitSummary)}</span>
       </th>${cells}
     </tr>`;
   }).join('');
@@ -2930,37 +3524,48 @@ function dpVisualizerHtml(row) {
   const stepLabel = step
     ? `Call ${step} of ${calls.length} · ${dpFormatShortDate(currentCall)}`
     : `Before call 1 · ${calls.length} calls planned`;
-  const phaseStatus = row.pricingDoesNotChange
-    ? 'Starting cycle points not applicable'
-    : `${knownPhaseUnits}/${units.length} unit starting cycle points known`;
+  const observedPhaseCount = Math.max(0, knownPhaseUnits - boundaryNotRequiredCount);
+  const phaseStatus = `${observedPhaseCount}/${units.length} cycle points known · ${boundaryNotRequiredCount} boundary searches unnecessary · ${fullyRetrievedUnits}/${units.length} windows fully retrieved`;
   const completion = totalCellCount
     ? Math.round(100 * knownCellCount / totalCellCount)
     : 0;
 
-  return `<div class="dp-algorithm-viz" data-bid="${esc(bid)}">
+  return `<div class="dp-algorithm-viz${fullscreen ? ' fullscreen' : ''}${colorMode ? ' color-mode' : ''}${denseClass}" data-bid="${esc(bid)}" style="--dp-viz-row-height:${rowHeight}px;--dp-viz-unit-width:${unitColumnWidth}px;--dp-viz-date-font:${dateFontSize}px;--dp-price-start-hue:${DP_PRICE_GRADIENT_START_HUE};--dp-price-end-hue:${DP_PRICE_GRADIENT_END_HUE}">
     <div class="dp-viz-toolbar">
+      <label class="dp-viz-mode">Mode
+        <select data-dp-viz-mode data-bid="${esc(bid)}" aria-label="Cadence starting state">
+          <option value="known"${mode === 'known' ? ' selected' : ''}>Known — verify first</option>
+          <option value="trusted"${mode === 'trusted' ? ' selected' : ''}>Known — trust without verification</option>
+          <option value="unknown"${mode === 'unknown' ? ' selected' : ''}>Unknown — discover first</option>
+        </select>
+      </label>
       <button type="button" data-dp-viz-action="reset" data-bid="${esc(bid)}"${step === 0 ? ' disabled' : ''}>Reset</button>
       <button type="button" data-dp-viz-action="prev" data-bid="${esc(bid)}"${step === 0 ? ' disabled' : ''}>Previous</button>
       <input class="dp-viz-slider" type="range" min="0" max="${calls.length}" value="${step}" data-dp-viz-slider data-bid="${esc(bid)}" aria-label="Algorithm step">
       <button type="button" data-dp-viz-action="next" data-bid="${esc(bid)}"${step === calls.length ? ' disabled' : ''}>Next API Call</button>
       <button type="button" data-dp-viz-action="last" data-bid="${esc(bid)}"${step === calls.length ? ' disabled' : ''}>Finish</button>
+      <button type="button" data-dp-viz-action="color" data-bid="${esc(bid)}" aria-pressed="${colorMode}">Color Mode: ${colorMode ? 'On' : 'Off'}</button>
+      <button type="button" data-dp-viz-action="fullscreen" data-bid="${esc(bid)}" aria-pressed="${fullscreen}">${fullscreen ? 'Exit Full Screen' : 'Full Screen'}</button>
       <strong class="dp-viz-step-label">${esc(stepLabel)}</strong>
+      <span class="dp-viz-key-hint">←/→ step calls</span>
     </div>
     <div class="dp-viz-status">
       <span><b>Cadence:</b> ${esc(cadenceStatus)}</span>
       <span><b>Cycle position:</b> ${esc(phaseStatus)}</span>
       <span><b>Known pricing:</b> ${knownCellCount}/${totalCellCount} cells (${completion}%)</span>
+      ${currentStep ? `<span><b>Stage:</b> ${esc(currentStep.stage)} · ${esc(currentStep.reason)}</span>` : ''}
     </div>
     <div class="dp-viz-legend" aria-label="Legend">
-      <span><i class="direct"></i>API response</span>
-      <span><i class="inferred"></i>Inferred from known range</span>
+      <span><i class="direct"></i>${colorMode ? 'API response · price gradient' : 'API response'}</span>
+      <span><i class="inferred"></i>${colorMode ? 'Inferred price · muted gradient' : 'Inferred pricing'}</span>
       <span><i class="unknown"></i>Unknown</span>
-      <span><i class="price-change"></i>Distinct pricing begins</span>
+      <span><i class="observed-change"></i>Observed adjacent price change</span>
       <span><i class="boundary-window"></i>Boundary lies in interval</span>
-      <span><i class="boundary"></i>Known cycle boundary</span>
+      <span><i class="boundary"></i>Projected boundary after proof</span>
     </div>
     <div class="dp-viz-grid-wrap">
       <table class="dp-viz-grid">
+        <colgroup><col class="dp-viz-unit-col">${calendar.map(() => '<col>').join('')}</colgroup>
         <thead><tr><th class="dp-viz-corner">Unit / availability and hold</th>${headerCells}</tr></thead>
         <tbody>${unitRows}</tbody>
       </table>
@@ -2968,18 +3573,41 @@ function dpVisualizerHtml(row) {
   </div>`;
 }
 
+function dpFindVisualizerRow(bid) {
+  return (dynamicPricing.result?.rows || [])
+    .find(item => String(item.buildingId || '') === String(bid))
+    || dynamicPricing.validationVisualizerRows.get(String(bid));
+}
+
 function dpRenderVisualizer(bid) {
-  const row = (dynamicPricing.result?.rows || [])
-    .find(item => String(item.buildingId || '') === String(bid));
+  const row = dpFindVisualizerRow(bid);
   const host = document.querySelector(`.dp-algorithm-viz[data-bid="${CSS.escape(String(bid))}"]`);
   if (row && host) host.outerHTML = dpVisualizerHtml(row);
 }
 
 function dpSetVisualizerStep(bid, action) {
-  const row = (dynamicPricing.result?.rows || [])
-    .find(item => String(item.buildingId || '') === String(bid));
+  const row = dpFindVisualizerRow(bid);
   if (!row) return;
-  const maximum = (row.bootstrapApiCallDates || []).length;
+  dynamicPricing.activeVisualizer = String(bid);
+  if (action === 'color') {
+    if (dynamicPricing.visualColorOff.has(String(bid))) {
+      dynamicPricing.visualColorOff.delete(String(bid));
+    } else {
+      dynamicPricing.visualColorOff.add(String(bid));
+    }
+    dpRenderVisualizer(bid);
+    return;
+  }
+  if (action === 'fullscreen') {
+    if (dynamicPricing.visualFullscreen.has(String(bid))) {
+      dynamicPricing.visualFullscreen.delete(String(bid));
+    } else {
+      dynamicPricing.visualFullscreen.add(String(bid));
+    }
+    dpRenderVisualizer(bid);
+    return;
+  }
+  const maximum = (dpVisualizerPlan(row, String(bid)).bootstrapApiCallDates || []).length;
   let step = Number(dynamicPricing.visualSteps[bid] || 0);
   if (action === 'reset') step = 0;
   else if (action === 'prev') step -= 1;
@@ -3019,15 +3647,27 @@ function dpRenderResult(result, isPartial = false) {
 
   const rows = dpVisibleRows(allRows);
   const totalCurrent = rows.reduce((sum, row) => sum + (row.currentApiCalls || 0), 0);
-  const totalBootstrap = rows.reduce((sum, row) => sum + (row.bootstrapApiCalls || 0), 0);
-  const totalSaved = rows.reduce((sum, row) => sum + (row.apiCallsSaved || 0), 0);
+  const totalKnown = rows.reduce((sum, row) => sum + (row.knownBootstrapApiCalls || 0), 0);
+  const totalTrusted = rows.reduce((sum, row) => sum + (row.trustedBootstrapApiCalls || 0), 0);
+  const totalUnknown = rows.reduce((sum, row) => sum + (row.unknownBootstrapApiCalls || 0), 0);
+  const totalKnownSaved = rows.reduce((sum, row) => sum + (row.knownApiCallsSaved || 0), 0);
+  const totalTrustedSaved = rows.reduce((sum, row) => sum + (row.trustedApiCallsSaved || 0), 0);
+  const totalUnknownSaved = rows.reduce((sum, row) => sum + (row.unknownApiCallsSaved || 0), 0);
+  const totalKnownSavedPct = totalCurrent
+    ? (100 * totalKnownSaved / totalCurrent).toFixed(1)
+    : '0.0';
+  const totalUnknownSavedPct = totalCurrent
+    ? (100 * totalUnknownSaved / totalCurrent).toFixed(1)
+    : '0.0';
+  const totalTrustedSavedPct = totalCurrent
+    ? (100 * totalTrustedSaved / totalCurrent).toFixed(1)
+    : '0.0';
   const tableRows = rows.map(row => {
     const bid = String(row.buildingId || '');
     const isOpen = dynamicPricing.open.has(bid);
-    const bootstrapDates = row.bootstrapApiCallDates || [];
-    const bootstrapDateCell = bootstrapDates.length
-      ? `<details class="dp-dates"><summary>${bootstrapDates.length} bootstrap dates</summary>`
-        + `<div class="dp-date-list">${dpDatesHtml(bootstrapDates)}</div></details>`
+    const callDateCell = (dates, label) => (dates || []).length
+      ? `<details class="dp-dates"><summary>${dates.length} ${label} dates</summary>`
+        + `<div class="dp-date-list">${dpDatesHtml(dates)}</div></details>`
       : '<span class="si-pending">none</span>';
     return `<tr class="dp-community-row" data-bid="${esc(bid)}">
       <td><button class="dp-expand" data-bid="${esc(bid)}" aria-expanded="${isOpen}">${isOpen ? 'Hide' : 'Visualize'}</button></td>
@@ -3039,14 +3679,26 @@ function dpRenderResult(result, isPartial = false) {
         : esc(dpFormatTimestamp(row.latestSync))}</td>
       <td>${row.error ? '<span class="dp-error">Error</span>' : dpCadenceHtml(row)}</td>
       <td>${esc(dpCadenceEvidenceText(row))}</td>
+      <td>${esc(row.knownCadenceStatus || '—')}</td>
+      <td>${esc(row.unknownCadenceStatus || '—')}</td>
       <td>${esc(row.cycleAlignment || 'Unknown')}</td>
       <td class="dp-num">${row.unitCount || 0}</td>
       <td class="dp-num">${row.currentApiCalls || 0}</td>
-      <td class="dp-num">${row.bootstrapApiCalls || 0}</td>
-      <td class="dp-num dp-saved">${row.apiCallsSaved || 0}</td>
-      <td class="dp-num">${row.reconstructionAccuracyPct ?? '—'}</td>
-      <td>${esc(row.retrievalStrategy || '—')}</td>
-      <td>${bootstrapDateCell}</td>
+      <td class="dp-num">${row.knownBootstrapApiCalls ?? row.bootstrapApiCalls ?? 0}</td>
+      <td class="dp-num">${row.trustedBootstrapApiCalls ?? row.bootstrapApiCalls ?? 0}</td>
+      <td class="dp-num">${row.unknownBootstrapApiCalls ?? row.bootstrapApiCalls ?? 0}</td>
+      <td class="dp-num dp-saved">${row.knownApiCallsSaved ?? row.apiCallsSaved ?? 0}</td>
+      <td class="dp-num dp-saved">${row.trustedApiCallsSaved ?? row.apiCallsSaved ?? 0}</td>
+      <td class="dp-num dp-saved">${row.unknownApiCallsSaved ?? row.apiCallsSaved ?? 0}</td>
+      <td class="dp-num dp-saved">${row.knownApiCallsSavedPct != null ? `${row.knownApiCallsSavedPct}%` : '—'}</td>
+      <td class="dp-num dp-saved">${row.trustedApiCallsSavedPct != null ? `${row.trustedApiCallsSavedPct}%` : '—'}</td>
+      <td class="dp-num dp-saved">${row.unknownApiCallsSavedPct != null ? `${row.unknownApiCallsSavedPct}%` : '—'}</td>
+      <td class="dp-num">${row.knownReconstructionAccuracyPct ?? row.reconstructionAccuracyPct ?? '—'}</td>
+      <td class="dp-num">${row.trustedReconstructionAccuracyPct ?? row.reconstructionAccuracyPct ?? '—'}</td>
+      <td class="dp-num">${row.unknownReconstructionAccuracyPct ?? row.reconstructionAccuracyPct ?? '—'}</td>
+      <td>${callDateCell(row.knownBootstrapApiCallDates || row.bootstrapApiCallDates, 'known-mode')}</td>
+      <td>${callDateCell(row.trustedBootstrapApiCallDates || row.bootstrapApiCallDates, 'trusted-mode')}</td>
+      <td>${callDateCell(row.unknownBootstrapApiCallDates || row.bootstrapApiCallDates, 'unknown-mode')}</td>
     </tr>
     <tr class="dp-detail-row" data-bid="${esc(bid)}"${isOpen ? '' : ' hidden'}>
       <td colspan="${DP_REPORT_COLUMNS.length + 1}"><div class="dp-unit-detail">${isOpen ? dpUnitDetailHtml(row) : ''}</div></td>
@@ -3060,9 +3712,10 @@ function dpRenderResult(result, isPartial = false) {
 
   body.innerHTML = `<div class="dp-summary">
       <span>${loadedLabel}</span>
-      <span>${totalBootstrap} bootstrap calls</span>
       <span>${totalCurrent} current API calls</span>
-      <span>${totalSaved} API calls saved</span>
+      <span>Known: ${totalKnown} calls · ${totalKnownSaved} saved (${totalKnownSavedPct}%)</span>
+      <span>Trusted: ${totalTrusted} calls · ${totalTrustedSaved} saved (${totalTrustedSavedPct}%)</span>
+      <span>Unknown: ${totalUnknown} calls · ${totalUnknownSaved} saved (${totalUnknownSavedPct}%)</span>
       ${dynamicPricing.result.excluded ? `<span>${dynamicPricing.result.excluded} invalid or single-day communities excluded</span>` : ''}
       ${dynamicPricing.result.errors ? `<span style="color:#f85149">${dynamicPricing.result.errors} errors</span>` : ''}
       ${dynamicPricing.result.unitNumberError ? '<span style="color:#d29922">Unit numbers unavailable; showing matrix IDs</span>' : ''}
@@ -3071,8 +3724,10 @@ function dpRenderResult(result, isPartial = false) {
         <button type="button" class="dp-export" data-dp-export${rows.length ? '' : ' disabled'}>Export CSV</button>
       </div>
     </div>
-    <div class="dp-method-note">
-      Cadence uses the shortest complete interior price range; first and last ranges are excluded because the retrieved window can truncate them. Community-aligned properties use one shared cadence grid across all units. Unit-specific properties use cadence-spaced anchors and adaptively search intervals whose endpoint prices differ. Every sparse plan is verified against the retrieved matrix; an inexact plan falls back to daily calls. API Calls Saved equals Current API Calls minus Bootstrap Calls.
+    <div class="dp-algorithm-actions" aria-label="Algorithm references">
+      <span>Algorithm reference:</span>
+      <button type="button" data-dp-algorithm="known">Known mode pseudocode</button>
+      <button type="button" data-dp-algorithm="unknown">Unknown mode pseudocode</button>
     </div>
     <div class="dp-table-wrap"><table class="dp-table">
       <thead>
@@ -3083,45 +3738,270 @@ function dpRenderResult(result, isPartial = false) {
     </table></div>`;
 }
 
+function dpAggregateValidationOrgs(rows) {
+  const organizations = new Map();
+  (rows || []).forEach(row => {
+    const key = row.orgId == null
+      ? `name:${row.orgName || 'Unknown'}` : `id:${row.orgId}`;
+    if (!organizations.has(key)) {
+      organizations.set(key, {
+        orgId: row.orgId,
+        orgName: row.orgName || 'Unknown',
+        communityCount: 0,
+        currentApiCalls: 0,
+        unknownBootstrapApiCalls: 0,
+        unknownApiCallsSaved: 0,
+        matricesPassed: 0,
+        matricesFailed: 0,
+        matrixCells: 0,
+        incorrectCellCount: 0,
+        accuracySum: 0,
+        accuracyCount: 0,
+        exactCellAccuracy: true,
+      });
+    }
+    const org = organizations.get(key);
+    org.communityCount += 1;
+    org.currentApiCalls += Number(row.currentApiCalls || 0);
+    org.unknownBootstrapApiCalls += Number(row.unknownBootstrapApiCalls || 0);
+    org.unknownApiCallsSaved += Number(row.unknownApiCallsSaved || 0);
+    const accuracy = Number(row.unknownReconstructionAccuracyPct);
+    if (Number.isFinite(accuracy)) {
+      org.accuracySum += accuracy;
+      org.accuracyCount += 1;
+      if (accuracy === 100) org.matricesPassed += 1;
+      else org.matricesFailed += 1;
+    }
+    const matrixCells = Number(row.matrixCells);
+    const incorrectCells = Number(row.incorrectCellCount);
+    if (Number.isFinite(matrixCells) && Number.isFinite(incorrectCells)) {
+      org.matrixCells += matrixCells;
+      org.incorrectCellCount += incorrectCells;
+    } else {
+      org.exactCellAccuracy = false;
+    }
+  });
+  return [...organizations.values()].map(org => ({
+    ...org,
+    unknownApiCallsSavedPct: org.currentApiCalls
+      ? 100 * org.unknownApiCallsSaved / org.currentApiCalls : 0,
+    unknownReconstructionAccuracyPct:
+      org.exactCellAccuracy && org.matrixCells
+        ? 100 * (org.matrixCells - org.incorrectCellCount) / org.matrixCells
+        : (org.accuracyCount ? org.accuracySum / org.accuracyCount : null),
+  }));
+}
+
+function dpRenderValidationResult(result, isPartial = false) {
+  dynamicPricing.validationResult = result || {};
+  const body = document.getElementById('dp-preview-body');
+  const status = result.validationStatus || (isPartial ? 'running' : 'unknown');
+  const statusLabel = status.replace('-', ' ');
+  const communityRows = result.rows || [];
+  const organizationView = dynamicPricing.validationView === 'organization';
+  const rows = dpValidationSortedRows(
+    organizationView ? dpAggregateValidationOrgs(communityRows) : communityRows);
+  const totalCurrentCalls = communityRows.reduce(
+    (sum, row) => sum + Number(row.currentApiCalls || 0), 0);
+  const totalUnknownCalls = communityRows.reduce(
+    (sum, row) => sum + Number(row.unknownBootstrapApiCalls || 0), 0);
+  // Run-wide savings must be calculated from the summed call counts, rather
+  // than by averaging (or otherwise combining) community percentages.
+  const totalCallsSaved = totalCurrentCalls - totalUnknownCalls;
+  const totalSavedPct = totalCurrentCalls
+    ? 100 * totalCallsSaved / totalCurrentCalls : 0;
+  const fallbackAccuracies = communityRows
+    .map(row => Number(row.unknownReconstructionAccuracyPct))
+    .filter(Number.isFinite);
+  const totalAccuracy = result.overallReconstructionAccuracyPct != null
+    ? Number(result.overallReconstructionAccuracyPct)
+    : (fallbackAccuracies.length
+        ? fallbackAccuracies.reduce((sum, value) => sum + value, 0)
+          / fallbackAccuracies.length
+        : null);
+  const matricesPassed = result.matricesPassed != null
+    ? Number(result.matricesPassed)
+    : communityRows.filter(
+        row => Number(row.unknownReconstructionAccuracyPct) === 100).length;
+  const matricesFailed = result.matricesFailed != null
+    ? Number(result.matricesFailed)
+    : Math.max(0, communityRows.length - matricesPassed);
+  const statusClass = status === 'failed'
+    ? 'fail' : (status === 'passed' ? 'pass' : 'neutral');
+  const tableRows = organizationView ? rows.map(row => {
+    const accuracy = row.unknownReconstructionAccuracyPct;
+    const accuracyLabel = accuracy == null
+      ? '—'
+      : `${Number(accuracy).toFixed(6)}%${row.exactCellAccuracy ? '' : ' avg'}`;
+    return `<tr class="dp-community-row">
+      <td>${esc(row.orgName || '—')}</td>
+      <td class="si-mono">${esc(row.orgId ?? '—')}</td>
+      <td class="dp-num">${Number(row.communityCount || 0).toLocaleString()}</td>
+      <td class="dp-num">${Number(row.currentApiCalls || 0).toLocaleString()}</td>
+      <td class="dp-num">${Number(row.unknownBootstrapApiCalls || 0).toLocaleString()}</td>
+      <td class="dp-num dp-saved">${Number(row.unknownApiCallsSaved || 0).toLocaleString()}</td>
+      <td class="dp-num dp-saved">${Number(row.unknownApiCallsSavedPct || 0).toFixed(1)}%</td>
+      <td class="dp-num dp-validation-${row.matricesFailed ? 'fail' : 'pass'}">${accuracyLabel}</td>
+      <td class="dp-num">${Number(row.matricesPassed || 0).toLocaleString()}</td>
+      <td class="dp-num">${Number(row.matricesFailed || 0).toLocaleString()}</td>
+    </tr>`;
+  }).join('') : rows.map(row => {
+    const bid = String(row.buildingId || '');
+    const isOpen = dynamicPricing.validationOpen.has(bid);
+    const loadedRow = dynamicPricing.validationVisualizerRows.get(bid);
+    const accuracy = row.unknownReconstructionAccuracyPct;
+    const passed = accuracy === 100;
+    return `<tr class="dp-community-row" data-bid="${esc(bid)}">
+      <td><button type="button" class="dp-expand" data-dp-validation-viz="${esc(bid)}"
+        aria-expanded="${isOpen}"${isPartial || !dynamicPricing.validationResultId ? ' disabled' : ''}>${isOpen ? 'Hide' : 'Visualize steps'}</button></td>
+      <td>${esc(row.orgName || '—')}</td>
+      <td>${esc(row.buildingName || '—')}</td>
+      <td class="si-mono">${esc(row.buildingId || '—')}</td>
+      <td>${row.snapshotLink
+        ? `<a href="${esc(row.snapshotLink)}" target="_blank" rel="noopener noreferrer">${esc(dpFormatTimestamp(row.latestSync))}</a>`
+        : esc(dpFormatTimestamp(row.latestSync))}</td>
+      <td>${esc(row.cadence || row.cadenceDays || '—')}</td>
+      <td class="dp-num">${row.unitCount || 0}</td>
+      <td class="dp-num">${row.currentApiCalls || 0}</td>
+      <td class="dp-num">${row.unknownBootstrapApiCalls || 0}</td>
+      <td class="dp-num dp-saved">${row.unknownApiCallsSaved || 0}</td>
+      <td class="dp-num dp-saved">${row.unknownApiCallsSavedPct == null ? '—' : `${row.unknownApiCallsSavedPct}%`}</td>
+      <td class="dp-num dp-validation-${passed ? 'pass' : 'fail'}">${accuracy == null ? '—' : `${accuracy}%`}</td>
+      <td>${esc(row.unknownCadenceStatus || '—')}</td>
+    </tr>
+    <tr class="dp-detail-row dp-validation-detail-row" data-bid="${esc(bid)}"${isOpen ? '' : ' hidden'}>
+      <td colspan="13"><div class="dp-unit-detail">${isOpen
+        ? (loadedRow ? dpVisualizerHtml(loadedRow) : '<div class="si-pending">Loading saved matrix and algorithm steps…</div>')
+        : ''}</div></td>
+    </tr>`;
+  }).join('');
+
+  document.getElementById('dp-preview-title').textContent = 'Unknown Mode Validation';
+  document.getElementById('dp-preview-status').textContent = isPartial
+    ? `${result.communitiesCompleted || 0}/${result.communitiesConsidered || 0} checked`
+    : `${Number(result.matricesTested || 0).toLocaleString()} matrices tested`;
+  body.innerHTML = `<div class="dp-validation-summary">
+      <span class="dp-validation-rollup"><strong>All ${communityRows.length.toLocaleString()} buildings:</strong> ${totalCallsSaved.toLocaleString()} total API calls saved · ${totalSavedPct.toFixed(1)}% total saved${totalAccuracy == null ? '' : ` · ${totalAccuracy.toFixed(6)}% total accuracy`}</span>
+      <span class="dp-validation-status ${statusClass}">${esc(statusLabel)}</span>
+      <span>${Number(result.matricesTested || 0).toLocaleString()} matrices tested</span>
+      <span>${matricesPassed.toLocaleString()} passed · ${matricesFailed.toLocaleString()} failed</span>
+      <span>${totalCurrentCalls.toLocaleString()} current API calls</span>
+      <span>${totalUnknownCalls.toLocaleString()} Unknown-mode API calls</span>
+      <span>${Number(result.communitiesCompleted || 0).toLocaleString()} of ${Number(result.communitiesConsidered || 0).toLocaleString()} communities checked</span>
+      <span>${Number(result.cadenceOneTested || 0).toLocaleString()} cadence = 1 tested</span>
+      <span>${Number(result.missingAvailabilitySkipped || 0).toLocaleString()} missing or inconsistent availability inputs</span>
+      <span>${Number(result.excluded || 0).toLocaleString()} unavailable matrices excluded</span>
+      <span>${Number((result.cadenceCorrections || []).length).toLocaleString()} cadence candidates corrected from normal responses</span>
+      <span>${isPartial ? 'Result will be saved when validation completes' : 'Saved to validation history'}</span>
+      ${result.errors ? `<span class="dp-validation-fail">${Number(result.errors).toLocaleString()} errors</span>` : ''}
+      ${result.durationSeconds != null ? `<span>${esc(result.durationSeconds)} seconds</span>` : ''}
+    </div>
+    <div class="si-toggle-bar">
+      <span class="si-toggle-label">View totals by</span>
+      <div class="si-seg">
+        <button class="si-seg-btn${organizationView ? '' : ' active'}" data-dp-validation-view="community">Community</button>
+        <button class="si-seg-btn${organizationView ? ' active' : ''}" data-dp-validation-view="organization">Organization</button>
+      </div>
+    </div>
+    <p class="dp-validation-confidence">${esc(result.confidence || '')}</p>
+    ${organizationView && rows.some(row => !row.exactCellAccuracy)
+      ? '<p class="dp-validation-warning">This saved run predates per-community cell totals, so organization accuracy is the average community accuracy. New validation runs use exact cell-weighted accuracy.</p>'
+      : ''}
+    ${result.populationTruncated ? '<p class="dp-validation-warning">The configured limit was reached, so this result covers a sample rather than the full selected population.</p>' : ''}
+    <div class="dp-table-wrap"><table class="dp-table dp-validation-table">
+      <thead><tr>${organizationView ? '' : '<th></th>'}${dpValidationHeaderHtml()}</tr></thead>
+      <tbody>${tableRows || `<tr><td colspan="${dpValidationActiveColumns().length + (organizationView ? 0 : 1)}" class="dp-no-results">${isPartial ? 'Waiting for the first matrix with an available cadence…' : 'No matrices with an available cadence were available in this run.'}</td></tr>`}</tbody>
+    </table></div>`;
+}
+
+async function dpToggleValidationVisualizer(bid) {
+  bid = String(bid || '');
+  if (!bid || !dynamicPricing.validationResultId) return;
+  const button = document.querySelector(
+    `[data-dp-validation-viz="${CSS.escape(bid)}"]`);
+  const detail = document.querySelector(
+    `.dp-validation-detail-row[data-bid="${CSS.escape(bid)}"]`);
+  if (!button || !detail) return;
+
+  if (dynamicPricing.validationOpen.has(bid)) {
+    dynamicPricing.validationOpen.delete(bid);
+    dynamicPricing.visualFullscreen.delete(bid);
+    detail.hidden = true;
+    detail.querySelector('.dp-unit-detail').innerHTML = '';
+    button.textContent = 'Visualize steps';
+    button.setAttribute('aria-expanded', 'false');
+    if (dynamicPricing.activeVisualizer === bid) {
+      dynamicPricing.activeVisualizer = [...dynamicPricing.validationOpen][0]
+        || [...dynamicPricing.open][0] || null;
+    }
+    return;
+  }
+
+  dynamicPricing.validationOpen.add(bid);
+  dynamicPricing.activeVisualizer = bid;
+  dynamicPricing.visualModes[bid] = 'unknown';
+  dynamicPricing.visualSteps[bid] ||= 0;
+  detail.hidden = false;
+  button.textContent = 'Hide';
+  button.setAttribute('aria-expanded', 'true');
+  const host = detail.querySelector('.dp-unit-detail');
+  const cached = dynamicPricing.validationVisualizerRows.get(bid);
+  if (cached) {
+    host.innerHTML = dpVisualizerHtml(cached);
+    return;
+  }
+
+  button.disabled = true;
+  host.innerHTML = '<div class="si-pending">Loading the saved sync-matched matrix and rebuilding its algorithm steps…</div>';
+  try {
+    const response = await fetch(
+      `/api/dynamic-pricing/validation/${encodeURIComponent(dynamicPricing.validationResultId)}/community/${encodeURIComponent(bid)}`);
+    const row = await response.json();
+    if (!response.ok || row.error) {
+      throw new Error(row.error || response.statusText);
+    }
+    dynamicPricing.validationVisualizerRows.set(bid, row);
+    host.innerHTML = dpVisualizerHtml(row);
+  } catch (error) {
+    dynamicPricing.validationOpen.delete(bid);
+    dynamicPricing.activeVisualizer = null;
+    button.textContent = 'Visualize steps';
+    button.setAttribute('aria-expanded', 'false');
+    host.innerHTML = `<div class="dp-error">Could not load algorithm steps: ${esc(error.message)}</div>`;
+  } finally {
+    button.disabled = false;
+  }
+}
+
 function dpToggleCommunity(bid) {
-  if (dynamicPricing.open.has(bid)) dynamicPricing.open.delete(bid);
-  else dynamicPricing.open.add(bid);
+  if (dynamicPricing.open.has(bid)) {
+    dynamicPricing.open.delete(bid);
+    dynamicPricing.visualFullscreen.delete(bid);
+    if (dynamicPricing.activeVisualizer === bid) {
+      dynamicPricing.activeVisualizer = [...dynamicPricing.open][0] || null;
+    }
+  } else {
+    dynamicPricing.open.add(bid);
+    dynamicPricing.activeVisualizer = bid;
+    dynamicPricing.visualModes[bid] ||= 'known';
+    dynamicPricing.visualSteps[bid] ||= 0;
+  }
   dpRenderResult(dynamicPricing.result, !!dynamicPricing.result?.partial);
 }
 
 async function runDynamicPricing() {
-  const input = document.getElementById('dp-limit');
-  const limit = Number.parseInt(input.value, 10);
-  if (!Number.isInteger(limit) || limit < 1 || limit > 5000) {
-    dpSetStatus('Maximum communities must be between 1 and 5,000.', true);
-    return;
-  }
-  const orgText = document.getElementById('dp-org-ids').value.trim();
-  const orgTokens = orgText ? orgText.split(/[\s,]+/).filter(Boolean) : [];
-  const invalidOrgId = orgTokens.find(value => !/^\d+$/.test(value) || Number(value) <= 0);
-  if (invalidOrgId) {
-    dpSetStatus(`Organization IDs must be positive integers; check “${invalidOrgId}”.`, true);
-    return;
-  }
-  const orgIds = [...new Set(orgTokens)];
-  if (orgIds.length > 5000) {
-    dpSetStatus('Enter at most 5,000 organization IDs.', true);
-    return;
-  }
-  if (dynamicPricing.polling) clearInterval(dynamicPricing.polling);
-  dynamicPricing.jobId = null;
-  dynamicPricing.polling = null;
-  dynamicPricing.result = null;
-  dynamicPricing.open.clear();
-  dynamicPricing.visualSteps = {};
-  dynamicPricing.filters = {};
-  dynamicPricing.sortKey = 'apiCallsSaved';
-  dynamicPricing.sortDir = 'desc';
+  const scopeValues = dpReadRunScope();
+  if (!scopeValues) return;
+  const {limit, orgIds, communityIds} = scopeValues;
+  if (dynamicPricing.validationPolling) clearInterval(dynamicPricing.validationPolling);
+  dynamicPricing.validationJobId = null;
+  dynamicPricing.validationPolling = null;
+  dpResetReportState();
 
-  const button = document.getElementById('btn-run-dynamic-pricing');
-  button.disabled = true;
-  dpSetStatus(orgIds.length
-    ? `Finding Entrata communities for ${orgIds.length} organization${orgIds.length === 1 ? '' : 's'}…`
+  dpSetRunButtons(true);
+  const scope = dpScopeLabel(orgIds, communityIds);
+  dpSetStatus(scope
+    ? `Finding Entrata communities for ${scope}…`
     : 'Finding Entrata communities in Snowflake…');
   document.getElementById('dp-preview-status').textContent = 'Starting…';
   document.getElementById('dp-preview-body').innerHTML =
@@ -3130,7 +4010,7 @@ async function runDynamicPricing() {
     const response = await fetch('/api/dynamic-pricing/analyze', {
       method: 'POST',
       headers: {'Content-Type': 'application/json'},
-      body: JSON.stringify({limit, orgIds}),
+      body: JSON.stringify({limit, orgIds, communityIds}),
     });
     const data = await response.json();
     if (!response.ok || data.error) throw new Error(data.error || response.statusText);
@@ -3138,12 +4018,87 @@ async function runDynamicPricing() {
     dynamicPricing.polling = setInterval(pollDynamicPricing, 1500);
     await pollDynamicPricing();
   } catch (error) {
-    button.disabled = false;
+    dpSetRunButtons(false);
     dpSetStatus(`Analysis failed: ${error.message}`, true);
     document.getElementById('dp-preview-status').textContent = 'Error';
     document.getElementById('dp-preview-body').innerHTML =
       `<div class="pane-msg" style="color:#f85149">${esc(error.message)}</div>`;
   }
+}
+
+function dpReadRunScope() {
+  const input = document.getElementById('dp-limit');
+  const limit = Number.parseInt(input.value, 10);
+  if (!Number.isInteger(limit) || limit < 1 || limit > 5000) {
+    dpSetStatus('Maximum communities must be between 1 and 5,000.', true);
+    return null;
+  }
+  const orgText = document.getElementById('dp-org-ids').value.trim();
+  const orgTokens = orgText ? orgText.split(/[\s,]+/).filter(Boolean) : [];
+  const invalidOrgId = orgTokens.find(value => !/^\d+$/.test(value) || Number(value) <= 0);
+  if (invalidOrgId) {
+    dpSetStatus(`Organization IDs must be positive integers; check “${invalidOrgId}”.`, true);
+    return null;
+  }
+  const orgIds = [...new Set(orgTokens)];
+  if (orgIds.length > 5000) {
+    dpSetStatus('Enter at most 5,000 organization IDs.', true);
+    return null;
+  }
+  const communityText = document.getElementById('dp-community-ids').value.trim();
+  const communityTokens = communityText
+    ? communityText.split(/[\s,]+/).filter(Boolean)
+    : [];
+  const invalidCommunityId = communityTokens.find(value =>
+    !/^\d+$/.test(value) || Number(value) <= 0);
+  if (invalidCommunityId) {
+    dpSetStatus(`Community IDs must be positive integers; check “${invalidCommunityId}”.`, true);
+    return null;
+  }
+  const communityIds = [...new Set(communityTokens)];
+  if (communityIds.length > 5000) {
+    dpSetStatus('Enter at most 5,000 community IDs.', true);
+    return null;
+  }
+  return {limit, orgIds, communityIds};
+}
+
+function dpResetReportState() {
+  if (dynamicPricing.polling) clearInterval(dynamicPricing.polling);
+  dynamicPricing.jobId = null;
+  dynamicPricing.polling = null;
+  dynamicPricing.result = null;
+  dynamicPricing.validationResultId = null;
+  dynamicPricing.validationResult = null;
+  dynamicPricing.validationVisualizerRows.clear();
+  dynamicPricing.validationOpen.clear();
+  dynamicPricing.open.clear();
+  dynamicPricing.visualSteps = {};
+  dynamicPricing.visualModes = {};
+  dynamicPricing.visualFullscreen.clear();
+  dynamicPricing.activeVisualizer = null;
+  dynamicPricing.filters = {};
+  dynamicPricing.sortKey = 'knownApiCallsSaved';
+  dynamicPricing.sortDir = 'desc';
+  dynamicPricing.validationSortKey = 'unknownApiCallsSaved';
+  dynamicPricing.validationSortDir = 'desc';
+  dynamicPricing.validationView = 'community';
+}
+
+function dpSetRunButtons(disabled) {
+  document.getElementById('btn-run-dynamic-pricing').disabled = disabled;
+  document.getElementById('btn-validate-dynamic-pricing').disabled = disabled;
+}
+
+function dpScopeLabel(orgIds, communityIds) {
+  return [
+    communityIds.length
+      ? `${communityIds.length} specified communit${communityIds.length === 1 ? 'y' : 'ies'}`
+      : '',
+    orgIds.length
+      ? `${orgIds.length} organization${orgIds.length === 1 ? '' : 's'}`
+      : '',
+  ].filter(Boolean).join(' plus ');
 }
 
 async function pollDynamicPricing() {
@@ -3159,7 +4114,7 @@ async function pollDynamicPricing() {
     clearInterval(dynamicPricing.polling);
     dynamicPricing.polling = null;
     dynamicPricing.jobId = null;
-    document.getElementById('btn-run-dynamic-pricing').disabled = false;
+    dpSetRunButtons(false);
     if (job.status === 'error') throw new Error(job.error || 'Unknown analysis error');
     const result = job.result || {};
     dpRenderResult(result, false);
@@ -3170,9 +4125,115 @@ async function pollDynamicPricing() {
     if (dynamicPricing.polling) clearInterval(dynamicPricing.polling);
     dynamicPricing.polling = null;
     dynamicPricing.jobId = null;
-    document.getElementById('btn-run-dynamic-pricing').disabled = false;
+    dpSetRunButtons(false);
     dpSetStatus(`Analysis failed: ${error.message}`, true);
     document.getElementById('dp-preview-status').textContent = 'Error';
+  }
+}
+
+async function runDynamicPricingValidation() {
+  const scopeValues = dpReadRunScope();
+  if (!scopeValues) return;
+  const {limit, orgIds, communityIds} = scopeValues;
+  if (dynamicPricing.polling) clearInterval(dynamicPricing.polling);
+  dynamicPricing.jobId = null;
+  if (dynamicPricing.validationPolling) clearInterval(dynamicPricing.validationPolling);
+  dynamicPricing.validationJobId = null;
+  dpResetReportState();
+  dpSetRunButtons(true);
+
+  const scope = dpScopeLabel(orgIds, communityIds);
+  dpSetStatus(scope
+    ? `Preparing Unknown-mode validation for ${scope}…`
+    : 'Preparing broad Unknown-mode validation…');
+  document.getElementById('dp-preview-title').textContent = 'Unknown Mode Validation';
+  document.getElementById('dp-preview-status').textContent = 'Starting…';
+  document.getElementById('dp-preview-body').innerHTML =
+    '<div class="pane-msg">Testing latest-sync matrices with cadence greater than one…</div>';
+  try {
+    const response = await fetch('/api/dynamic-pricing/validate-unknown', {
+      method: 'POST',
+      headers: {'Content-Type': 'application/json'},
+      body: JSON.stringify({limit, orgIds, communityIds}),
+    });
+    const data = await response.json();
+    if (!response.ok || data.error) throw new Error(data.error || response.statusText);
+    dynamicPricing.validationJobId = data.jobId;
+    dynamicPricing.validationResultId = data.jobId;
+    dynamicPricing.validationPolling = setInterval(
+      pollDynamicPricingValidation, 1500);
+    await pollDynamicPricingValidation();
+  } catch (error) {
+    dpSetRunButtons(false);
+    dpSetStatus(`Validation failed: ${error.message}`, true);
+    document.getElementById('dp-preview-status').textContent = 'Error';
+    document.getElementById('dp-preview-body').innerHTML =
+      `<div class="pane-msg" style="color:#f85149">${esc(error.message)}</div>`;
+  }
+}
+
+async function pollDynamicPricingValidation() {
+  if (!dynamicPricing.validationJobId) return;
+  try {
+    const response = await fetch(`/api/job?id=${encodeURIComponent(dynamicPricing.validationJobId)}`);
+    const job = await response.json();
+    if (!response.ok || !job.status) throw new Error(job.error || response.statusText);
+    if (job.result) dpRenderValidationResult(job.result, job.status === 'running');
+    dpSetStatus(job.note || 'Validating Unknown mode…');
+    if (job.status === 'running') return;
+
+    clearInterval(dynamicPricing.validationPolling);
+    dynamicPricing.validationPolling = null;
+    dynamicPricing.validationJobId = null;
+    dpSetRunButtons(false);
+    if (job.status === 'error') throw new Error(job.error || 'Unknown validation error');
+    const result = job.result || {};
+    dpRenderValidationResult(result, false);
+    dpSetStatus(`Validation ${String(result.validationStatus || 'finished').replace('-', ' ')} — ${Number(result.matricesTested || 0).toLocaleString()} matrices tested`);
+    await loadHistory();
+    const saved = document.getElementById('saved-dynamic-pricing-validation');
+    saved?.classList.add('open');
+    saved?.querySelector('.saved-toggle')?.setAttribute('aria-expanded', 'true');
+  } catch (error) {
+    if (dynamicPricing.validationPolling) clearInterval(dynamicPricing.validationPolling);
+    dynamicPricing.validationPolling = null;
+    dynamicPricing.validationJobId = null;
+    dpSetRunButtons(false);
+    dpSetStatus(`Validation failed: ${error.message}`, true);
+    document.getElementById('dp-preview-status').textContent = 'Error';
+  }
+}
+
+async function openDynamicPricingValidationHistory(entry) {
+  setMode('dynamic-pricing');
+  dynamicPricing.validationResultId = entry.id;
+  dynamicPricing.validationResult = null;
+  dynamicPricing.validationSortKey = 'unknownApiCallsSaved';
+  dynamicPricing.validationSortDir = 'desc';
+  dynamicPricing.validationView = 'community';
+  dynamicPricing.validationVisualizerRows.clear();
+  dynamicPricing.validationOpen.clear();
+  dynamicPricing.visualSteps = {};
+  dynamicPricing.visualModes = {};
+  dynamicPricing.visualFullscreen.clear();
+  dynamicPricing.activeVisualizer = null;
+  document.getElementById('dp-preview-title').textContent = 'Unknown Mode Validation';
+  document.getElementById('dp-preview-status').textContent = 'Loading saved result…';
+  document.getElementById('dp-preview-body').innerHTML =
+    '<div class="pane-msg">Opening saved validation result…</div>';
+  try {
+    const url = entry.resultUrl
+      || `/api/dynamic-pricing/validation/${encodeURIComponent(entry.id)}`;
+    const response = await fetch(url);
+    const result = await response.json();
+    if (!response.ok || result.error) throw new Error(result.error || response.statusText);
+    dpRenderValidationResult(result, false);
+    dpSetStatus(`Saved validation from ${entry.createdAt ? new Date(entry.createdAt).toLocaleString() : 'history'}`);
+  } catch (error) {
+    dpSetStatus(`Could not open saved validation: ${error.message}`, true);
+    document.getElementById('dp-preview-status').textContent = 'Error';
+    document.getElementById('dp-preview-body').innerHTML =
+      `<div class="pane-msg" style="color:#f85149">${esc(error.message)}</div>`;
   }
 }
 

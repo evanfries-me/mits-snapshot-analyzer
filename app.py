@@ -14,8 +14,9 @@ Connects via .env file or AWS environment variables.
 
 from flask import Flask, request, jsonify, send_from_directory
 from flask_cors import CORS
-from concurrent.futures import (ThreadPoolExecutor, TimeoutError as FutureTimeoutError,
-                                wait, FIRST_COMPLETED)
+from concurrent.futures import (ProcessPoolExecutor, ThreadPoolExecutor,
+                                TimeoutError as FutureTimeoutError, wait,
+                                FIRST_COMPLETED)
 from datetime import date, datetime, timedelta, timezone
 from botocore.config import Config
 from botocore.exceptions import ClientError
@@ -47,6 +48,7 @@ DYNAMIC_PRICING_BUCKET = os.environ.get(
     'DYNAMIC_PRICING_BUCKET', 'elise-dynamic-pricing')
 DYNAMIC_PRICING_MAX_COMMUNITIES = 5000
 DYNAMIC_PRICING_WORKERS = 16
+DYNAMIC_PRICING_VALIDATION_WORKERS = min(12, os.cpu_count() or 4)
 
 INDEX_DIR     = os.path.join(os.path.dirname(os.path.abspath(__file__)), 'index')
 INDEX_WORKERS = 64  # parallel LISTs while indexing
@@ -533,12 +535,14 @@ def _history_write(entries):
 
 
 def _history_record(job_id, kind, result, details=None):
-    if not result or kind not in ('fields', 'availability'):
+    if not result or kind not in (
+            'fields', 'availability', 'dynamic_pricing_validation'):
         return
     now = time.time()
     with _history_lock:
         entries = _history_read()
         previous = next((entry for entry in entries if entry.get('id') == job_id), {})
+        is_validation = kind == 'dynamic_pricing_validation'
         entry = {
             'id': job_id,
             'kind': kind,
@@ -547,12 +551,16 @@ def _history_record(job_id, kind, result, details=None):
             'createdAt': datetime.fromtimestamp(now, timezone.utc).isoformat(),
             'created': now,
             'favorite': bool(previous.get('favorite')),
-            'rowCount': result.get('rowCount', 0),
+            'rowCount': (result.get('matricesTested', 0)
+                         if is_validation else result.get('rowCount', 0)),
             'fields': result.get('fields') or [],
             'csvFields': result.get('csvFields') or result.get('fields') or [],
             'fileName': result.get('fileName'),
             'details': details or {},
-            'downloadUrl': f'/api/search/csv/{job_id}',
+            'downloadUrl': (None if is_validation
+                            else f'/api/search/csv/{job_id}'),
+            'resultUrl': (f'/api/dynamic-pricing/validation/{job_id}'
+                          if is_validation else None),
         }
         entries = [entry] + [item for item in entries if item.get('id') != job_id]
         entries.sort(key=lambda item: float(item.get('created') or 0), reverse=True)
@@ -564,8 +572,11 @@ def _history_entries():
     with _history_lock:
         entries = _history_read()
     for entry in entries:
-        entry['available'] = os.path.exists(
-            os.path.join(EXPORT_DIR, f'{entry.get("id", "")}.csv'))
+        extension = (
+            '.json' if entry.get('kind') == 'dynamic_pricing_validation'
+            else '.csv')
+        entry['available'] = os.path.exists(os.path.join(
+            EXPORT_DIR, f'{entry.get("id", "")}{extension}'))
     return entries
 
 
@@ -1935,7 +1946,7 @@ def _run_search_job(job_id: str, integration: str, file_name: str, text: str,
 
 
 def _cleanup_old_exports():
-    """Sweep CSV exports past EXPORT_MAX_AGE. Called opportunistically at the
+    """Sweep saved exports past EXPORT_MAX_AGE. Called opportunistically at the
     start of each fields job rather than on a timer — this is a low-traffic
     dev tool, not a service that needs a scheduler."""
     if not os.path.isdir(EXPORT_DIR):
@@ -1947,7 +1958,8 @@ def _cleanup_old_exports():
     for fn in os.listdir(EXPORT_DIR):
         if fn in {os.path.basename(HISTORY_PATH), os.path.basename(HISTORY_PATH) + '.tmp'}:
             continue
-        job_id = fn[:-4] if fn.endswith('.csv') else None
+        stem, extension = os.path.splitext(fn)
+        job_id = stem if extension in ('.csv', '.json') else None
         if job_id in favorite_ids:
             continue
         path = os.path.join(EXPORT_DIR, fn)
@@ -2735,6 +2747,18 @@ def _availability_snapshot_datetime(snapshot):
     return parsed.replace(tzinfo=timezone.utc) if parsed.tzinfo is None else parsed.astimezone(timezone.utc)
 
 
+def _availability_leading_number(text) -> float:
+    """Parse the leading numeric token of a raw PMS value, tolerating a
+    trailing unit label the API appends to an otherwise-numeric field --
+    e.g. Entrata's Area: "1663.0000 SquareFeet". Raises ValueError/TypeError
+    the same as float() when there is no leading number at all, so callers
+    that already catch those need no other change."""
+    match = re.match(r'\s*[+-]?\d+(?:\.\d+)?', str(text))
+    if not match:
+        raise ValueError(f'no leading number in {text!r}')
+    return float(match.group())
+
+
 def _availability_when(values: dict, clause: dict):
     if 'any' in clause:
         return any(_availability_when(values, child) for child in (clause.get('any') or []))
@@ -2754,6 +2778,8 @@ def _availability_when(values: dict, clause: dict):
     reference_date = reference_date or datetime.now(timezone.utc).date()
     if op == 'missing':
         return actual is None or text == ''
+    if op == 'nonempty':
+        return actual is not None and text != ''
     if op == 'truthy':
         return bool(actual) and text.casefold() not in ('false', '0', 'none', 'null', 'no')
     if op == 'falsey':
@@ -2762,7 +2788,7 @@ def _availability_when(values: dict, clause: dict):
         return actual is not None and text.casefold() in ('', 'false', '0', 'none', 'null', 'no')
     if op == 'invalid_rent':
         try:
-            return not (100 < float(actual) < 50000)
+            return not (100 < _availability_leading_number(actual) < 50000)
         except (TypeError, ValueError):
             return True
     if op == 'invalid_sqft':
@@ -2773,7 +2799,11 @@ def _availability_when(values: dict, clause: dict):
         if not actual or text.casefold() in ('false', '0', 'none', 'null', 'no'):
             return False
         try:
-            numeric = float(actual)
+            # Some raw feeds append a unit label to an otherwise-numeric
+            # value (Entrata's Area: "1663.0000 SquareFeet"); read the
+            # leading number rather than treating the whole field as
+            # malformed.
+            numeric = _availability_leading_number(actual)
             if numeric == 0:
                 return False
             return not (0 < numeric < 10000)
@@ -4430,7 +4460,7 @@ WHERE COALESCE(
         building_flag.VALUE, org_flag.VALUE, default_flag.VALUE, FALSE) = TRUE
     AND b.IS_ACTIVE = TRUE
     AND COALESCE(b.IS_TEST, FALSE) = FALSE
-    {org_filter}
+    {search_filter}
     AND UPPER(COALESCE(
         b.PRICING_USED, b.PMS_USED_NAME, b.CRM_USED_NAME, '')) = 'ENTRATA'
 ORDER BY b.ID
@@ -4497,7 +4527,14 @@ def _dynamic_pricing_unit_result(matrix, ordinal):
     previous_day = None
     for day in pricing_dates:
         signature = _dynamic_pricing_signature(by_date[day])
-        if previous_signature is None or signature != previous_signature:
+        is_calendar_contiguous = False
+        if previous_day is not None:
+            is_calendar_contiguous = (
+                date.fromisoformat(day) - date.fromisoformat(previous_day)
+            ).days == 1
+        if (previous_signature is None
+                or signature != previous_signature
+                or not is_calendar_contiguous):
             change_dates.append(day)
             if range_start is not None:
                 price_ranges.append({
@@ -4528,6 +4565,13 @@ def _dynamic_pricing_unit_result(matrix, ordinal):
         'cadencePattern': observed_gaps,
         'pricingDates': pricing_dates,
         'pricingDateCount': len(pricing_dates),
+        # The retrieval input is a calendar-day hold, not the count of prices
+        # Entrata happened to return. A temporarily unavailable unit can have
+        # sparse pricing dates inside that requested window.
+        'pricingWindowDayCount': (
+            date.fromisoformat(pricing_dates[-1])
+            - date.fromisoformat(pricing_dates[0])
+        ).days + 1,
         'priceRanges': price_ranges,
         'priceRangeCount': len(price_ranges),
         'priceRangeLengths': [
@@ -4900,53 +4944,2618 @@ def _dynamic_pricing_aligned_retrieval_dates(units, cadence_days, phase):
     return calls, accuracy
 
 
-def _dynamic_pricing_visualizer_metadata(
-        units, cadence_days, cycle_alignment, cycle_phases, call_sequence):
-    """Attach compact step-through metadata before signatures are discarded."""
-    shared_phase = (next(iter(cycle_phases))
-                    if cycle_alignment == 'Community-Aligned'
-                    and len(cycle_phases) == 1 else None)
-    for unit in units:
-        unit['holdTimeDays'] = unit.get('pricingDateCount') or 0
-        unit['visualStartDate'] = unit.get('firstPricingDate')
-        unit_phase = shared_phase
-        if unit_phase is None:
-            unit_phase = unit.get('_cyclePhase')
-        if unit_phase is None and cadence_days:
-            for price_range in (unit.get('priceRanges') or [])[1:]:
-                try:
-                    unit_phase = (
-                        date.fromisoformat(price_range['start']).toordinal()
-                        % cadence_days)
+def _dynamic_pricing_cycle_groups(unit, cadence_days, phase):
+    """Return this unit's dated cadence groups for one proven phase."""
+    groups = []
+    current_key = None
+    current_dates = []
+    for day in unit.get('pricingDates') or []:
+        parsed = date.fromisoformat(day)
+        cycle_key = (parsed.toordinal() - phase) // cadence_days
+        if current_key is not None and cycle_key != current_key:
+            groups.append(current_dates)
+            current_dates = []
+        current_key = cycle_key
+        current_dates.append(day)
+    if current_dates:
+        groups.append(current_dates)
+    return groups
+
+
+def _dynamic_pricing_phase_proof_call(unit, call_sequence, cadence_ready_at):
+    """Return when adjacent queried dates first prove a unit boundary."""
+    call_index = {day: index for index, day in enumerate(call_sequence, 1)}
+    signatures = unit.get('_pricingSignatures') or {}
+    proofs = []
+    for previous, current in zip(
+            unit.get('pricingDates') or [],
+            (unit.get('pricingDates') or [])[1:]):
+        if signatures.get(previous) == signatures.get(current):
+            continue
+        if previous in call_index and current in call_index:
+            proofs.append(max(call_index[previous], call_index[current]))
+    if not proofs:
+        return None
+    return max(min(proofs), cadence_ready_at or 0)
+
+
+def _dynamic_pricing_verification_boundaries(units, cadence_days):
+    """Choose two observed adjacent boundaries exactly one cadence apart."""
+    candidates = []
+    for unit_index, unit in enumerate(units):
+        ranges = unit.get('priceRanges') or []
+        for index in range(1, len(ranges) - 1):
+            try:
+                first = date.fromisoformat(ranges[index]['start'])
+                second = date.fromisoformat(ranges[index + 1]['start'])
+            except (KeyError, TypeError, ValueError):
+                continue
+            if (second - first).days != cadence_days:
+                continue
+            first_pricing = date.fromisoformat(unit['pricingDates'][0])
+            candidates.append(((second - first_pricing).days,
+                               second, unit_index, first, second))
+    if not candidates:
+        return None
+    _span, _second, unit_index, first, second = min(candidates)
+    return unit_index, first, second
+
+
+def _dynamic_pricing_discovered_cadence(
+        units, call_sequence, expected_cadence=None):
+    """Return the earliest cadence proven by any unit in the responses so far.
+
+    A price boundary is observable only when both adjacent dates were queried.
+    Two observed boundaries for the same unit expose one complete cycle. The
+    property-level caller benefits from every unit returned by each API call;
+    discovery is therefore not limited to whichever unit started the search.
+    """
+    call_index = {day: index for index, day in enumerate(call_sequence, 1)}
+    candidates = []
+    for unit_index, unit in enumerate(units):
+        signatures = unit.get('_pricingSignatures') or {}
+        observed_boundaries = []
+        dates = unit.get('pricingDates') or []
+        for previous, current in zip(dates, dates[1:]):
+            try:
+                adjacent = (
+                    date.fromisoformat(current) - date.fromisoformat(previous)
+                ).days == 1
+            except (TypeError, ValueError):
+                adjacent = False
+            if (not adjacent or previous not in call_index
+                    or current not in call_index
+                    or signatures.get(previous) == signatures.get(current)):
+                continue
+            observed_boundaries.append((current, max(
+                call_index[previous], call_index[current])))
+        for first, second in zip(
+                observed_boundaries, observed_boundaries[1:]):
+            cadence = (
+                date.fromisoformat(second[0]) - date.fromisoformat(first[0])
+            ).days
+            if cadence <= 0:
+                continue
+            # During historical evaluation, ignore longer spans caused by an
+            # unchanged price crossing a real cycle boundary. In production
+            # the derived community cadence is the candidate being evaluated.
+            if expected_cadence and cadence != expected_cadence:
+                continue
+            candidates.append({
+                'call': max(first[1], second[1]),
+                'cadenceDays': cadence,
+                'unitIndex': unit_index,
+                'firstBoundary': first[0],
+                'secondBoundary': second[0],
+            })
+    return min(candidates, key=lambda item: (
+        item['call'], item['secondBoundary'], item['unitIndex'])) if candidates else None
+
+
+def _dynamic_pricing_causal_retrieval_plan(units, cadence_days, cadence_mode):
+    """Build a plan whose visible conclusions follow only from prior calls.
+
+    Unknown-cadence mode queries consecutive dates through two observed price
+    boundaries. Known-cadence mode verifies the supplied cadence by querying
+    both sides of two boundaries separated by that cadence. Trusted-cadence
+    mode accepts the supplied cadence without verification. Unit phase is never
+    considered known until two adjacent queried cells have different signatures.
+    Once cadence and phase are proven, one call in each resulting cadence group
+    is sufficient to fill that group.
+    """
+    all_pricing_dates = sorted({
+        day for unit in units for day in (unit.get('pricingDates') or [])
+    })
+    if not all_pricing_dates:
+        return {
+            'calls': [], 'steps': [], 'accuracy': 0.0,
+            'cadenceKnownAtCall': None, 'cadenceVerifiedAtCall': None,
+            'phaseKnownAtCall': {}, 'strategy': 'No pricing dates',
+        }
+
+    call_sequence = []
+    call_steps = []
+    call_set = set()
+
+    def add_call(day, stage, reason):
+        day = day.isoformat() if isinstance(day, date) else str(day)
+        if day not in all_pricing_dates or day in call_set:
+            return False
+        call_set.add(day)
+        call_sequence.append(day)
+        call_steps.append({'date': day, 'stage': stage, 'reason': reason})
+        return True
+
+    if not isinstance(cadence_days, int) or cadence_days <= 0:
+        for day in all_pricing_dates:
+            add_call(day, 'Daily fallback',
+                     'Cadence is not reliable enough to infer unqueried dates.')
+        return {
+            'calls': call_sequence,
+            'steps': call_steps,
+            'accuracy': 100.0,
+            'cadenceKnownAtCall': None,
+            'cadenceVerifiedAtCall': None,
+            'phaseKnownAtCall': {},
+            'strategy': 'Daily fallback; cadence unresolved',
+        }
+
+    if cadence_mode == 'trusted':
+        cadence_known_at = 0
+        cadence_verified_at = None
+        cadence_ready_at = 0
+        strategy_prefix = 'Trust supplied cadence without verification'
+    else:
+        verification = _dynamic_pricing_verification_boundaries(
+            units, cadence_days)
+        if verification is None:
+            for day in all_pricing_dates:
+                add_call(day, 'Daily fallback',
+                         'Two adjacent cadence boundaries could not be verified.')
+            return {
+                'calls': call_sequence,
+                'steps': call_steps,
+                'accuracy': 100.0,
+                'cadenceKnownAtCall': None,
+                'cadenceVerifiedAtCall': None,
+                'phaseKnownAtCall': {},
+                'strategy': 'Daily fallback; cadence could not be verified',
+            }
+
+        representative_index, first_boundary, second_boundary = verification
+        representative = units[representative_index]
+        representative_label = (
+            representative.get('unitId') or 'representative unit')
+        second_previous = second_boundary - timedelta(days=1)
+
+    if cadence_mode == 'unknown':
+        discovery_start = date.fromisoformat(representative['pricingDates'][0])
+        cursor = discovery_start
+        discovery = None
+        while cursor <= second_boundary:
+            added = add_call(
+                cursor, 'Discover cadence',
+                'Query the next property date; inspect every returned unit for '
+                'two observed adjacent price boundaries.')
+            if added:
+                discovery = _dynamic_pricing_discovered_cadence(
+                    units, call_sequence, cadence_days)
+                if discovery:
+                    evidence_unit = units[discovery['unitIndex']]
+                    evidence_label = (
+                        evidence_unit.get('unitId') or 'an observed unit')
+                    call_steps[-1]['reason'] = (
+                        f'Unit {evidence_label} now has observed boundaries on '
+                        f"{discovery['firstBoundary']} and "
+                        f"{discovery['secondBoundary']}; their "
+                        f"{discovery['cadenceDays']}-day separation proves the "
+                        'community cadence.')
                     break
-                except (KeyError, TypeError, ValueError):
+            cursor += timedelta(days=1)
+        cadence_known_at = discovery['call'] if discovery else len(call_sequence)
+        cadence_verified_at = cadence_known_at
+        strategy_prefix = 'Discover cadence from the earliest qualifying unit'
+    elif cadence_mode == 'known':
+        verification_start = date.fromisoformat(representative['pricingDates'][0])
+        cursor = verification_start
+        while cursor <= first_boundary:
+            add_call(
+                cursor, 'Verify known cadence',
+                f'Query consecutive dates for unit {representative_label} '
+                'until its first adjacent price change is observed.')
+            cursor += timedelta(days=1)
+        add_call(
+            second_previous, 'Verify known cadence',
+            f'Check the day before the boundary predicted by the known '
+            f'{cadence_days}-day cadence.')
+        add_call(
+            second_boundary, 'Verify known cadence',
+            f'Confirm the second boundary and verify the {cadence_days}-day cadence.')
+        cadence_known_at = 0
+        cadence_verified_at = len(call_sequence)
+        strategy_prefix = 'Verify known cadence at two adjacent boundaries'
+
+    cadence_ready_at = cadence_verified_at or 0
+
+    def phase_proofs():
+        return {
+            index: _dynamic_pricing_phase_proof_call(
+                unit, call_sequence, cadence_ready_at)
+            for index, unit in enumerate(units)
+        }
+
+    proofs = phase_proofs()
+    unresolved = {
+        index for index, unit in enumerate(units)
+        if len(unit.get('priceRanges') or []) > 1 and proofs.get(index) is None
+    }
+
+    # Pick adjacent-date probes that establish phase for as many unresolved
+    # units as possible. A price difference across non-adjacent calls marks an
+    # interval containing a boundary, but never establishes its exact date.
+    while unresolved:
+        candidates = {}
+        for unit_index in unresolved:
+            unit = units[unit_index]
+            signatures = unit.get('_pricingSignatures') or {}
+            dates = unit.get('pricingDates') or []
+            for previous, current in zip(dates, dates[1:]):
+                if signatures.get(previous) == signatures.get(current):
                     continue
-        unit['cyclePhase'] = unit_phase
-        unit['cycleBoundaryDates'] = []
-        if unit_phase is not None and cadence_days:
-            unit['cycleBoundaryDates'] = [
-                day for day in (unit.get('pricingDates') or [])
-                if date.fromisoformat(day).toordinal() % cadence_days == unit_phase
+                key = (previous, current)
+                covered = set()
+                for other_index in unresolved:
+                    other_signatures = (
+                        units[other_index].get('_pricingSignatures') or {})
+                    if (previous in other_signatures and current in other_signatures
+                            and other_signatures[previous]
+                            != other_signatures[current]):
+                        covered.add(other_index)
+                candidates[key] = covered
+        if not candidates:
+            break
+        (previous, current), covered = max(
+            candidates.items(),
+            key=lambda item: (
+                len(item[1]),
+                -sum(day not in call_set for day in item[0]),
+                item[0][1]),
+        )
+        labels = ', '.join(str(units[index].get('unitId') or index)
+                           for index in sorted(covered)[:3])
+        suffix = ' and others' if len(covered) > 3 else ''
+        reason = f'Query adjacent dates to establish cycle position for {labels}{suffix}.'
+        add_call(previous, 'Locate unit cycles', reason)
+        add_call(current, 'Locate unit cycles', reason)
+        proofs = phase_proofs()
+        unresolved = {
+            index for index in unresolved if proofs.get(index) is None
+        }
+
+    # Every proven unit is partitioned only by its observed adjacent boundary.
+    # Units without an observable boundary are retrieved daily; inventing a
+    # phase for them would make the reconstruction look more certain than it is.
+    target_ranges = []
+    for unit_index, unit in enumerate(units):
+        phase_known_at = proofs.get(unit_index)
+        unit_phase = unit.get('_cyclePhase')
+        if phase_known_at is None or unit_phase is None:
+            for day in unit.get('pricingDates') or []:
+                if day not in call_set:
+                    target_ranges.append({'start': day, 'end': day})
+            continue
+        for days in _dynamic_pricing_cycle_groups(
+                unit, cadence_days, unit_phase):
+            if not any(day in call_set for day in days):
+                target_ranges.append({'start': days[0], 'end': days[-1]})
+
+    fill_dates = _dynamic_pricing_minimum_range_dates([
+        {'priceRanges': target_ranges}
+    ])
+    for day in fill_dates:
+        add_call(day, 'Fill matrix',
+                 'Retrieve one value inside every proven unit-cycle group.')
+
+    proofs = phase_proofs()
+    total = correct = 0
+    for unit_index, unit in enumerate(units):
+        dates = unit.get('pricingDates') or []
+        known = {day for day in dates if day in call_set}
+        phase_known_at = proofs.get(unit_index)
+        unit_phase = unit.get('_cyclePhase')
+        if phase_known_at is not None and unit_phase is not None:
+            for group in _dynamic_pricing_cycle_groups(
+                    unit, cadence_days, unit_phase):
+                if any(day in call_set for day in group):
+                    known.update(group)
+        total += len(dates)
+        correct += len(known)
+    accuracy = round(100 * correct / total, 3) if total else 0.0
+    return {
+        'calls': call_sequence,
+        'steps': call_steps,
+        'accuracy': accuracy,
+        'cadenceKnownAtCall': cadence_known_at,
+        'cadenceVerifiedAtCall': cadence_verified_at,
+        'phaseKnownAtCall': proofs,
+        'strategy': f'{strategy_prefix}; adjacent phase probes; cycle-range cover',
+    }
+
+
+def _dynamic_pricing_lower_bound_retrieval_plan(
+        units, cadence_lower_bound, cadence_mode):
+    """Cover observed price ranges when only a cadence lower bound is known.
+
+    With no complete interior range, the exact cadence cannot be measured. The
+    longest observed equal-price range is nevertheless a useful conservative
+    lower bound. One response within each observed range is sufficient under
+    that assumption; changing units first require an adjacent response pair so
+    the boundary between their (necessarily edge) ranges is actually observed.
+    """
+    all_pricing_dates = sorted({
+        day for unit in units for day in (unit.get('pricingDates') or [])
+    })
+    call_sequence = []
+    call_steps = []
+    call_set = set()
+
+    def add_call(day, stage, reason):
+        day = str(day)
+        if day not in all_pricing_dates or day in call_set:
+            return False
+        call_set.add(day)
+        call_sequence.append(day)
+        call_steps.append({'date': day, 'stage': stage, 'reason': reason})
+        return True
+
+    phase_known_at = {
+        index: 0
+        for index, unit in enumerate(units)
+        if len(unit.get('priceRanges') or []) <= 1
+    }
+    unresolved = {
+        index for index, unit in enumerate(units)
+        if len(unit.get('priceRanges') or []) > 1
+    }
+
+    # A property-date response applies to every active unit. Select adjacent
+    # probes that expose boundaries for the greatest number of units at once.
+    while unresolved:
+        candidates = {}
+        for unit_index in unresolved:
+            unit = units[unit_index]
+            signatures = unit.get('_pricingSignatures') or {}
+            dates = unit.get('pricingDates') or []
+            for previous, current in zip(dates, dates[1:]):
+                if signatures.get(previous) == signatures.get(current):
+                    continue
+                key = (previous, current)
+                covered = set()
+                for other_index in unresolved:
+                    other_signatures = (
+                        units[other_index].get('_pricingSignatures') or {})
+                    if (previous in other_signatures
+                            and current in other_signatures
+                            and other_signatures[previous]
+                            != other_signatures[current]):
+                        covered.add(other_index)
+                candidates[key] = covered
+        if not candidates:
+            break
+        (previous, current), covered = max(
+            candidates.items(),
+            key=lambda item: (
+                len(item[1]),
+                -sum(day not in call_set for day in item[0]),
+                item[0][1]),
+        )
+        labels = ', '.join(str(units[index].get('unitId') or index)
+                           for index in sorted(covered)[:3])
+        suffix = ' and others' if len(covered) > 3 else ''
+        reason = (
+            f'Observe the adjacent price boundary for {labels}{suffix}; '
+            f'the assumed cadence is at least {cadence_lower_bound} days.')
+        add_call(previous, 'Locate price ranges', reason)
+        add_call(current, 'Locate price ranges', reason)
+        for index in tuple(unresolved):
+            proof = _dynamic_pricing_phase_proof_call(
+                units[index], call_sequence, 0)
+            if proof is not None:
+                phase_known_at[index] = proof
+                unresolved.remove(index)
+
+    target_ranges = []
+    for unit_index, unit in enumerate(units):
+        if unit_index not in phase_known_at:
+            target_ranges.extend({
+                'start': day, 'end': day
+            } for day in (unit.get('pricingDates') or []) if day not in call_set)
+            continue
+        for price_range in unit.get('priceRanges') or []:
+            if not any(
+                    price_range['start'] <= day <= price_range['end']
+                    for day in call_set):
+                target_ranges.append({
+                    'start': price_range['start'],
+                    'end': price_range['end'],
+                })
+
+    for day in _dynamic_pricing_minimum_range_dates([
+            {'priceRanges': target_ranges}]):
+        add_call(
+            day, 'Fill matrix',
+            'Retrieve one value in each observed range covered by the cadence '
+            'lower-bound assumption.')
+
+    # Calls added while filling can also complete an adjacent boundary proof.
+    for index, unit in enumerate(units):
+        if len(unit.get('priceRanges') or []) <= 1:
+            phase_known_at[index] = 0
+            continue
+        proof = _dynamic_pricing_phase_proof_call(unit, call_sequence, 0)
+        if proof is not None:
+            phase_known_at[index] = proof
+
+    total = correct = 0
+    for unit_index, unit in enumerate(units):
+        dates = unit.get('pricingDates') or []
+        known = {day for day in dates if day in call_set}
+        if unit_index in phase_known_at:
+            for price_range in unit.get('priceRanges') or []:
+                range_days = [
+                    day for day in dates
+                    if price_range['start'] <= day <= price_range['end']
+                ]
+                if any(day in call_set for day in range_days):
+                    known.update(range_days)
+        total += len(dates)
+        correct += len(known)
+
+    if cadence_mode == 'trusted':
+        strategy_prefix = 'Trust cadence lower bound without verification'
+    elif cadence_mode == 'known':
+        strategy_prefix = 'Use supplied cadence lower bound; exact verification unavailable'
+    else:
+        strategy_prefix = 'Infer cadence lower bound from observed price ranges'
+    return {
+        'calls': call_sequence,
+        'steps': call_steps,
+        'accuracy': round(100 * correct / total, 3) if total else 0.0,
+        'cadenceKnownAtCall': 0,
+        'cadenceVerifiedAtCall': None,
+        'phaseKnownAtCall': phase_known_at,
+        'strategy': f'{strategy_prefix}; observed-range cover',
+    }
+
+
+def _dynamic_pricing_observation_only_plan(
+        units, supplied_cadence, cadence_mode, cadence_is_lower_bound=False,
+        _seed_call_steps=None, _rejected_cadences=None,
+        _cadence_invalidations=None, _cadence_candidate_rejections=None):
+    """Simulate retrieval using only metadata and responses already returned.
+
+    The scheduler can inspect each unit's initial pricing window (availability
+    date plus hold time), the supplied cadence in known/trusted modes, and the
+    signatures returned by prior property-date calls. Full-matrix signatures
+    are read only inside ``query`` and during the final accuracy evaluation.
+    """
+    window_dates = [
+        list(unit.get('_initialPricingDates') or []) for unit in units
+    ]
+    window_sets = [set(days) for days in window_dates]
+    property_dates = sorted({day for days in window_dates for day in days})
+    truth = [unit.get('_pricingSignatures') or {} for unit in units]
+    # A property-date response includes every unit returned for that date, not
+    # only units whose metadata-derived window currently contains the date.
+    # Keep those raw responses separately so a delayed first pricing date can
+    # move a unit's requested window forward without losing earlier calls.
+    api_responses = [{} for _unit in units]
+    observations = [{} for _unit in units]
+    call_sequence = []
+    call_steps = []
+    call_index = {}
+    adjusted_window_at_call = {}
+    rejected_cadences = set(_rejected_cadences or [])
+    cadence_invalidations = list(_cadence_invalidations or [])
+    cadence_candidate_rejections = list(
+        _cadence_candidate_rejections or [])
+
+    def reconcile_delayed_pricing_windows():
+        """Shift a unit window after observing its actual pricing start.
+
+        ``unit_details`` can say that an already-available unit starts on the
+        sync date even though Entrata omits it from pricing responses until a
+        later move-in date. Two adjacent responses -- no price followed by a
+        price -- prove that later start without consulting the matrix ahead of
+        time. Preserve the requested hold length and extend the end date by the
+        same amount.
+        """
+        changed = False
+        for unit_index, days in enumerate(window_dates):
+            if not days or unit_index in adjusted_window_at_call:
+                continue
+            responses = api_responses[unit_index]
+            # Do not mistake a temporary no-price gap for a delayed pricing
+            # start. The metadata-derived first day must itself have returned
+            # no price before the window is allowed to move.
+            if (days[0] not in responses
+                    or responses.get(days[0]) is not None):
+                continue
+            priced_days = sorted(
+                day for day, signature in responses.items()
+                if signature is not None)
+            if not priced_days:
+                continue
+            first_priced = priced_days[0]
+            previous = (
+                date.fromisoformat(first_priced) - timedelta(days=1)
+            ).isoformat()
+            if (first_priced <= days[0]
+                    or previous not in responses
+                    or responses.get(previous) is not None):
+                continue
+
+            start = date.fromisoformat(first_priced)
+            shifted = [
+                (start + timedelta(days=offset)).isoformat()
+                for offset in range(len(days))
             ]
-        # Each property-date response covers every unit active on that date.
-        # A unit's phase is settled no later than its cadence-th property-wide
-        # sample; do not wait for a later pair of adjacent calls. A shorter
-        # complete retrieval plan can settle it on its final active sample.
-        # Calls before a future unit is available do not count toward that
-        # unit's bootstrap evidence.
-        active_dates = set(unit.get('pricingDates') or [])
-        active_call_indexes = [
-            index for index, call in enumerate(call_sequence, 1)
-            if call in active_dates
+            window_dates[unit_index] = shifted
+            window_sets[unit_index] = set(shifted)
+            observations[unit_index] = {
+                day: signature
+                for day, signature in responses.items()
+                if day in window_sets[unit_index]
+            }
+            adjusted_window_at_call[unit_index] = len(call_sequence)
+            changed = True
+
+        if changed:
+            property_dates[:] = sorted({
+                day for days in window_dates for day in days
+            })
+        return changed
+
+    observed_boundaries_cache = {}
+    observed_equal_span_cache = {}
+    lower_bound_contradiction_cache = {}
+    response_lower_bound_components_cache = {}
+
+    def query(day, stage, reason):
+        """Issue one simulated API call and reveal only that date's response."""
+        if day not in property_dates or day in call_index:
+            return False
+        call_sequence.append(day)
+        call_index[day] = len(call_sequence)
+        call_steps.append({'date': day, 'stage': stage, 'reason': reason})
+        for unit_index, days in enumerate(window_sets):
+            signature = truth[unit_index].get(day)
+            api_responses[unit_index][day] = signature
+            if day in days:
+                observations[unit_index][day] = signature
+        # Every evidence cache is scoped to the responses available before
+        # this property call. Invalidate once here instead of rescanning the
+        # same units repeatedly for every inferred cell.
+        observed_boundaries_cache.clear()
+        observed_equal_span_cache.clear()
+        lower_bound_contradiction_cache.clear()
+        response_lower_bound_components_cache.clear()
+        lower_bound_inference_cache.clear()
+        reconcile_delayed_pricing_windows()
+        refresh_no_future_endpoint_equalities()
+        # A property-wide response can make a previously exhausted unit
+        # actionable even when another unit selected the date.
+        phase_probe_exhausted.clear()
+        return True
+
+    def observed_boundaries(unit_index):
+        """Return exact boundaries supported by two adjacent responses."""
+        cached = observed_boundaries_cache.get(unit_index)
+        if cached is not None:
+            return cached
+        result = []
+        days = window_dates[unit_index]
+        observed = observations[unit_index]
+        for previous, current in zip(days, days[1:]):
+            if previous not in observed or current not in observed:
+                continue
+            previous_signature = observed[previous]
+            current_signature = observed[current]
+            if (previous_signature is None or current_signature is None
+                    or previous_signature == current_signature):
+                continue
+            result.append({
+                'date': current,
+                'proofCall': max(call_index[previous], call_index[current]),
+            })
+        observed_boundaries_cache[unit_index] = result
+        return result
+
+    def observed_equal_span_consistent(unit_index, start_day, end_day):
+        """Return whether responses support one equal-price inclusive span.
+
+        Both endpoints must have been retrieved with the same price. Any
+        retrieved interior date with another price invalidates the span. This
+        prevents skipped short ranges from masquerading as one long cadence.
+        """
+        cache_key = (unit_index, start_day, end_day)
+        cached = observed_equal_span_cache.get(cache_key)
+        if cached is not None:
+            return cached
+        days = window_dates[unit_index]
+        positions = {day: index for index, day in enumerate(days)}
+        start = positions.get(start_day)
+        end = positions.get(end_day)
+        observed = observations[unit_index]
+        if (start is None or end is None or end < start
+                or start_day not in observed or end_day not in observed):
+            observed_equal_span_cache[cache_key] = False
+            return False
+        signature = observed.get(start_day)
+        if signature is None or observed.get(end_day) != signature:
+            observed_equal_span_cache[cache_key] = False
+            return False
+        result = all(
+            observed.get(day) == signature
+            for day in days[start:end + 1]
+            if day in observed)
+        observed_equal_span_cache[cache_key] = result
+        return result
+
+    def future_availability_probe_days(unit_index, cadence_hint):
+        """Return n+cadence-1/n+cadence for a future-available unit.
+
+        The pair verifies the common Entrata pattern that the availability date
+        is cycle day one. It is only a hypothesis until the two returned prices
+        differ; a same-price response pair falls through to adaptive search.
+        """
+        if not cadence_hint:
+            return []
+        unit = units[unit_index]
+        days = window_dates[unit_index]
+        if (unit.get('availabilityTiming') != 'Future Available'
+                or not days
+                or unit.get('availableDate') != days[0]
+                or cadence_hint >= len(days)):
+            return []
+        return [days[cadence_hint - 1], days[cadence_hint]]
+
+    def is_future_cycle_start_candidate(unit_index):
+        unit = units[unit_index]
+        days = window_dates[unit_index]
+        return bool(
+            len(days) > 1
+            and unit.get('availabilityTiming') == 'Future Available'
+            and unit.get('availableDate') == days[0])
+
+    endpoint_equal_at_call = {}
+    supplied_response_lower_bound = (
+        supplied_cadence
+        if (cadence_mode == 'known' and cadence_is_lower_bound
+            and supplied_cadence) else 0)
+    equal_edge_range_cache = {'callCount': -1, 'ranges': []}
+
+    def refresh_no_future_endpoint_equalities():
+        """Accept equal whole-window endpoints when no future unit exists.
+
+        Without a future-availability cycle-start candidate, discovery uses
+        the documented lower-bound assumption: an unchanged retrieved window
+        establishes cadence at least as long as that window.  Two property
+        calls can establish this for every coextensive unit.
+        """
+        if (cadence_mode != 'unknown' or any(
+                is_future_cycle_start_candidate(index)
+                for index in range(len(units)))):
+            return
+        for unit_index, days in enumerate(window_dates):
+            if len(days) < 2:
+                continue
+            observed = observations[unit_index]
+            first_signature = observed.get(days[0])
+            last_signature = observed.get(days[-1])
+            if (days[0] in observed and days[-1] in observed
+                    and first_signature is not None
+                    and first_signature == last_signature):
+                endpoint_equal_at_call[unit_index] = max(
+                    call_index[days[0]], call_index[days[-1]])
+
+    def observed_equal_edge_ranges():
+        """Return response-proven equal ranges touching a unit-window edge.
+
+        A response-proven adjacent boundary plus an equal response at the
+        corresponding window edge establishes an observed edge range.  When
+        no complete interior cycle fits in the hold, the analyzer's domain
+        rule treats the longest such range as a cadence lower bound.  This is
+        deliberately derived only from prior responses; the truth ranges are
+        never consulted by the planner.
+        """
+        call_count = len(call_sequence)
+        if equal_edge_range_cache['callCount'] == call_count:
+            return equal_edge_range_cache['ranges']
+        ranges = []
+        for unit_index, days in enumerate(window_dates):
+            if not days:
+                continue
+            positions = {day: index for index, day in enumerate(days)}
+            observed = observations[unit_index]
+            for boundary in observed_boundaries(unit_index):
+                position = positions[boundary['date']]
+                if position > 0:
+                    start_day = days[0]
+                    end_day = days[position - 1]
+                    if observed_equal_span_consistent(
+                            unit_index, start_day, end_day):
+                        ranges.append({
+                            'unitIndex': unit_index,
+                            'start': start_day,
+                            'end': end_day,
+                            'length': position,
+                            'signature': observed[start_day],
+                            'proofCall': max(
+                                boundary['proofCall'],
+                                call_index[start_day],
+                                call_index[end_day]),
+                        })
+                if position < len(days):
+                    start_day = days[position]
+                    end_day = days[-1]
+                    if observed_equal_span_consistent(
+                            unit_index, start_day, end_day):
+                        ranges.append({
+                            'unitIndex': unit_index,
+                            'start': start_day,
+                            'end': end_day,
+                            'length': len(days) - position,
+                            'signature': observed[start_day],
+                            'proofCall': max(
+                                boundary['proofCall'],
+                                call_index[start_day],
+                                call_index[end_day]),
+                        })
+        equal_edge_range_cache['callCount'] = call_count
+        equal_edge_range_cache['ranges'] = ranges
+        return ranges
+
+    def shared_endpoint_lower_bound_evidence():
+        """Return endpoint evidence safe to promote to the community level."""
+        future_indexes = [
+            index for index in endpoint_equal_at_call
+            if is_future_cycle_start_candidate(index)
         ]
-        samples_needed = min(cadence_days, len(active_call_indexes))
-        unit['cyclePhaseKnownAtCall'] = (
-            active_call_indexes[samples_needed - 1]
-            if unit_phase is not None and samples_needed else None)
+        if future_indexes:
+            return [
+                (index, endpoint_equal_at_call[index])
+                for index in future_indexes
+            ]
+        eligible_indexes = [
+            index for index, days in enumerate(window_dates)
+            if len(days) > 1
+        ]
+        if eligible_indexes and all(
+                index in endpoint_equal_at_call
+                for index in eligible_indexes):
+            return [
+                (index, endpoint_equal_at_call[index])
+                for index in eligible_indexes
+            ]
+        return []
+
+    def lower_bound_response_contradiction(cadence_lower_bound, step=None):
+        """Reject a lower bound when responses prove a closer next change.
+
+        An equal edge range remains safe to infer directly, but its length is
+        not a reusable cadence lower bound if a price observed within that
+        many days of an exact boundary differs from the boundary-side price.
+        This catches a long constant prefix followed by daily pricing without
+        consulting any unqueried matrix cell.
+        """
+        cache_key = (cadence_lower_bound, step)
+        if cache_key in lower_bound_contradiction_cache:
+            return lower_bound_contradiction_cache[cache_key]
+        if not cadence_lower_bound or cadence_lower_bound <= 1:
+            lower_bound_contradiction_cache[cache_key] = False
+            return False
+        for unit_index, days in enumerate(window_dates):
+            positions = {day: index for index, day in enumerate(days)}
+            observed = observations[unit_index]
+            visible = {
+                day: signature for day, signature in observed.items()
+                if step is None or call_index.get(day, step + 1) <= step
+            }
+            for boundary in observed_boundaries(unit_index):
+                if step is not None and boundary['proofCall'] > step:
+                    continue
+                position = positions[boundary['date']]
+                left_signature = visible.get(days[position - 1])
+                right_signature = visible.get(days[position])
+                for offset in range(
+                        position + 1,
+                        min(len(days), position + cadence_lower_bound)):
+                    signature = visible.get(days[offset])
+                    if (signature is not None
+                            and right_signature is not None
+                            and signature != right_signature):
+                        lower_bound_contradiction_cache[cache_key] = True
+                        return True
+                for offset in range(
+                        max(0, position - cadence_lower_bound + 1),
+                        position - 1):
+                    signature = visible.get(days[offset])
+                    if (signature is not None
+                            and left_signature is not None
+                            and signature != left_signature):
+                        lower_bound_contradiction_cache[cache_key] = True
+                        return True
+        lower_bound_contradiction_cache[cache_key] = False
+        return False
+
+    def response_lower_bound_components(step=None):
+        """Return the strongest response lower bound known for each unit."""
+        if step in response_lower_bound_components_cache:
+            return response_lower_bound_components_cache[step]
+        if cadence_mode != 'unknown' and not (
+                cadence_mode == 'known' and cadence_is_lower_bound):
+            response_lower_bound_components_cache[step] = {}
+            return {}
+        bounds = {}
+        for index, proof_call in shared_endpoint_lower_bound_evidence():
+            length = len(window_dates[index])
+            if ((step is None or proof_call <= step)
+                    and length not in rejected_cadences
+                    and not lower_bound_response_contradiction(length, step)):
+                bounds[index] = max(bounds.get(index, 0), length)
+        for evidence in observed_equal_edge_ranges():
+            if ((step is None or evidence['proofCall'] <= step)
+                    and evidence['length'] not in rejected_cadences
+                    and not lower_bound_response_contradiction(
+                        evidence['length'], step)):
+                index = evidence['unitIndex']
+                bounds[index] = max(
+                    bounds.get(index, 0), evidence['length'])
+        response_lower_bound_components_cache[step] = bounds
+        return bounds
+
+    def current_response_cadence_lower_bound(unit_index=None):
+        """Return a conservative community/target-unit cadence lower bound.
+
+        The community-wide value is the minimum of the strongest bounds
+        supported by participating units.  A static unit can therefore never
+        promote its long hold into a larger bound for changing units.  A
+        target unit may still use its own stronger response-backed bound.
+        """
+        components = response_lower_bound_components()
+        community_bound = min(components.values()) if components else 0
+        unit_bound = components.get(unit_index, 0)
+        return max(
+            supplied_response_lower_bound, community_bound, unit_bound)
+
+    def cadence_lower_bound_at_call(step, unit_index=None):
+        components = response_lower_bound_components(step)
+        community_bound = min(components.values()) if components else 0
+        unit_bound = components.get(unit_index, 0)
+        return max(
+            supplied_response_lower_bound, community_bound, unit_bound)
+
+    lower_bound_inference_cache = {}
+
+    def lower_bound_inference_evidence(unit_index):
+        """Map inferred dates to their response-only signature and proof call."""
+        cache_key = (
+            unit_index, len(call_sequence), cadence_ready_at,
+            effective_cadence, calendar_month_day)
+        cached = lower_bound_inference_cache.get(cache_key)
+        if cached is not None:
+            return cached
+        days = window_dates[unit_index]
+        positions = {day: index for index, day in enumerate(days)}
+        inferred = {}
+
+        def bound_and_call(evidence_call):
+            lower_bound = cadence_lower_bound_at_call(
+                evidence_call, unit_index)
+            if cadence_ready_at is not None and effective_cadence:
+                # Endpoint equality is unit evidence, not proof that every
+                # unit shares that long lower bound. Once an exact, smaller
+                # property cadence is response-proven, recompute all bounded
+                # inference on that safe cadence and do not display it before
+                # the cadence proof existed.
+                lower_bound = min(
+                    lower_bound or effective_cadence, effective_cadence)
+                return lower_bound, max(evidence_call, cadence_ready_at)
+            if lower_bound:
+                return lower_bound, evidence_call
+            final_bound = current_response_cadence_lower_bound(unit_index)
+            qualifying_calls = [
+                proof_call
+                for index, proof_call in shared_endpoint_lower_bound_evidence()
+                if len(window_dates[index]) >= final_bound
+            ] + [
+                evidence['proofCall']
+                for evidence in observed_equal_edge_ranges()
+                if evidence['length'] >= final_bound
+            ]
+            if not final_bound or not qualifying_calls:
+                return 0, evidence_call
+            return final_bound, max(evidence_call, min(qualifying_calls))
+
+        observed = observations[unit_index]
+        observed_days = sorted(observed, key=positions.get)
+        for edge_range in observed_equal_edge_ranges():
+            if edge_range['unitIndex'] != unit_index:
+                continue
+            start = positions[edge_range['start']]
+            end = positions[edge_range['end']]
+            for day in days[start:end + 1]:
+                inferred[day] = {
+                    'call': edge_range['proofCall'],
+                    'signature': edge_range['signature'],
+                }
+        if cadence_mode != 'unknown' and not (
+                cadence_mode == 'known' and cadence_is_lower_bound):
+            lower_bound_inference_cache[cache_key] = inferred
+            return inferred
+        # Compare every response-observed pair, not only pairs that remain
+        # adjacent after all calls finish. A later property-wide response can
+        # land inside an interval that was already proven equal and must not
+        # erase that interval's earlier inference time in the visualizer.
+        for left_offset, left_day in enumerate(observed_days):
+            left = positions[left_day]
+            if observed.get(left_day) is None:
+                continue
+            for right_day in observed_days[left_offset + 1:]:
+                right = positions[right_day]
+                evidence_call = max(
+                    call_index[left_day], call_index[right_day])
+                lower_bound, inference_call = bound_and_call(evidence_call)
+                if not lower_bound or right - left > lower_bound:
+                    continue
+                if observed.get(left_day) != observed.get(right_day):
+                    continue
+                for day in days[left:right + 1]:
+                    previous = inferred.get(day)
+                    evidence = {
+                        'call': inference_call,
+                        'signature': observed.get(left_day),
+                    }
+                    if previous is None or inference_call < previous['call']:
+                        inferred[day] = evidence
+
+        for boundary in observed_boundaries(unit_index):
+            boundary_call = boundary['proofCall']
+            lower_bound, boundary_call = bound_and_call(boundary_call)
+            if not lower_bound:
+                continue
+            position = positions[boundary['date']]
+            start = max(0, position - lower_bound)
+            end = min(len(days), position + lower_bound)
+            left_signature = observed.get(days[position - 1])
+            right_signature = observed.get(days[position])
+            for offset, day in enumerate(days[start:end], start):
+                previous = inferred.get(day)
+                evidence = {
+                    'call': boundary_call,
+                    'signature': (left_signature if offset < position
+                                  else right_signature),
+                }
+                if previous is None or boundary_call < previous['call']:
+                    inferred[day] = evidence
+        lower_bound_inference_cache[cache_key] = inferred
+        return inferred
+
+    def lower_bound_inference_calls(unit_index):
+        return {
+            day: evidence['call']
+            for day, evidence in lower_bound_inference_evidence(
+                unit_index).items()
+        }
+
+    def future_discovery_candidate(unit_index):
+        """Derive cadence from response-observed future-unit boundaries.
+
+        The availability date is treated as cycle day one. Two boundaries are
+        normally required. If the first boundary is at least halfway through
+        the hold, a second cannot fit; the one-boundary result is accepted only
+        when the observed post-boundary tail retains one price.
+        """
+        if not is_future_cycle_start_candidate(unit_index):
+            return None
+        days = window_dates[unit_index]
+        boundaries = observed_boundaries(unit_index)
+        if not boundaries:
+            return None
+        positions = {day: index for index, day in enumerate(days)}
+        first = boundaries[0]
+        first_offset = positions[first['date']]
+        response_lower_bound = current_response_cadence_lower_bound(
+            unit_index)
+        if first_offset <= 0:
+            return None
+        if len(boundaries) >= 2:
+            for first_boundary, second in zip(
+                    boundaries, boundaries[1:]):
+                gap = (
+                    positions[second['date']]
+                    - positions[first_boundary['date']])
+                if gap in rejected_cadences:
+                    continue
+                second_previous = days[positions[second['date']] - 1]
+                if (gap <= 0 or not observed_equal_span_consistent(
+                        unit_index, first_boundary['date'],
+                        second_previous)):
+                    continue
+                candidate = {
+                    'cadenceDays': gap,
+                    'unitIndex': unit_index,
+                    'firstBoundary': first_boundary['date'],
+                    'secondBoundary': second['date'],
+                    'proofCall': max(
+                        first_boundary['proofCall'], second['proofCall']),
+                    'singleBoundaryAssumption': False,
+                    'ready': True,
+                }
+                # Equal day-of-month boundaries 28-31 days apart may be a
+                # calendar-month schedule rather than one fixed day count.
+                # Verify the next monthly edge once for the whole property;
+                # do not repeat this check for every unit.
+                first_date = date.fromisoformat(first_boundary['date'])
+                second_date = date.fromisoformat(second['date'])
+                if (28 <= gap <= 31
+                        and first_date.day == second_date.day):
+                    next_month = 1 if second_date.month == 12 else (
+                        second_date.month + 1)
+                    next_year = (second_date.year + 1
+                                 if second_date.month == 12
+                                 else second_date.year)
+                    following_month = 1 if next_month == 12 else next_month + 1
+                    following_year = (next_year + 1
+                                      if next_month == 12 else next_year)
+                    month_end = (
+                        date(following_year, following_month, 1)
+                        - timedelta(days=1)).day
+                    projected = date(
+                        next_year, next_month,
+                        min(second_date.day, month_end))
+                    previous = projected - timedelta(days=1)
+                    probe_days = [
+                        day.isoformat() for day in (previous, projected)
+                        if day.isoformat() in window_sets[unit_index]
+                    ]
+                    if (len(probe_days) == 2 and any(
+                            day not in observations[unit_index]
+                            for day in probe_days)):
+                        candidate['calendarProbeDays'] = probe_days
+                        candidate['ready'] = False
+                return candidate
+        single_boundary_ready = (
+            first_offset >= response_lower_bound
+            and 2 * first_offset >= len(days)
+            and observed_equal_span_consistent(
+                unit_index, first['date'], days[-1]))
+        return {
+            'cadenceDays': first_offset,
+            'unitIndex': unit_index,
+            'firstBoundary': first['date'],
+            'secondBoundary': None,
+            'proofCall': first['proofCall'],
+            'singleBoundaryAssumption': single_boundary_ready,
+            'ready': single_boundary_ready,
+        }
+
+    def next_future_discovery_probe(unit_index):
+        """Compare endpoints, then bisect to the first future-unit boundary."""
+        if not is_future_cycle_start_candidate(unit_index):
+            return None
+        days = window_dates[unit_index]
+        observed = observations[unit_index]
+        if days[0] not in observed:
+            return days[0]
+        if days[-1] not in observed:
+            return days[-1]
+        first_signature = observed.get(days[0])
+        last_signature = observed.get(days[-1])
+        if (first_signature is not None
+                and first_signature == last_signature):
+            endpoint_equal_at_call[unit_index] = max(
+                call_index[days[0]], call_index[days[-1]])
+            return None
+
+        # Under the future-availability hypothesis, cycle one begins at index
+        # zero. Maintain a same-as-first / different-from-first bracket and
+        # halve it until the first boundary is adjacent.
+        low = 0
+        high = len(days) - 1
+        while high - low > 1:
+            midpoint = (low + high) // 2
+            midpoint_day = days[midpoint]
+            if midpoint_day not in observed:
+                return midpoint_day
+            if observed.get(midpoint_day) == first_signature:
+                low = midpoint
+            else:
+                high = midpoint
+        return None
+
+    def next_candidate_boundary_confirmation_probe(unit_index, candidate):
+        """Confirm a future unit's next projected boundary in one call.
+
+        Discovery's first exact boundary supplies a provisional cadence from
+        the availability-date hypothesis. If its next projected boundary is
+        already observed, query the preceding day directly instead of
+        bisecting the whole differing-price interval.
+        """
+        if not candidate or candidate.get('secondBoundary'):
+            return None
+        try:
+            projected = (
+                date.fromisoformat(candidate['firstBoundary'])
+                + timedelta(days=candidate['cadenceDays']))
+        except (KeyError, TypeError, ValueError):
+            return None
+        previous = (projected - timedelta(days=1)).isoformat()
+        projected_day = projected.isoformat()
+        if not all(
+                day in window_sets[unit_index]
+                for day in (previous, projected_day)):
+            return None
+        observed = observations[unit_index]
+        if projected_day in observed and previous not in observed:
+            return previous
+        if previous in observed and projected_day not in observed:
+            return projected_day
+        return None
+
+    def next_boundary_probe(unit_index, cadence_hint=None):
+        """Choose the next response-only probe for one unit via interval search.
+
+        With a cadence hypothesis, sample matching cycle positions one cadence
+        apart. A differing pair is bisected before the hypothesis is accepted,
+        allowing a hidden shorter cadence to replace it. Once one boundary is
+        observed, probe the two cells around its predicted neighbor to verify
+        the cadence directly. Without a cadence hypothesis, split the largest
+        unresolved interval; equal distant endpoints can still conceal multiple
+        changes in that mode.
+        """
+        days = window_dates[unit_index]
+        if not days:
+            return None
+        observed = observations[unit_index]
+        unobserved = [day for day in days if day not in observed]
+        if not unobserved:
+            return None
+        positions = {day: index for index, day in enumerate(days)}
+        observed_days = sorted(observed, key=positions.get)
+
+        # Future availability is usually cycle day one. Test that hypothesis
+        # with the two adjacent responses surrounding its first projected
+        # boundary. When confirmed, those same calls populate the first and
+        # second price ranges, so phase discovery adds no throwaway calls.
+        for probe_day in future_availability_probe_days(
+                unit_index, cadence_hint):
+            if probe_day not in observed:
+                return probe_day
+
+        if not observed_days:
+            return days[0]
+        if cadence_hint:
+            # A missing response followed later by a real price is an
+            # availability-window edge, not a pricing-cycle boundary. Bisect
+            # it so the active hold window can be shifted to the first date
+            # Entrata actually returns for the unit.
+            availability_brackets = []
+            for left_day, right_day in zip(observed_days, observed_days[1:]):
+                left = positions[left_day]
+                right = positions[right_day]
+                if right - left <= 1:
+                    continue
+                if ((observed[left_day] is None)
+                        != (observed[right_day] is None)):
+                    availability_brackets.append((
+                        right - left, days[(left + right) // 2]))
+            if availability_brackets:
+                return min(availability_brackets)[1]
+
+            # Resolve a response-proven internal change before attempting to
+            # confirm the cadence-shifted neighbor of an observed boundary.
+            # Otherwise a unit with a long constant prefix followed by daily
+            # changes can make two non-consecutive boundaries look one long
+            # cadence apart (for example, building 6702).
+            differing_brackets = []
+            for left_day, right_day in zip(observed_days, observed_days[1:]):
+                left = positions[left_day]
+                right = positions[right_day]
+                if not (1 < right - left <= cadence_hint):
+                    continue
+                if (observed[left_day] is not None
+                        and observed[right_day] is not None
+                        and observed[left_day] != observed[right_day]):
+                    differing_brackets.append((
+                        right - left, days[(left + right) // 2]))
+            if differing_brackets:
+                return min(differing_brackets)[1]
+
+            # One exact boundary plus its cadence-shifted neighbor is the
+            # shortest proof of the supplied cadence.
+            for boundary in observed_boundaries(unit_index):
+                boundary_position = positions[boundary['date']]
+                for expected_position in (
+                        boundary_position + cadence_hint,
+                        boundary_position - cadence_hint):
+                    if not (1 <= expected_position < len(days)):
+                        continue
+                    for position in (expected_position - 1, expected_position):
+                        if days[position] not in observed:
+                            return days[position]
+
+            # Probe the same relative position in consecutive cycles. Equal
+            # endpoints prove the whole <= cadence interval has one price;
+            # differing endpoints create the binary-search bracket above.
+            anchor_positions = list(range(0, len(days), cadence_hint))
+            if anchor_positions[-1] != len(days) - 1:
+                anchor_positions.append(len(days) - 1)
+            for position in anchor_positions:
+                if days[position] not in observed:
+                    return days[position]
+            return None
+
+        if len(observed_days) == 1:
+            return days[-1] if days[-1] not in observed else days[0]
+
+        differing_brackets = []
+        availability_brackets = []
+        unresolved_intervals = []
+        for left_day, right_day in zip(observed_days, observed_days[1:]):
+            left = positions[left_day]
+            right = positions[right_day]
+            if right - left <= 1:
+                continue
+            midpoint = days[(left + right) // 2]
+            if ((observed[left_day] is None)
+                    != (observed[right_day] is None)):
+                availability_brackets.append((right - left, midpoint))
+            elif (observed[left_day] is not None
+                    and observed[right_day] is not None
+                    and observed[left_day] != observed[right_day]):
+                differing_brackets.append((right - left, midpoint))
+            else:
+                unresolved_intervals.append((right - left, midpoint))
+        if availability_brackets:
+            return min(availability_brackets)[1]
+        if differing_brackets:
+            return min(differing_brackets)[1]
+
+        first_position = positions[observed_days[0]]
+        last_position = positions[observed_days[-1]]
+        if first_position > 0:
+            unresolved_intervals.append((first_position, days[0]))
+        if last_position < len(days) - 1:
+            unresolved_intervals.append((
+                len(days) - 1 - last_position, days[-1]))
+        if not unresolved_intervals:
+            return unobserved[0]
+        return max(unresolved_intervals, key=lambda item: (
+            item[0], item[1]))[1]
+
+    def has_unresolved_availability_bracket(unit_index):
+        """Return whether calls bracket a delayed pricing start non-adjacently."""
+        days = window_dates[unit_index]
+        positions = {day: index for index, day in enumerate(days)}
+        observed = observations[unit_index]
+        observed_days = sorted(observed, key=positions.get)
+        return any(
+            positions[right] - positions[left] > 1
+            and ((observed[left] is None) != (observed[right] is None))
+            for left, right in zip(observed_days, observed_days[1:])
+        )
+
+    def future_availability_alignment_proof(unit_index, cadence_hint):
+        """Return when n+cadence-1/n+cadence proves cycle-day-one.
+
+        For a future-available unit, two distinct non-null prices on this
+        adjacent pair prove the boundary and populate both adjoining ranges.
+        A separate call on the availability date would add no information.
+        """
+        probe_days = future_availability_probe_days(
+            unit_index, cadence_hint)
+        if len(probe_days) != 2 or not all(
+                day in observations[unit_index] for day in probe_days):
+            return None
+        left, right = probe_days
+        left_signature = observations[unit_index].get(left)
+        right_signature = observations[unit_index].get(right)
+        if (left_signature is None or right_signature is None
+                or left_signature == right_signature):
+            return None
+        return max(call_index[left], call_index[right])
+
+    def pricing_window_start_resolved(unit_index):
+        """Require response evidence for a future unit's active start date."""
+        days = window_dates[unit_index]
+        if not days:
+            return True
+        observed = observations[unit_index]
+        if days[0] in observed and observed[days[0]] is not None:
+            return True
+        # The optimized future-unit boundary test proves that availability is
+        # cycle day one and gives a checked price in its first range. Requiring
+        # another response on the availability date merely rechecks a range
+        # whose value is already inferable.
+        if (effective_cadence
+                and future_availability_alignment_proof(
+                    unit_index, effective_cadence) is not None):
+            return True
+        # A fully queried no-price window is terminal; it cannot provide a
+        # cadence candidate but should not block other units indefinitely.
+        return all(day in observed and observed[day] is None for day in days)
+
+    def future_pricing_start_probe_needed(unit_index):
+        """Detect a rejected future-start shortcut that can hide an island.
+
+        Ordinarily a future unit's availability date is safely covered by the
+        cycle-day-one alignment proof. If the boundary probe instead returns
+        no price immediately before a later price, the availability date can
+        contain an isolated earlier price response. Query that metadata-known
+        start once; do not add a start-date call for every ordinary future
+        unit whose phase was learned incidentally from another property call.
+        """
+        days = window_dates[unit_index]
+        if (not days or not effective_cadence
+                or units[unit_index].get('availabilityTiming')
+                != 'Future Available'):
+            return False
+        observed = observations[unit_index]
+        if days[0] in observed:
+            return False
+        probe_window = days[:min(len(days), effective_cadence + 1)]
+        return (any(
+            day in observed and observed[day] is None
+            for day in probe_window)
+            and any(
+                day in observed and observed[day] is not None
+                for day in probe_window))
+
+    def cadence_candidates(required_cadence=None):
+        candidates = []
+        for unit_index in range(len(units)):
+            boundaries = observed_boundaries(unit_index)
+            positions = {
+                day: index
+                for index, day in enumerate(window_dates[unit_index])
+            }
+            for first, second in zip(boundaries, boundaries[1:]):
+                gap = (
+                    date.fromisoformat(second['date'])
+                    - date.fromisoformat(first['date'])
+                ).days
+                second_previous = window_dates[unit_index][
+                    positions[second['date']] - 1]
+                if gap <= 0 or (
+                        required_cadence is not None
+                        and gap != required_cadence):
+                    continue
+                if not observed_equal_span_consistent(
+                        unit_index, first['date'], second_previous):
+                    continue
+                candidates.append({
+                    'cadenceDays': gap,
+                    'unitIndex': unit_index,
+                    'firstBoundary': first['date'],
+                    'secondBoundary': second['date'],
+                    'proofCall': max(first['proofCall'], second['proofCall']),
+                })
+        return sorted(candidates, key=lambda item: (
+            item['proofCall'], item['cadenceDays'], item['secondBoundary'],
+            item['unitIndex']))
+
+    def cadence_response_contradiction(cadence_hint):
+        """Disprove a cadence using only prices from normal property calls.
+
+        Each chronologically adjacent pair of returned, distinct prices proves
+        that at least one boundary lies inside that date interval. A valid
+        cadence must have some unit-specific phase whose projected boundaries
+        intersect every such interval. If no phase can do so, the cadence is
+        impossible for that unit. No cadence-only call is needed.
+        """
+        if not isinstance(cadence_hint, int) or cadence_hint <= 0:
+            return None
+        all_phases = set(range(cadence_hint))
+        for unit_index, days in enumerate(window_dates):
+            positions = {day: index for index, day in enumerate(days)}
+            observed = observations[unit_index]
+            observed_days = sorted(
+                (day for day, signature in observed.items()
+                 if day in positions and signature is not None),
+                key=positions.get)
+            possible_phases = set(all_phases)
+            evidence_calls = []
+            for left_day, right_day in zip(
+                    observed_days, observed_days[1:]):
+                if observed[left_day] == observed[right_day]:
+                    continue
+                left = positions[left_day]
+                right = positions[right_day]
+                interval_phases = {
+                    date.fromisoformat(days[offset]).toordinal()
+                    % cadence_hint
+                    for offset in range(left + 1, right + 1)
+                }
+                possible_phases &= interval_phases
+                evidence_calls.extend((
+                    call_index[left_day], call_index[right_day]))
+                if possible_phases:
+                    continue
+                label = units[unit_index].get('unitId') or unit_index
+                return {
+                    'unitIndex': unit_index,
+                    'unitId': units[unit_index].get('unitId'),
+                    'atCall': max(evidence_calls),
+                    'reason': (
+                        f'Returned price changes for unit {label} cannot all '
+                        f'be placed on one {cadence_hint}-day phase.'),
+                }
+        return None
+
+    def calendar_month_evidence():
+        """Return three response-proven boundaries on one monthly edge."""
+        candidates = []
+        pairs_by_day = {}
+        for unit_index in range(len(units)):
+            boundaries = observed_boundaries(unit_index)
+            for first_boundary, second_boundary in zip(
+                    boundaries, boundaries[1:]):
+                first_date = date.fromisoformat(first_boundary['date'])
+                second_date = date.fromisoformat(second_boundary['date'])
+                if first_date.day != second_date.day:
+                    continue
+                if (second_date.year * 12 + second_date.month
+                        != first_date.year * 12 + first_date.month + 1):
+                    continue
+                gap = (second_date - first_date).days
+                if not 28 <= gap <= 31:
+                    continue
+                pairs_by_day.setdefault(first_date.day, []).append({
+                    'unitIndex': unit_index,
+                    'first': first_boundary,
+                    'second': second_boundary,
+                    'gap': gap,
+                })
+            for triple in zip(
+                    boundaries, boundaries[1:], boundaries[2:]):
+                parsed = [
+                    date.fromisoformat(item['date']) for item in triple
+                ]
+                if len({item.day for item in parsed}) != 1:
+                    continue
+                month_indexes = [
+                    item.year * 12 + item.month for item in parsed
+                ]
+                if not (month_indexes[1] == month_indexes[0] + 1
+                        and month_indexes[2] == month_indexes[1] + 1):
+                    continue
+                gaps = [
+                    (parsed[1] - parsed[0]).days,
+                    (parsed[2] - parsed[1]).days,
+                ]
+                if not all(28 <= gap <= 31 for gap in gaps):
+                    continue
+                candidates.append({
+                    'cadenceDays': min(gaps),
+                    'calendarMonthDay': parsed[0].day,
+                    'unitIndex': unit_index,
+                    'firstBoundary': triple[0]['date'],
+                    'secondBoundary': triple[1]['date'],
+                    'thirdBoundary': triple[2]['date'],
+                    'proofCall': max(
+                        item['proofCall'] for item in triple),
+                    'calendarMonth': True,
+                    'ready': True,
+                })
+        if candidates:
+            return min(candidates, key=lambda item: (
+                item['proofCall'], item['unitIndex']))
+        # A property call observes all units. Two independently proven monthly
+        # boundary pairs on the same day-of-month provide the same property-
+        # level evidence even when short unit holds prevent either unit from
+        # containing three boundaries by itself.
+        pair_candidates = []
+        for month_day, pairs in pairs_by_day.items():
+            distinct_pairs = {
+                (item['first']['date'], item['second']['date']): item
+                for item in pairs
+            }
+            pairs = list(distinct_pairs.values())
+            if len(pairs) < 2:
+                continue
+            first_pair, second_pair = sorted(
+                pairs, key=lambda item: (
+                    max(item['first']['proofCall'],
+                        item['second']['proofCall']),
+                    item['unitIndex']))[:2]
+            pair_candidates.append({
+                'cadenceDays': min(
+                    first_pair['gap'], second_pair['gap']),
+                'calendarMonthDay': month_day,
+                'unitIndex': first_pair['unitIndex'],
+                'firstBoundary': first_pair['first']['date'],
+                'secondBoundary': first_pair['second']['date'],
+                'corroboratingUnitIndex': second_pair['unitIndex'],
+                'proofCall': max(
+                    first_pair['first']['proofCall'],
+                    first_pair['second']['proofCall'],
+                    second_pair['first']['proofCall'],
+                    second_pair['second']['proofCall']),
+                'calendarMonth': True,
+                'crossUnitEvidence': True,
+                'ready': True,
+            })
+        return min(pair_candidates, key=lambda item: (
+            item['proofCall'], item['unitIndex'])) if pair_candidates else None
+
+    def calendar_month_probe_days(candidate):
+        """Return one adjacent pair at the next same-day monthly edge."""
+        if not candidate:
+            return []
+        try:
+            first = date.fromisoformat(candidate['firstBoundary'])
+            second = date.fromisoformat(candidate['secondBoundary'])
+        except (KeyError, TypeError, ValueError):
+            return []
+        gap = (second - first).days
+        if not (28 <= gap <= 31 and first.day == second.day):
+            return []
+        next_month = 1 if second.month == 12 else second.month + 1
+        next_year = second.year + 1 if second.month == 12 else second.year
+        following_month = 1 if next_month == 12 else next_month + 1
+        following_year = next_year + 1 if next_month == 12 else next_year
+        month_end = (
+            date(following_year, following_month, 1)
+            - timedelta(days=1)).day
+        projected = date(
+            next_year, next_month, min(second.day, month_end))
+        previous = projected - timedelta(days=1)
+        return [
+            day.isoformat() for day in (previous, projected)
+            if day.isoformat() in property_dates
+        ]
+
+    def calendar_month_response_contradiction():
+        """Disprove any unit-specific calendar-day monthly model."""
+        for unit_index, days in enumerate(window_dates):
+            positions = {day: index for index, day in enumerate(days)}
+            observed = observations[unit_index]
+            observed_days = sorted(
+                (day for day, signature in observed.items()
+                 if day in positions and signature is not None),
+                key=positions.get)
+            possible_month_days = set(range(1, 32))
+            evidence_calls = []
+            for left_day, right_day in zip(
+                    observed_days, observed_days[1:]):
+                if observed[left_day] == observed[right_day]:
+                    continue
+                left = positions[left_day]
+                right = positions[right_day]
+                possible_month_days &= {
+                    date.fromisoformat(days[offset]).day
+                    for offset in range(left + 1, right + 1)
+                }
+                evidence_calls.extend((
+                    call_index[left_day], call_index[right_day]))
+                if possible_month_days:
+                    continue
+                label = units[unit_index].get('unitId') or unit_index
+                return {
+                    'unitIndex': unit_index,
+                    'unitId': units[unit_index].get('unitId'),
+                    'atCall': max(evidence_calls),
+                    'reason': (
+                        f'Returned price changes for unit {label} cannot all '
+                        'be placed on one calendar day-of-month phase.'),
+                }
+        return None
+
+    def equal_interval_dates(unit_index, cadence_hint):
+        """Dates proven equal by response pairs no farther than one cadence."""
+        return set(equal_interval_values(unit_index, cadence_hint))
+
+    def equal_interval_values(unit_index, cadence_hint):
+        """Map dates to the signature proven by nearby equal responses."""
+        if not cadence_hint:
+            return {}
+        days = window_dates[unit_index]
+        observed = observations[unit_index]
+        positions = {day: index for index, day in enumerate(days)}
+        observed_days = sorted(observed, key=positions.get)
+        covered = {}
+        for left_day, right_day in zip(observed_days, observed_days[1:]):
+            left = positions[left_day]
+            right = positions[right_day]
+            if right - left > cadence_hint:
+                continue
+            left_signature = observed[left_day]
+            right_signature = observed[right_day]
+            if (left_signature is None or right_signature is None
+                    or left_signature != right_signature):
+                continue
+            for day in days[left:right + 1]:
+                covered[day] = left_signature
+        return covered
+
+    def endpoint_inferred_dates(unit_index):
+        return (set(window_dates[unit_index])
+                if unit_index in endpoint_equal_at_call else set())
+
+    def largest_observed_equal_range():
+        largest = 0
+        for unit_index, days in enumerate(window_dates):
+            observed = observations[unit_index]
+            current_signature = object()
+            current_length = 0
+            for day in days:
+                if day not in observed or observed[day] is None:
+                    current_signature = object()
+                    current_length = 0
+                    continue
+                if observed[day] == current_signature:
+                    current_length += 1
+                else:
+                    current_signature = observed[day]
+                    current_length = 1
+                largest = max(largest, current_length)
+        return largest
+
+    effective_cadence = (
+        supplied_cadence if cadence_mode in ('known', 'trusted') else None)
+    cadence_known_at = 0 if effective_cadence else None
+    cadence_verified_at = None
+    cadence_evidence = None
+    cadence_ready_at = 0 if cadence_mode == 'trusted' else None
+    phase_known_at = {}
+    unit_phases = {}
+    boundary_not_required = set()
+    phase_probe_exhausted = set()
+    discovery_is_lower_bound = False
+    future_discovery_exhausted = set()
+    calendar_month_day = None
+
+    def response_derived_groups(days, cadence_days, phase):
+        if calendar_month_day is None:
+            return _dynamic_pricing_date_groups(
+                days, cadence_days, phase)
+        groups = []
+        current_key = None
+        current_dates = []
+        for day in days:
+            parsed = date.fromisoformat(day)
+            month_index = parsed.year * 12 + parsed.month
+            if parsed.day < phase:
+                month_index -= 1
+            if current_key is not None and month_index != current_key:
+                groups.append(current_dates)
+                current_dates = []
+            current_key = month_index
+            current_dates.append(day)
+        if current_dates:
+            groups.append(current_dates)
+        return groups
+
+    if cadence_mode == 'trusted' and effective_cadence:
+        for unit_index, days in enumerate(window_dates):
+            if (days and not cadence_is_lower_bound
+                    and effective_cadence > len(days)):
+                # The trusted domain assumption says a cadence longer than the
+                # entire requested hold cannot introduce an interior boundary.
+                # A reported lower bound is not an exact cadence and cannot
+                # safely support that shortcut.
+                boundary_not_required.add(unit_index)
+                phase_known_at[unit_index] = 0
+                unit_phases[unit_index] = (
+                    date.fromisoformat(days[0]).toordinal()
+                    % effective_cadence)
+
+    def refresh_cadence():
+        nonlocal effective_cadence, cadence_known_at
+        nonlocal cadence_verified_at, cadence_evidence, cadence_ready_at
+        nonlocal calendar_month_day
+        if cadence_ready_at is not None:
+            return
+        if cadence_mode == 'known':
+            candidates = cadence_candidates(supplied_cadence)
+        else:
+            monthly_evidence = calendar_month_evidence()
+            monthly_contradiction = (
+                calendar_month_response_contradiction()
+                if monthly_evidence else None)
+            if monthly_evidence and not monthly_contradiction:
+                cadence_evidence = monthly_evidence
+                effective_cadence = monthly_evidence['cadenceDays']
+                calendar_month_day = monthly_evidence['calendarMonthDay']
+                cadence_known_at = monthly_evidence['proofCall']
+                cadence_verified_at = monthly_evidence['proofCall']
+                cadence_ready_at = monthly_evidence['proofCall']
+                return
+            future_indexes = [
+                unit_index for unit_index in range(len(units))
+                if is_future_cycle_start_candidate(unit_index)
+            ]
+            future_candidates = [
+                candidate for unit_index in future_indexes
+                if (candidate := future_discovery_candidate(unit_index))
+                and candidate['ready']
+            ]
+            future_candidates = [
+                candidate for candidate in future_candidates
+                if candidate.get('cadenceDays') not in rejected_cadences
+            ]
+            eligible_candidates = []
+            for candidate in future_candidates:
+                contradiction = cadence_response_contradiction(
+                    candidate['cadenceDays'])
+                if contradiction is None:
+                    eligible_candidates.append(candidate)
+                    continue
+                rejected_cadences.add(candidate['cadenceDays'])
+                rejection_key = (
+                    candidate['cadenceDays'], contradiction['unitIndex'])
+                if not any(
+                        (item.get('cadenceDays'), item.get('unitIndex'))
+                        == rejection_key
+                        for item in cadence_candidate_rejections):
+                    cadence_candidate_rejections.append({
+                        'cadenceDays': candidate['cadenceDays'],
+                        'atCall': max(
+                            candidate['proofCall'],
+                            contradiction['atCall']),
+                        'unitIndex': contradiction['unitIndex'],
+                        'unitId': contradiction['unitId'],
+                        'reason': contradiction['reason'],
+                    })
+            future_candidates = eligible_candidates
+            strong_candidates = [
+                candidate for candidate in future_candidates
+                if not candidate.get('singleBoundaryAssumption')
+            ]
+            future_scan_complete = bool(future_indexes) and all(
+                pricing_window_start_resolved(unit_index)
+                and
+                not has_unresolved_availability_bracket(unit_index)
+                and (
+                    unit_index in endpoint_equal_at_call
+                    or unit_index in future_discovery_exhausted
+                    or any(candidate['unitIndex'] == unit_index
+                           for candidate in future_candidates)
+                )
+                for unit_index in future_indexes)
+            if strong_candidates:
+                # Two adjacent response-proven boundaries establish an exact
+                # cadence for this unit immediately. Accept it now; if a later
+                # property-wide response exposes an incompatible shorter
+                # cadence, the contradiction detector rejects it and restarts
+                # discovery with every prior response preserved.
+                chosen = min(strong_candidates, key=lambda item: (
+                    item['cadenceDays'], item['proofCall'], item['unitIndex']))
+                candidates = [chosen]
+            elif future_candidates and future_scan_complete:
+                # One-boundary candidates at least half a hold long are valid
+                # assumptions, but first give every future unit a chance to
+                # provide the stronger two-boundary proof.
+                # Prefer the smallest response-supported candidate whenever
+                # property-wide calls have exposed more than one.
+                chosen = min(future_candidates, key=lambda item: (
+                    item['cadenceDays'], item['proofCall'], item['unitIndex']))
+                chosen = dict(chosen)
+                chosen['proofCall'] = len(call_sequence)
+                candidates = [chosen]
+            elif not future_indexes:
+                candidates = [
+                    candidate for candidate in cadence_candidates()
+                    if candidate.get('cadenceDays') not in rejected_cadences
+                ]
+            else:
+                candidates = []
+        if not candidates:
+            return
+        cadence_evidence = candidates[0]
+        if cadence_mode == 'unknown':
+            effective_cadence = cadence_evidence['cadenceDays']
+            cadence_known_at = cadence_evidence['proofCall']
+        cadence_verified_at = cadence_evidence['proofCall']
+        cadence_ready_at = cadence_evidence['proofCall']
+
+    def refresh_phases():
+        if not effective_cadence or cadence_ready_at is None:
+            return
+        for unit_index in range(len(units)):
+            if unit_index in unit_phases:
+                continue
+            if (unit_index in adjusted_window_at_call
+                    and window_dates[unit_index]):
+                # An adjacent no-price -> priced response proves the exact
+                # start of a delayed unit pricing window. Once cadence is
+                # accepted, that start is also the first cycle-group edge;
+                # searching for the next price boundary would only re-prove
+                # a range whose cells are already inferable.
+                first_day = date.fromisoformat(window_dates[unit_index][0])
+                unit_phases[unit_index] = (
+                    first_day.day if calendar_month_day is not None
+                    else first_day.toordinal() % effective_cadence)
+                phase_known_at[unit_index] = max(
+                    adjusted_window_at_call[unit_index], cadence_ready_at)
+                continue
+            boundaries = observed_boundaries(unit_index)
+            if not boundaries:
+                continue
+            boundary = min(boundaries, key=lambda item: (
+                item['proofCall'], item['date']))
+            boundary_date = date.fromisoformat(boundary['date'])
+            unit_phases[unit_index] = (
+                boundary_date.day if calendar_month_day is not None
+                else boundary_date.toordinal() % effective_cadence)
+            phase_known_at[unit_index] = max(
+                boundary['proofCall'], cadence_ready_at)
+
+    # When a provisional cadence is invalidated, restart the state machine
+    # with every prior response already known. Replaying these seed calls only
+    # reconstructs causal state; query() de-duplicates them before any new API
+    # call is selected.
+    for seed_step in (_seed_call_steps or []):
+        query(
+            seed_step.get('date'),
+            seed_step.get('stage') or 'Discover cadence',
+            seed_step.get('reason') or 'Previously retrieved API response.')
+
+    # Candidate scan blocks are ranked entirely from unit metadata. Discovery
+    # begins with future-available units because their availability date is the
+    # cycle-start hypothesis; it receives no cadence value as input.
+    scan_blocks = []
+    for unit_index, days in enumerate(window_dates):
+        if not days:
+            continue
+        overlap_score = sum(
+            len(window_sets[unit_index] & other_days)
+            for other_days in window_sets
+        )
+        # Future-available units are the strongest phase candidates because
+        # their retrieval window usually begins on cycle day one. Always scan
+        # every such unit before an already-available unit, even when its hold
+        # is too short for the usual n+cadence boundary probe. Property-level
+        # responses may resolve the already-available units along the way.
+        future_probe_priority = (
+            0 if units[unit_index].get('availabilityTiming')
+            == 'Future Available' else 1)
+        priority_score = (
+            -date.fromisoformat(days[0]).toordinal()
+            if future_probe_priority == 0 else -overlap_score)
+        scan_blocks.append((
+            future_probe_priority, priority_score, days[0], -len(days),
+            unit_index, days))
+    scan_blocks.sort()
+
+    if cadence_mode != 'trusted':
+        cadence_stage = (
+            'Verify known cadence' if cadence_mode == 'known'
+            else ('Rediscover cadence' if cadence_invalidations
+                  else 'Discover cadence'))
+        # Give every future unit its inexpensive first chance, then revisit
+        # rejected future-availability hypotheses before touching any
+        # already-available unit. This preserves the future-first ordering
+        # while avoiding an adaptive search on one exception when another
+        # future unit can reveal the boundary in the preferred two calls.
+        future_scan_blocks = [
+            block for block in scan_blocks if block[0] == 0
+        ]
+        current_scan_blocks = [
+            block for block in scan_blocks if block[0] != 0
+        ]
+        retry_future_blocks = [
+            (2, *block[1:]) for block in future_scan_blocks
+        ]
+        ordered_scan_blocks = (
+            future_scan_blocks + retry_future_blocks + current_scan_blocks)
+        for (_future_priority, _score, _start, _length,
+             unit_index, days) in ordered_scan_blocks:
+            label = units[unit_index].get('unitId') or unit_index
+            while True:
+                discovery_candidate = (
+                    future_discovery_candidate(unit_index)
+                    if cadence_mode == 'unknown' else None)
+                discovery_inferred = (
+                    endpoint_inferred_dates(unit_index)
+                    | set(lower_bound_inference_calls(unit_index)))
+                lower_bound_mode = (
+                    cadence_mode == 'unknown'
+                    or (cadence_mode == 'known' and cadence_is_lower_bound))
+                cadence_proof_incomplete = (
+                    cadence_mode == 'unknown'
+                    and is_future_cycle_start_candidate(unit_index)
+                    and discovery_candidate is not None
+                    and not discovery_candidate['ready'])
+                if (not cadence_proof_incomplete
+                        and lower_bound_mode and all(
+                        day in observations[unit_index]
+                        or day in discovery_inferred
+                        for day in window_dates[unit_index])
+                        and (not is_future_cycle_start_candidate(unit_index)
+                             or pricing_window_start_resolved(unit_index))):
+                    day = None
+                elif (cadence_mode == 'unknown'
+                      and is_future_cycle_start_candidate(unit_index)):
+                    rejected_hint = min((
+                        item['cadenceDays']
+                        for item in cadence_candidate_rejections
+                        if item.get('unitIndex') == unit_index
+                    ), default=None)
+                    if rejected_hint:
+                        # This unit already disproved a longer candidate using
+                        # property-wide responses. Bisect those existing
+                        # differing-price intervals directly instead of
+                        # reopening its availability-to-hold endpoint search.
+                        day = next_boundary_probe(
+                            unit_index, rejected_hint)
+                    elif discovery_candidate and not discovery_candidate['ready']:
+                        calendar_probes = (
+                            discovery_candidate.get('calendarProbeDays') or [])
+                        day = next((probe for probe in calendar_probes
+                                    if probe not in observations[unit_index]),
+                                   None)
+                        if day is None:
+                            day = next_candidate_boundary_confirmation_probe(
+                                unit_index, discovery_candidate)
+                        if day is None:
+                            property_lower_bound = (
+                                current_response_cadence_lower_bound(
+                                    unit_index))
+                            cadence_hint = max(
+                                discovery_candidate['cadenceDays'],
+                                property_lower_bound)
+                            if (cadence_hint
+                                    > discovery_candidate['cadenceDays']
+                                    and cadence_response_contradiction(
+                                        cadence_hint)):
+                                # A long equal window on another unit is only
+                                # a provisional property lower bound. If
+                                # normal responses already make it impossible,
+                                # continue from this unit's tighter boundary.
+                                cadence_hint = (
+                                    discovery_candidate['cadenceDays'])
+                            day = next_boundary_probe(
+                                unit_index, cadence_hint)
+                    else:
+                        day = next_future_discovery_probe(unit_index)
+                else:
+                    day = next_boundary_probe(
+                        unit_index,
+                        (supplied_cadence if cadence_mode == 'known'
+                         else current_response_cadence_lower_bound(
+                             unit_index) or None))
+                if day is None:
+                    if (cadence_mode == 'unknown'
+                            and is_future_cycle_start_candidate(unit_index)):
+                        future_discovery_exhausted.add(unit_index)
+                        refresh_cadence()
+                        if cadence_ready_at is not None:
+                            refresh_phases()
+                    break
+                future_probe = day in future_availability_probe_days(
+                    unit_index, supplied_cadence)
+                if cadence_mode == 'unknown' and is_future_cycle_start_candidate(
+                        unit_index):
+                    search_reason = (
+                        f'Compare the first and last pricing dates for future '
+                        f'unit {label}, then bisect every proven differing-price '
+                        'interval until consecutive boundaries establish the '
+                        'cadence')
+                elif future_probe:
+                    search_reason = (
+                        f'Test whether future availability is cycle day one '
+                        f'for unit {label}')
+                elif cadence_mode == 'known' and cadence_is_lower_bound:
+                    search_reason = (
+                        f'Probe supplied cadence-lower-bound intervals for '
+                        f'unit {label} and infer equal endpoints without '
+                        'sequential calls')
+                elif cadence_mode == 'known':
+                    search_reason = (
+                        f'Probe cadence-spaced anchors and bisect a differing '
+                        f'interval for unit {label}')
+                else:
+                    search_reason = (
+                        f'Probe cadence-lower-bound intervals for unit {label} '
+                        'and infer equal endpoints without sequential calls')
+                query(
+                    day, cadence_stage,
+                    f'{search_reason}; evaluate every unit returned by each '
+                    'property call.')
+                refresh_cadence()
+                if cadence_ready_at is not None:
+                    refresh_phases()
+                    break
+                future_probe_days = future_availability_probe_days(
+                    unit_index, supplied_cadence)
+                if (cadence_mode == 'known'
+                        and _future_priority == 0
+                        and future_probe_days
+                        and all(day in observations[unit_index]
+                                for day in future_probe_days)
+                        and observations[unit_index].get(
+                            future_probe_days[0])
+                        == observations[unit_index].get(
+                            future_probe_days[1])):
+                    # This unit is an exception to the cycle-day-one pattern.
+                    # Try the next future unit before adaptively searching it.
+                    break
+            if cadence_ready_at is not None:
+                break
+
+        # A supplied cadence may be impossible to verify within every unit's
+        # horizon. Complete retrieval is then the only safe known-mode result.
+        # Stop early if the fallback responses happen to expose the proof.
+        if cadence_ready_at is None:
+            for day in property_dates:
+                if day in call_index:
+                    continue
+                if (cadence_mode == 'unknown'
+                        or (cadence_mode == 'known'
+                            and cadence_is_lower_bound)) and all(
+                        day not in window_sets[unit_index]
+                        or day in observations[unit_index]
+                        or day in endpoint_inferred_dates(unit_index)
+                        or day in lower_bound_inference_calls(unit_index)
+                        for unit_index in range(len(units))):
+                    continue
+                query(
+                    day, 'Daily fallback',
+                    ('Cadence is still unresolved; retrieve the next property '
+                     'date without assuming an unobserved boundary.'))
+                refresh_cadence()
+                if cadence_ready_at is not None:
+                    refresh_phases()
+                    break
+
+        if cadence_mode == 'unknown' and cadence_ready_at is None:
+            endpoint_lower_bound = max((
+                len(window_dates[index])
+                for index, _proof_call
+                in shared_endpoint_lower_bound_evidence()
+                if len(window_dates[index]) not in rejected_cadences
+            ), default=0)
+            observed_lower_bound = largest_observed_equal_range()
+            lower_bound = max(endpoint_lower_bound, observed_lower_bound)
+            if lower_bound and lower_bound not in rejected_cadences:
+                effective_cadence = lower_bound
+                discovery_is_lower_bound = True
+                cadence_evidence = {
+                    'cadenceDays': lower_bound,
+                    'proofCall': len(call_sequence),
+                    'lowerBound': True,
+                }
+
+    # A 28-31 day fixed candidate supported by same-day-of-month boundaries
+    # is ambiguous with a calendar-month schedule. Resolve that ambiguity once
+    # at the property level before locating unit phases. The two responses also
+    # populate the adjacent matrix ranges, so this is not repeated per unit.
+    if (cadence_mode == 'unknown' and cadence_ready_at is not None
+            and calendar_month_day is None):
+        monthly_probe_days = calendar_month_probe_days(cadence_evidence)
+        if len(monthly_probe_days) == 2:
+            for day in monthly_probe_days:
+                query(
+                    day, 'Verify property calendar cadence',
+                    'Check the next same-day-of-month boundary once for the '
+                    'property; distinguish a calendar-month schedule from a '
+                    'fixed 28-31 day cadence without per-unit rechecks.')
+            monthly_evidence = calendar_month_evidence()
+            if (monthly_evidence
+                    and not calendar_month_response_contradiction()):
+                cadence_evidence = monthly_evidence
+                effective_cadence = monthly_evidence['cadenceDays']
+                calendar_month_day = monthly_evidence['calendarMonthDay']
+                cadence_known_at = monthly_evidence['proofCall']
+                cadence_verified_at = monthly_evidence['proofCall']
+                cadence_ready_at = monthly_evidence['proofCall']
+                unit_phases.clear()
+                phase_known_at.clear()
+                refresh_phases()
+        elif cadence_evidence:
+            try:
+                first_month_boundary = date.fromisoformat(
+                    cadence_evidence['firstBoundary'])
+                second_month_boundary = date.fromisoformat(
+                    cadence_evidence['secondBoundary'])
+            except (KeyError, TypeError, ValueError):
+                first_month_boundary = second_month_boundary = None
+            if (first_month_boundary and second_month_boundary
+                    and first_month_boundary.day == second_month_boundary.day
+                    and 28 <= (
+                        second_month_boundary
+                        - first_month_boundary).days <= 31):
+                # The proving unit may end before a third month is available.
+                # Cover the same calendar edge across the property horizon.
+                # These are shared property calls, never one check per unit,
+                # and they directly populate every ambiguous monthly range.
+                for day in property_dates:
+                    if (date.fromisoformat(day).day
+                            != first_month_boundary.day):
+                        continue
+                    query(
+                        day, 'Cover property calendar edges',
+                        'Retrieve the possible same-day-of-month price edge '
+                        'once for the property because the proving unit ends '
+                        'before a third monthly boundary can be checked.')
+                monthly_evidence = calendar_month_evidence()
+                if (monthly_evidence
+                        and not calendar_month_response_contradiction()):
+                    cadence_evidence = monthly_evidence
+                    effective_cadence = monthly_evidence['cadenceDays']
+                    calendar_month_day = (
+                        monthly_evidence['calendarMonthDay'])
+                    cadence_known_at = monthly_evidence['proofCall']
+                    cadence_verified_at = monthly_evidence['proofCall']
+                    cadence_ready_at = monthly_evidence['proofCall']
+                    unit_phases.clear()
+                    phase_known_at.clear()
+                    refresh_phases()
+
+    def cadence_contradiction(cadence_hint):
+        """Return the first response-only contradiction of a cadence belief."""
+        if not cadence_hint:
+            return None
+        if calendar_month_day is None:
+            response_contradiction = cadence_response_contradiction(
+                cadence_hint)
+            if response_contradiction:
+                return response_contradiction
+        else:
+            response_contradiction = (
+                calendar_month_response_contradiction())
+            if response_contradiction:
+                return response_contradiction
+        for unit_index, days in enumerate(window_dates):
+            boundaries = observed_boundaries(unit_index)
+            if len(boundaries) >= 2:
+                phases = {
+                    (date.fromisoformat(boundary['date']).day
+                     if calendar_month_day is not None
+                     else date.fromisoformat(
+                         boundary['date']).toordinal() % cadence_hint)
+                    for boundary in boundaries
+                }
+                if len(phases) > 1:
+                    proof_call = max(
+                        boundary['proofCall'] for boundary in boundaries)
+                    return {
+                        'unitIndex': unit_index,
+                        'unitId': units[unit_index].get('unitId'),
+                        'atCall': proof_call,
+                        'reason': (
+                            f'Observed boundaries for unit '
+                            f'{units[unit_index].get("unitId") or unit_index} '
+                            f'do not share one {cadence_hint}-day phase.'),
+                    }
+
+            phase = unit_phases.get(unit_index)
+            if phase is None:
+                continue
+            for group in response_derived_groups(
+                    days, cadence_hint, phase):
+                observed_group = [
+                    (day, observations[unit_index][day])
+                    for day in group
+                    if day in observations[unit_index]
+                    and observations[unit_index][day] is not None
+                ]
+                if len({signature for _day, signature in observed_group}) <= 1:
+                    continue
+                proof_call = max(
+                    call_index[day] for day, _signature in observed_group)
+                return {
+                    'unitIndex': unit_index,
+                    'unitId': units[unit_index].get('unitId'),
+                    'atCall': proof_call,
+                    'reason': (
+                        f'Unit {units[unit_index].get("unitId") or unit_index} '
+                        f'returned distinct prices inside one projected '
+                        f'{cadence_hint}-day group.'),
+                }
+        return None
+
+    # Once cadence is trusted or response-verified, scan metadata-defined unit
+    # windows until each unit either exposes one exact boundary or every one of
+    # its dates has been retrieved. Each call can resolve several units at once.
+    if cadence_ready_at is not None and effective_cadence:
+        refresh_phases()
+        live_contradiction = None
+        while True:
+            unresolved = [
+                index for index, days in enumerate(window_dates)
+                if (index not in unit_phases
+                    or has_unresolved_availability_bracket(index)
+                    or (
+                        units[index].get('availabilityTiming')
+                        != 'Future Available'
+                        and not pricing_window_start_resolved(index))
+                    or future_pricing_start_probe_needed(index))
+                and index not in phase_probe_exhausted
+                and not all(
+                    day in observations[index]
+                    or day in endpoint_inferred_dates(index)
+                    or day in lower_bound_inference_calls(index)
+                    or day in equal_interval_dates(index, effective_cadence)
+                    for day in days)
+                and any(day not in observations[index] for day in days)
+            ]
+            if not unresolved:
+                break
+            ranked = []
+            for unit_index in unresolved:
+                remaining = [
+                    day for day in window_dates[unit_index]
+                    if day not in observations[unit_index]
+                ]
+                coverage = sum(
+                    sum(day in window_sets[other] for other in unresolved)
+                    for day in remaining
+                )
+                availability_priority = (
+                    0 if units[unit_index].get('availabilityTiming')
+                    == 'Future Available' else 1)
+                ranked.append((
+                    availability_priority, -coverage, remaining[0],
+                    len(remaining), unit_index, remaining))
+            (_availability, _coverage, _first, _count, focus_index,
+             _remaining) = min(ranked)
+            label = units[focus_index].get('unitId') or focus_index
+            while True:
+                day = next_boundary_probe(focus_index, effective_cadence)
+                if day is None:
+                    # Never requeue an unchanged unit. This can occur when its
+                    # metadata window begins before Entrata starts returning a
+                    # price and every useful cadence anchor has been exhausted.
+                    phase_probe_exhausted.add(focus_index)
+                    break
+                future_alignment_probe = day in future_availability_probe_days(
+                    focus_index, effective_cadence)
+                queried = query(
+                    day,
+                    ('Verify availability-cycle alignment'
+                     if future_alignment_probe else 'Locate unit cycles'),
+                    (f'Test n+cadence-1 and n+cadence for future-available '
+                     f'unit {label}; if distinct, both first ranges are also '
+                     'populated.'
+                     if future_alignment_probe
+                     else f'Probe cadence-spaced anchors for unit {label}, '
+                          'then bisect only an interval proven to contain a '
+                          'boundary.'))
+                if not queried:
+                    phase_probe_exhausted.add(focus_index)
+                    break
+                phase_probe_exhausted.discard(focus_index)
+                refresh_phases()
+                if cadence_mode == 'unknown':
+                    live_contradiction = cadence_contradiction(
+                        effective_cadence)
+                    if live_contradiction:
+                        break
+                if (focus_index in unit_phases
+                        and not has_unresolved_availability_bracket(
+                            focus_index)
+                        and (
+                            (units[focus_index].get('availabilityTiming')
+                             == 'Future Available'
+                             and not future_pricing_start_probe_needed(
+                                 focus_index))
+                            or pricing_window_start_resolved(focus_index))):
+                    break
+            if live_contradiction:
+                break
+
+        # Cycle groups now come only from an observed phase, supplied/discovered
+        # cadence, and the metadata-defined pricing window.
+        target_ranges = []
+        if not live_contradiction:
+            for unit_index, phase in unit_phases.items():
+                inferred_dates = (
+                    endpoint_inferred_dates(unit_index)
+                    | set(lower_bound_inference_calls(unit_index))
+                    | equal_interval_dates(
+                        unit_index, effective_cadence))
+                for days in response_derived_groups(
+                        window_dates[unit_index], effective_cadence, phase):
+                    if (not any(
+                            observations[unit_index].get(day) is not None
+                            for day in days)
+                            and not all(
+                                day in inferred_dates for day in days)):
+                        target_ranges.append({
+                            'start': days[0], 'end': days[-1]})
+            for day in _dynamic_pricing_minimum_range_dates([
+                    {'priceRanges': target_ranges}]):
+                query(
+                    day, 'Fill matrix',
+                    'Retrieve one response inside each cycle group derived '
+                    'from observed phase and the available cadence.')
+                if cadence_mode == 'unknown':
+                    live_contradiction = cadence_contradiction(
+                        effective_cadence)
+                    if live_contradiction:
+                        break
+    else:
+        live_contradiction = None
+
+    contradiction = (
+        live_contradiction or cadence_contradiction(effective_cadence))
+    if (cadence_mode == 'unknown' and contradiction
+            and effective_cadence not in rejected_cadences):
+        accepted_at = (
+            cadence_known_at
+            or (cadence_evidence or {}).get('proofCall')
+            or contradiction['atCall'])
+        invalidation = {
+            'cadenceDays': effective_cadence,
+            'acceptedAtCall': accepted_at,
+            'atCall': max(accepted_at, contradiction['atCall']),
+            'unitIndex': contradiction['unitIndex'],
+            'unitId': contradiction['unitId'],
+            'reason': contradiction['reason'],
+        }
+        return _dynamic_pricing_observation_only_plan(
+            units, None, 'unknown', cadence_is_lower_bound=False,
+            _seed_call_steps=call_steps,
+            _rejected_cadences=(
+                rejected_cadences | {effective_cadence}),
+            _cadence_invalidations=(
+                cadence_invalidations + [invalidation]),
+            _cadence_candidate_rejections=cadence_candidate_rejections)
+
+    # If cadence could not be verified/discovered, the scan blocks have queried
+    # every metadata-defined property date. This is an explicit full-retrieval
+    # result, not a sparse plan chosen with hindsight.
+    total = correct = 0
+    incorrect_cells = []
+    for unit_index, unit in enumerate(units):
+        signatures = truth[unit_index]
+        groups = []
+        if effective_cadence and unit_index in unit_phases:
+            groups = response_derived_groups(
+                window_dates[unit_index], effective_cadence,
+                unit_phases[unit_index])
+        group_by_day = {
+            day: group for group in groups for day in group
+        }
+        equal_values = equal_interval_values(unit_index, effective_cadence)
+        endpoint_signature = None
+        if unit_index in endpoint_equal_at_call and window_dates[unit_index]:
+            endpoint_signature = observations[unit_index].get(
+                window_dates[unit_index][0])
+        lower_bound_values = {
+            day: evidence['signature']
+            for day, evidence in lower_bound_inference_evidence(
+                unit_index).items()
+        }
+        for day in unit.get('pricingDates') or []:
+            total += 1
+            predicted_signature = None
+            prediction_available = False
+            if day in api_responses[unit_index]:
+                predicted_signature = api_responses[unit_index][day]
+                prediction_available = True
+            elif endpoint_signature is not None:
+                predicted_signature = endpoint_signature
+                prediction_available = True
+            elif day in lower_bound_values:
+                predicted_signature = lower_bound_values[day]
+                prediction_available = True
+            elif day in equal_values:
+                predicted_signature = equal_values[day]
+                prediction_available = True
+            if not prediction_available:
+                group = group_by_day.get(day) or []
+                inferred_from = next((
+                    candidate for candidate in group
+                    if observations[unit_index].get(candidate) is not None
+                ), None)
+                if inferred_from is not None:
+                    predicted_signature = observations[unit_index][inferred_from]
+                    prediction_available = True
+            reconstructed = (
+                prediction_available
+                and predicted_signature == signatures.get(day))
+            if reconstructed:
+                correct += 1
+            else:
+                incorrect_cells.append({
+                    'unitIndex': unit_index,
+                    'unitId': units[unit_index].get('unitId'),
+                    'date': day,
+                })
+
+    if cadence_mode == 'trusted':
+        strategy = (
+            'Trust supplied cadence; adaptively locate only necessary phases; '
+            'cover cycles')
+        cadence_status = 'Accepted without verification'
+    elif (cadence_ready_at is None and cadence_mode == 'known'
+          and cadence_is_lower_bound):
+        strategy = (
+            'Retain supplied cadence lower bound; infer bounded equal '
+            'intervals; retrieve only unresolved dates')
+        cadence_status = (
+            f'Lower bound ≥ {effective_cadence} days retained; exact cadence '
+            'not verifiable from the retrieved horizon')
+    elif cadence_ready_at is None and discovery_is_lower_bound:
+        strategy = (
+            'Infer equal future-unit endpoint windows; retain a cadence lower '
+            'bound; retrieve remaining unresolved dates')
+        cadence_status = (
+            f'Lower bound ≥ {effective_cadence} days from retrieved responses')
+    elif cadence_ready_at is None:
+        strategy = (
+            'Cadence not observable from responses; retrieve every property date')
+        cadence_status = (
+            'Not verifiable from retrieved horizon' if cadence_mode == 'known'
+            else 'Not discoverable from retrieved horizon')
+    elif cadence_mode == 'known':
+        strategy = (
+            'Adaptively verify supplied cadence; locate phases by bisection; '
+            'cover cycles')
+        cadence_status = f'Verified at call {cadence_verified_at}'
+    else:
+        strategy = (
+            'Adaptively discover cadence; locate phases by bisection; cover cycles')
+        if (cadence_evidence or {}).get('calendarMonth'):
+            strategy = (
+                'Discover calendar-month cadence from three property-level '
+                'boundaries; locate phases; cover monthly cycles')
+            cadence_status = (
+                f'Discovered calendar-month cadence at call '
+                f'{cadence_known_at} (day {calendar_month_day}; '
+                f'{effective_cadence}-31 day ranges)')
+        elif (cadence_evidence or {}).get('singleBoundaryAssumption'):
+            cadence_status = (
+                f'Assumed {effective_cadence}-day cadence at call '
+                f'{cadence_known_at} from one boundary spanning at least half '
+                'the unit hold with a constant observed tail')
+        else:
+            cadence_status = (
+                f'Discovered {effective_cadence}-day cadence at call '
+                f'{cadence_known_at}')
+
+    if cadence_candidate_rejections:
+        rejected = ', '.join(
+            str(item.get('cadenceDays'))
+            for item in cadence_candidate_rejections)
+        strategy = (
+            f'Reject impossible cadence candidate ({rejected}) from existing '
+            f'property responses; {strategy[0].lower() + strategy[1:]}')
+        cadence_status = (
+            f'{cadence_status}; rejected candidate {rejected} without an '
+            'additional cadence-check call')
+
+    if cadence_invalidations:
+        invalidated = ', '.join(
+            str(item.get('cadenceDays'))
+            for item in cadence_invalidations)
+        strategy = (
+            f'Invalidate contradicted cadence ({invalidated}); re-enter '
+            f'discovery; {strategy[0].lower() + strategy[1:]}')
+        cadence_status = (
+            f'{cadence_status}; invalidated prior cadence '
+            f'{invalidated} from later unit responses')
+
+    unit_cycle_boundaries = {}
+    future_availability_alignment = {}
+    if effective_cadence:
+        for unit_index, phase in unit_phases.items():
+            unit_cycle_boundaries[str(unit_index)] = (
+                [] if unit_index in boundary_not_required else [
+                    day for day in window_dates[unit_index]
+                    if ((date.fromisoformat(day).day == phase)
+                        if calendar_month_day is not None
+                        else (date.fromisoformat(day).toordinal()
+                              % effective_cadence == phase))
+                ])
+        for unit_index in range(len(units)):
+            proof_call = future_availability_alignment_proof(
+                unit_index, effective_cadence)
+            probe_days = future_availability_probe_days(
+                unit_index, effective_cadence)
+            if not probe_days or not all(
+                    day in observations[unit_index] for day in probe_days):
+                continue
+            confirmed = proof_call is not None
+            future_availability_alignment[str(unit_index)] = {
+                'status': 'Confirmed' if confirmed else 'Rejected',
+                'atCall': (proof_call if confirmed else max(
+                    call_index[day] for day in probe_days)),
+            }
+    return {
+        'calls': call_sequence,
+        'steps': call_steps,
+        'accuracy': round(100 * correct / total, 3) if total else 0.0,
+        'incorrectCells': incorrect_cells,
+        'cadenceKnownAtCall': cadence_known_at,
+        'cadenceVerifiedAtCall': cadence_verified_at,
+        'cadenceReadyAtCall': cadence_ready_at,
+        'effectiveCadenceDays': effective_cadence,
+        'cadenceEvidence': cadence_evidence,
+        'cadenceInvalidations': cadence_invalidations,
+        'cadenceCandidateRejections': cadence_candidate_rejections,
+        'calendarMonthDay': calendar_month_day,
+        'cadenceStatus': cadence_status,
+        'phaseKnownAtCall': phase_known_at,
+        'unitCyclePhases': {
+            str(index): phase for index, phase in unit_phases.items()
+        },
+        'unitCycleBoundaryDates': unit_cycle_boundaries,
+        'unitBoundaryNotRequired': sorted(boundary_not_required),
+        'unitFutureAvailabilityAlignment': future_availability_alignment,
+        'unitEndpointEqualityAtCall': {
+            str(index): call
+            for index, call in endpoint_equal_at_call.items()
+        },
+        'unitLowerBoundInferenceAtCall': {
+            str(index): inference
+            for index in range(len(units))
+            if (inference := lower_bound_inference_calls(index))
+        },
+        'unitWindowAdjustedAtCall': {
+            str(index): call
+            for index, call in adjusted_window_at_call.items()
+        },
+        'unitPlannedPricingWindows': {
+            str(index): {
+                'start': days[0] if days else None,
+                'end': days[-1] if days else None,
+                'days': len(days),
+            }
+            for index, days in enumerate(window_dates)
+        },
+        'strategy': strategy,
+        'cadenceIsLowerBound': (
+            cadence_is_lower_bound or discovery_is_lower_bound),
+    }
 
 
-def _dynamic_pricing_analyze_payload(community, payload, latest_sync=None,
-                                     snapshot_link='', unit_details=None):
+def _dynamic_pricing_date_groups(days, cadence_days, phase):
+    """Partition metadata-defined dates using a response-derived cycle phase."""
+    groups = []
+    current_key = None
+    current_dates = []
+    for day in days:
+        cycle_key = (
+            date.fromisoformat(day).toordinal() - phase) // cadence_days
+        if current_key is not None and cycle_key != current_key:
+            groups.append(current_dates)
+            current_dates = []
+        current_key = cycle_key
+        current_dates.append(day)
+    if current_dates:
+        groups.append(current_dates)
+    return groups
+
+
+def _dynamic_pricing_visualizer_metadata(
+        units, cadence_days, cadence_is_lower_bound=False):
+    """Attach compact step-through metadata before signatures are discarded."""
+    for unit_index, unit in enumerate(units):
+        unit['holdTimeDays'] = unit.get('pricingWindowDayCount') or 0
+        unit['visualPricingDates'] = list(
+            unit.get('_initialPricingDates') or [])
+        unit['visualStartDate'] = (
+            unit['visualPricingDates'][0]
+            if unit['visualPricingDates'] else unit.get('firstPricingDate'))
+        signature_ids = {}
+        signature_indexes = {}
+        for day in unit.get('pricingDates') or []:
+            signature = (unit.get('_pricingSignatures') or {}).get(day)
+            if signature not in signature_indexes:
+                signature_indexes[signature] = len(signature_indexes)
+            signature_ids[day] = signature_indexes[signature]
+        unit['pricingSignatureIds'] = signature_ids
+
+
+def _dynamic_pricing_analyze_payload(
+        community, payload, latest_sync=None, snapshot_link='',
+        unit_details=None, unknown_only=False):
     """Summarize the matrix corresponding to one Entrata community's sync."""
     matrices = payload.get('priceMatrices') if isinstance(payload, dict) else []
     if not isinstance(matrices, list):
@@ -4985,17 +7594,31 @@ def _dynamic_pricing_analyze_payload(community, payload, latest_sync=None,
         and price_range.get('lengthDays') > 0
     ]
     cadence_lengths = [length for _unit, length in cadence_evidence]
-    cadence_days = (None if pricing_does_not_change or not cadence_lengths
-                    else min(cadence_lengths))
+    observed_range_lengths = [
+        price_range.get('lengthDays')
+        for unit in units
+        for price_range in (unit.get('priceRanges') or [])
+        if isinstance(price_range.get('lengthDays'), int)
+        and price_range.get('lengthDays') > 0
+    ]
+    cadence_is_lower_bound = not cadence_lengths and bool(
+        observed_range_lengths)
+    cadence_days = (
+        max(observed_range_lengths) if cadence_is_lower_bound
+        else (min(cadence_lengths) if cadence_lengths else None)
+    )
     cadence_evidence_units = len({
         str(unit.get('sourceUnitId') or unit.get('unitId') or '')
         for unit, _length in cadence_evidence
     })
     cadence_is_consistent = bool(cadence_days) and all(
         length % cadence_days == 0 for length in cadence_lengths)
-    can_project_cycle = bool(cadence_days and cadence_is_consistent)
-    if pricing_does_not_change:
-        cadence_confidence = 'Pricing Does Not Change'
+    can_project_cycle = bool(
+        cadence_days and cadence_is_consistent and not cadence_is_lower_bound)
+    if cadence_is_lower_bound and pricing_does_not_change:
+        cadence_confidence = 'No Changes Observed; Lower Bound Only'
+    elif cadence_is_lower_bound:
+        cadence_confidence = 'Lower Bound Only'
     elif not cadence_lengths:
         cadence_confidence = 'Insufficient Data'
     elif len(cadence_lengths) == 1:
@@ -5017,9 +7640,9 @@ def _dynamic_pricing_analyze_payload(community, payload, latest_sync=None,
     # be truncated by the unit's availability and the retrieved horizon.
     for unit in units:
         unit['cadenceDays'] = cadence_days
-        unit['cadence'] = ('Pricing Does Not Change'
-                           if pricing_does_not_change
-                           else (str(cadence_days) if cadence_days else None))
+        unit['cadence'] = (
+            f'>= {cadence_days}' if cadence_is_lower_bound and cadence_days
+            else (str(cadence_days) if cadence_days else None))
         ranges = unit.get('priceRanges') or []
         first_range = ranges[0] if ranges else {}
         last_range = ranges[-1] if ranges else {}
@@ -5033,6 +7656,19 @@ def _dynamic_pricing_analyze_payload(community, payload, latest_sync=None,
 
         available_day = (date.fromisoformat(available_date)
                          if available_date else None)
+        initial_start = (
+            sync_date.isoformat() if sync_date is not None
+            else first_pricing_date)
+        if available_day is not None and sync_date is not None:
+            initial_start = max(available_day, sync_date).isoformat()
+        elif available_day is not None:
+            initial_start = available_day.isoformat()
+        initial_start_day = date.fromisoformat(initial_start)
+        hold_time_days = unit.get('pricingWindowDayCount') or 0
+        unit['_initialPricingDates'] = [
+            (initial_start_day + timedelta(days=offset)).isoformat()
+            for offset in range(hold_time_days)
+        ]
         if available_day is None or sync_date is None:
             unit['availabilityTiming'] = 'Unknown'
         elif available_day > sync_date:
@@ -5083,7 +7719,10 @@ def _dynamic_pricing_analyze_payload(community, payload, latest_sync=None,
                 pass
             predictable_units += 1
 
-        if pricing_does_not_change:
+        if pricing_does_not_change and cadence_is_lower_bound:
+            unit['predictionStatus'] = (
+                'No changes observed; use the observed range as a cadence lower bound')
+        elif pricing_does_not_change:
             unit['predictionStatus'] = 'No price changes observed'
         elif not cadence_days:
             unit['predictionStatus'] = 'Observed ranges only; cadence unavailable'
@@ -5096,7 +7735,7 @@ def _dynamic_pricing_analyze_payload(community, payload, latest_sync=None,
                 'Availability date alone does not establish cycle phase')
 
     if pricing_does_not_change:
-        cycle_alignment = 'No Changes'
+        cycle_alignment = 'No Observed Changes'
     elif not can_project_cycle or not cycle_phases:
         cycle_alignment = 'Unknown'
     elif len(cycle_phases) == 1:
@@ -5104,77 +7743,106 @@ def _dynamic_pricing_analyze_payload(community, payload, latest_sync=None,
     else:
         cycle_alignment = f'Unit-Specific ({len(cycle_phases)} phases)'
 
+    inconsistent_input_units = [
+        unit.get('unitId')
+        for unit in units
+        if (unit.get('firstPricingDate')
+            not in set(unit.get('_initialPricingDates') or []))
+    ]
+
     all_pricing_dates = sorted({
-        day for unit in units for day in unit['pricingDates']
+        day for unit in units for day in unit['_initialPricingDates']
     })
-    shared_phase = (next(iter(cycle_phases))
-                    if cycle_alignment == 'Community-Aligned'
-                    and len(cycle_phases) == 1 else None)
-    cycle_range_units = (
-        _dynamic_pricing_cycle_range_units(
-            units, cadence_days, shared_phase=shared_phase)
-        if can_project_cycle else [])
-    cadence_spaced_dates, cadence_spacing_strict = (
-        _dynamic_pricing_cadence_spaced_range_dates(
-            cycle_range_units, cadence_days)
-        if can_project_cycle else ([], False))
-    all_change_dates = (
-        all_pricing_dates[:1] if pricing_does_not_change
-        else (cadence_spaced_dates if can_project_cycle
-              else _dynamic_pricing_minimum_range_dates(units)))
     current_calls = len(all_pricing_dates)
-    new_calls = 1 if pricing_does_not_change else len(all_change_dates)
-    if pricing_does_not_change:
-        bootstrap_dates = all_pricing_dates[:1]
-        bootstrap_accuracy = 100.0
-        retrieval_strategy = 'One learned constant-price call'
-    elif can_project_cycle:
-        bootstrap_dates = cadence_spaced_dates
-        bootstrap_accuracy = _dynamic_pricing_range_plan_accuracy(
-            cycle_range_units, bootstrap_dates)
-        retrieval_strategy = (
-            'Cadence-spaced property range cover'
-            if cadence_spacing_strict else
-            'Exact range cover; truncated-edge spacing exception')
-    else:
-        # A phase-agnostic sparse plan is unsafe when cadence is unresolved.
-        # Retain daily retrieval as the correctness-preserving fallback.
-        bootstrap_dates = all_pricing_dates
-        bootstrap_accuracy = 100.0
-        retrieval_strategy = 'Daily fallback; cadence unresolved'
-    if bootstrap_accuracy != 100.0:
-        # A larger apparent cadence can hide shorter equal-price cycles, and
-        # malformed date gaps can violate the one-boundary assumption. Never
-        # publish an inexact sparse bootstrap plan.
-        bootstrap_dates = all_pricing_dates
-        bootstrap_accuracy = 100.0
-        retrieval_strategy = (
-            'Daily fallback; sparse cadence plan failed verification')
-    bootstrap_calls = len(bootstrap_dates)
+
+    def finalized_plan(mode):
+        plan = _dynamic_pricing_observation_only_plan(
+            units,
+            cadence_days if mode in ('known', 'trusted') else None,
+            mode,
+            cadence_is_lower_bound=(
+                cadence_is_lower_bound if mode in ('known', 'trusted')
+                else False))
+        calls = plan['calls']
+        calls_saved = current_calls - len(calls)
+        return {
+            'mode': mode,
+            'bootstrapApiCallDates': calls,
+            'bootstrapApiCalls': len(calls),
+            'apiCallsSaved': calls_saved,
+            'apiCallsSavedPct': round(
+                100 * calls_saved / current_calls, 1) if current_calls else 0.0,
+            'reconstructionAccuracyPct': plan['accuracy'],
+            'incorrectCells': plan.get('incorrectCells') or [],
+            'retrievalStrategy': plan['strategy'],
+            'cadenceKnownAtCall': plan['cadenceKnownAtCall'],
+            'cadenceVerifiedAtCall': plan['cadenceVerifiedAtCall'],
+            'cadenceReadyAtCall': plan['cadenceReadyAtCall'],
+            'effectiveCadenceDays': plan['effectiveCadenceDays'],
+            'cadenceEvidence': plan['cadenceEvidence'],
+            'cadenceInvalidations': plan['cadenceInvalidations'],
+            'cadenceCandidateRejections': (
+                plan['cadenceCandidateRejections']),
+            'calendarMonthDay': plan['calendarMonthDay'],
+            'cadenceStatus': plan['cadenceStatus'],
+            'cadenceIsLowerBound': plan['cadenceIsLowerBound'],
+            'algorithmCallSteps': plan['steps'],
+            'unitPhaseKnownAtCall': {
+                str(index): call
+                for index, call in plan['phaseKnownAtCall'].items()
+            },
+            'unitCyclePhases': plan['unitCyclePhases'],
+            'unitCycleBoundaryDates': plan['unitCycleBoundaryDates'],
+            'unitBoundaryNotRequired': plan['unitBoundaryNotRequired'],
+            'unitFutureAvailabilityAlignment': (
+                plan['unitFutureAvailabilityAlignment']),
+            'unitEndpointEqualityAtCall': plan['unitEndpointEqualityAtCall'],
+            'unitLowerBoundInferenceAtCall': (
+                plan['unitLowerBoundInferenceAtCall']),
+            'unitWindowAdjustedAtCall': plan['unitWindowAdjustedAtCall'],
+            'unitPlannedPricingWindows': plan['unitPlannedPricingWindows'],
+        }
+
+    plan_modes = ('unknown',) if unknown_only else (
+        'known', 'trusted', 'unknown')
+    retrieval_plans = {
+        mode: finalized_plan(mode) for mode in plan_modes
+    }
+    unknown_plan = retrieval_plans['unknown']
+    # Full validation consumes only Unknown-mode fields. Preserve the normal
+    # response shape without calculating two plans that the job discards;
+    # opening a saved result rebuilds all three modes on demand.
+    known_plan = retrieval_plans.get('known', unknown_plan)
+    trusted_plan = retrieval_plans.get('trusted', unknown_plan)
     _dynamic_pricing_visualizer_metadata(
-        units, cadence_days, cycle_alignment, cycle_phases, bootstrap_dates)
+        units, cadence_days, cadence_is_lower_bound)
 
     # Comparable price signatures are an internal verification aid, not
     # report data. Removing them also keeps large report payloads manageable.
     for unit in units:
         unit.pop('_pricingSignatures', None)
         unit.pop('_cyclePhase', None)
+        unit.pop('_initialPricingDates', None)
     return {
         'buildingId': str(community.get('BUILDING_ID') or ''),
         'buildingName': community.get('BUILDING_NAME') or '',
         'orgId': community.get('ORG_ID'),
         'orgName': community.get('ORG_NAME') or '',
         'cadenceDays': cadence_days,
-        'cadence': ('Pricing Does Not Change'
-                    if pricing_does_not_change
-                    else (str(cadence_days) if cadence_days
-                          else 'Insufficient Data')),
+        'cadence': (
+            f'>= {cadence_days}' if cadence_is_lower_bound and cadence_days
+            else (str(cadence_days) if cadence_days else 'Insufficient Data')),
+        'cadenceIsLowerBound': cadence_is_lower_bound,
+        'cadenceLowerBoundDays': (
+            cadence_days if cadence_is_lower_bound else None),
         'pricingDoesNotChange': pricing_does_not_change,
         'cadenceConfidence': cadence_confidence,
         'cadenceEvidenceRangeCount': len(cadence_lengths),
         'cadenceEvidenceUnitCount': cadence_evidence_units,
         'cadenceEvidenceLengths': sorted(set(cadence_lengths)),
         'cycleAlignment': cycle_alignment,
+        'algorithmInputComplete': not inconsistent_input_units,
+        'algorithmInputIssueUnits': inconsistent_input_units,
         'predictableUnitCount': predictable_units,
         'predictionCoveragePct': round(
             100 * predictable_units / len(units), 1) if units else 0,
@@ -5183,16 +7851,43 @@ def _dynamic_pricing_analyze_payload(community, payload, latest_sync=None,
         'alreadyAvailableUnitCount': already_units,
         'alreadyAvailableStartsAtSyncCount': already_starts_at_sync,
         'unitCount': len(units),
-        'priceChangeDates': all_change_dates,
-        'newApiCalls': new_calls,
+        'priceChangeDates': known_plan['bootstrapApiCallDates'],
+        'newApiCalls': known_plan['bootstrapApiCalls'],
         'currentApiCalls': current_calls,
-        'apiCallsSaved': current_calls - bootstrap_calls,
-        'bootstrapApiCallDates': bootstrap_dates,
-        'bootstrapApiCalls': bootstrap_calls,
-        'bootstrapApiCallsSaved': current_calls - bootstrap_calls,
-        'reconstructionAccuracyPct': bootstrap_accuracy,
-        'retrievalStrategy': retrieval_strategy,
-        'cadenceKnownAtCall': 0 if cadence_days else None,
+        'knownBootstrapApiCallDates': known_plan['bootstrapApiCallDates'],
+        'knownBootstrapApiCalls': known_plan['bootstrapApiCalls'],
+        'knownApiCallsSaved': known_plan['apiCallsSaved'],
+        'knownApiCallsSavedPct': known_plan['apiCallsSavedPct'],
+        'knownReconstructionAccuracyPct': (
+            known_plan['reconstructionAccuracyPct']),
+        'knownCadenceStatus': known_plan['cadenceStatus'],
+        'trustedBootstrapApiCallDates': (
+            trusted_plan['bootstrapApiCallDates']),
+        'trustedBootstrapApiCalls': trusted_plan['bootstrapApiCalls'],
+        'trustedApiCallsSaved': trusted_plan['apiCallsSaved'],
+        'trustedApiCallsSavedPct': trusted_plan['apiCallsSavedPct'],
+        'trustedReconstructionAccuracyPct': (
+            trusted_plan['reconstructionAccuracyPct']),
+        'unknownBootstrapApiCallDates': unknown_plan['bootstrapApiCallDates'],
+        'unknownBootstrapApiCalls': unknown_plan['bootstrapApiCalls'],
+        'unknownApiCallsSaved': unknown_plan['apiCallsSaved'],
+        'unknownApiCallsSavedPct': unknown_plan['apiCallsSavedPct'],
+        'unknownReconstructionAccuracyPct': (
+            unknown_plan['reconstructionAccuracyPct']),
+        'unknownCadenceStatus': unknown_plan['cadenceStatus'],
+        'retrievalPlans': retrieval_plans,
+        # Keep the known-cadence values for saved reports and older clients.
+        'apiCallsSaved': known_plan['apiCallsSaved'],
+        'apiCallsSavedPct': known_plan['apiCallsSavedPct'],
+        'bootstrapApiCallDates': known_plan['bootstrapApiCallDates'],
+        'bootstrapApiCalls': known_plan['bootstrapApiCalls'],
+        'bootstrapApiCallsSaved': known_plan['apiCallsSaved'],
+        'reconstructionAccuracyPct': known_plan['reconstructionAccuracyPct'],
+        'retrievalStrategy': known_plan['retrievalStrategy'],
+        'cadenceMode': 'known',
+        'cadenceKnownAtCall': known_plan['cadenceKnownAtCall'],
+        'cadenceVerifiedAtCall': known_plan['cadenceVerifiedAtCall'],
+        'algorithmCallSteps': known_plan['algorithmCallSteps'],
         'latestSync': (
             latest_sync.isoformat() if hasattr(latest_sync, 'isoformat')
             else latest_sync),
@@ -5304,7 +7999,7 @@ def _dynamic_pricing_matrix_version_for_sync(key, sync_at):
     return best[1] if best else None
 
 
-def _dynamic_pricing_fetch_community(community):
+def _dynamic_pricing_fetch_community(community, unknown_only=False):
     """GET the matrix version corresponding to the latest Entrata MITS sync."""
     building_id = str(community.get('BUILDING_ID') or '')
     latest_sync = None
@@ -5319,27 +8014,9 @@ def _dynamic_pricing_fetch_community(community):
                 'excluded': True,
                 'error': None,
             }
-        key = f'building_{building_id}.json'
-        version = _dynamic_pricing_matrix_version_for_sync(key, latest_sync)
-        if version is None:
-            return {
-                'buildingId': building_id,
-                'buildingName': community.get('BUILDING_NAME') or '',
-                'excluded': True,
-                'error': None,
-            }
-        response = s3().get_object(
-            Bucket=DYNAMIC_PRICING_BUCKET,
-            Key=key,
-            VersionId=version['VersionId'])
-        raw = response['Body'].read()
-        if raw[:2] == b'\x1f\x8b':
-            raw = gzip_module.decompress(raw)
-        payload = json.loads(raw.decode('utf-8'))
-        unit_details = _dynamic_pricing_snapshot_unit_details(
-            building_id, snapshot)
-        return _dynamic_pricing_analyze_payload(
-            community, payload, latest_sync, snapshot_link, unit_details)
+        return _dynamic_pricing_fetch_community_snapshot(
+            community, snapshot, latest_sync, snapshot_link,
+            unknown_only=unknown_only)
     except ClientError as exc:
         code = str((exc.response.get('Error') or {}).get('Code') or '')
         if code in ('NoSuchKey', '404', 'NotFound'):
@@ -5399,12 +8076,183 @@ def _dynamic_pricing_fetch_community(community):
         }
 
 
+def _dynamic_pricing_fetch_community_snapshot(
+        community, snapshot, latest_sync, snapshot_link='',
+        unknown_only=False):
+    """Analyze one community using a specific successful MITS snapshot."""
+    building_id = str(community.get('BUILDING_ID') or '')
+    key = f'building_{building_id}.json'
+    version = _dynamic_pricing_matrix_version_for_sync(key, latest_sync)
+    if version is None:
+        return {
+            'buildingId': building_id,
+            'buildingName': community.get('BUILDING_NAME') or '',
+            'excluded': True,
+            'error': None,
+        }
+    response = s3().get_object(
+        Bucket=DYNAMIC_PRICING_BUCKET,
+        Key=key,
+        VersionId=version['VersionId'])
+    raw = response['Body'].read()
+    if raw[:2] == b'\x1f\x8b':
+        raw = gzip_module.decompress(raw)
+    payload = json.loads(raw.decode('utf-8'))
+    unit_details = _dynamic_pricing_snapshot_unit_details(
+        building_id, snapshot)
+    return _dynamic_pricing_analyze_payload(
+        community, payload, latest_sync, snapshot_link, unit_details,
+        unknown_only=unknown_only)
+
+
+def _dynamic_pricing_fetch_saved_validation_community(summary):
+    """Rebuild visualizer data from the exact sync recorded in validation."""
+    building_id = str(summary.get('buildingId') or '')
+    raw_sync = summary.get('latestSync')
+    if not building_id or not raw_sync:
+        raise ValueError('saved validation row has no sync reference')
+    latest_sync = datetime.fromisoformat(
+        str(raw_sync).replace('Z', '+00:00'))
+    if latest_sync.tzinfo is None:
+        latest_sync = latest_sync.replace(tzinfo=timezone.utc)
+    else:
+        latest_sync = latest_sync.astimezone(timezone.utc)
+
+    entity = f'building_{building_id}'
+    entity_prefix = f'{ROOT}Entrata/{entity}/'
+    snapshot_prefix = _snapshot_prefix_nearest(
+        entity_prefix, latest_sync, max_skew_minutes=1)
+    if not snapshot_prefix:
+        raise ValueError('the saved MITS snapshot is no longer available')
+    snapshot = snapshot_prefix[len(entity_prefix):].rstrip('/')
+    snapshot_sync = _snapshot_dt(snapshot)
+    if abs((snapshot_sync - latest_sync).total_seconds()) > 60:
+        raise ValueError('could not match the saved MITS sync exactly')
+
+    community = {
+        'BUILDING_ID': building_id,
+        'BUILDING_NAME': summary.get('buildingName') or '',
+        'ORG_ID': summary.get('orgId'),
+        'ORG_NAME': summary.get('orgName') or '',
+    }
+    snapshot_link = (
+        summary.get('snapshotLink')
+        or _snapshot_link(entity, snapshot, summary.get('orgId')))
+    row = _dynamic_pricing_fetch_community_snapshot(
+        community, snapshot, snapshot_sync, snapshot_link)
+    if row.get('excluded'):
+        raise ValueError('the saved sync has no valid multi-day pricing matrix')
+    if row.get('error'):
+        raise ValueError(row['error'])
+    try:
+        _dynamic_pricing_apply_unit_numbers([row])
+    except Exception:
+        # Snapshot unit numbers are normally already present. Falling back to
+        # source IDs should not prevent algorithm playback.
+        pass
+    return row
+
+
 def _dynamic_pricing_sorted_rows(rows):
     return sorted(rows, key=lambda row: (
         -(row.get('apiCallsSaved') or 0),
         (row.get('buildingName') or '').casefold(),
         row.get('buildingId') or '',
     ))
+
+
+def _dynamic_pricing_search_communities(
+        limit: int, org_ids=None, community_ids=None):
+    """Return the configured Entrata dynamic-pricing community population."""
+    org_ids = org_ids or []
+    community_ids = community_ids or []
+    search_predicates = []
+    query_params = []
+    if org_ids:
+        placeholders = ', '.join('%s' for _ in org_ids)
+        search_predicates.append(f'b.ORG_ID IN ({placeholders})')
+        query_params.extend(org_ids)
+    if community_ids:
+        placeholders = ', '.join('%s' for _ in community_ids)
+        search_predicates.append(f'b.ID IN ({placeholders})')
+        query_params.extend(community_ids)
+    search_filter = (
+        f"AND ({' OR '.join(search_predicates)})"
+        if search_predicates else '')
+    return snowflake_db.query(
+        _DYNAMIC_PRICING_COMMUNITIES_SQL.format(
+            search_filter=search_filter, limit=int(limit)),
+        params=query_params or None,
+        timeout=SYNC_ISSUES_QUERY_TIMEOUT)
+
+
+def _dynamic_pricing_validation_row(row):
+    """Keep the evidence needed to inspect one Unknown-mode validation."""
+    unknown_plan = ((row.get('retrievalPlans') or {}).get('unknown') or {})
+    incorrect_cell_count = len(unknown_plan.get('incorrectCells') or [])
+    return {
+        'buildingId': row.get('buildingId'),
+        'buildingName': row.get('buildingName'),
+        'orgId': row.get('orgId'),
+        'orgName': row.get('orgName'),
+        'latestSync': row.get('latestSync'),
+        'snapshotLink': row.get('snapshotLink'),
+        'cadence': row.get('cadence'),
+        'cadenceDays': row.get('cadenceDays'),
+        'cadenceIsLowerBound': bool(row.get('cadenceIsLowerBound')),
+        'unitCount': row.get('unitCount') or 0,
+        'currentApiCalls': row.get('currentApiCalls') or 0,
+        'unknownBootstrapApiCalls': row.get('unknownBootstrapApiCalls') or 0,
+        'unknownApiCallsSaved': row.get('unknownApiCallsSaved') or 0,
+        'unknownApiCallsSavedPct': row.get('unknownApiCallsSavedPct'),
+        'unknownReconstructionAccuracyPct': (
+            row.get('unknownReconstructionAccuracyPct')),
+        'matrixCells': sum(
+            unit.get('pricingDateCount') or 0
+            for unit in (row.get('units') or [])),
+        'incorrectCellCount': incorrect_cell_count,
+        'unknownCadenceStatus': row.get('unknownCadenceStatus'),
+        'unknownCadenceCandidateRejections': (
+            ((row.get('retrievalPlans') or {}).get('unknown') or {}).get(
+                'cadenceCandidateRejections') or []),
+        'unknownCadenceInvalidations': (
+            ((row.get('retrievalPlans') or {}).get('unknown') or {}).get(
+                'cadenceInvalidations') or []),
+    }
+
+
+def _dynamic_pricing_fetch_validation_community(community):
+    """Fetch and score one matrix, returning only batch-validation fields."""
+    row = _dynamic_pricing_fetch_community(community, True)
+    if row.get('excluded') or row.get('error'):
+        return {
+            'excluded': bool(row.get('excluded')),
+            'error': row.get('error'),
+        }
+    summary = _dynamic_pricing_validation_row(row)
+    plan = ((row.get('retrievalPlans') or {}).get('unknown') or {})
+    return {
+        'excluded': False,
+        'error': None,
+        'summary': summary,
+        'cadenceDays': row.get('cadenceDays'),
+        'algorithmInputComplete': row.get('algorithmInputComplete', True),
+        'hasMissingAvailability': any(
+            not unit.get('availableDate') for unit in (row.get('units') or [])),
+        'matrixCells': summary['matrixCells'],
+        'incorrectCells': plan.get('incorrectCells') or [],
+        'cadenceEvidence': plan.get('cadenceEvidence'),
+    }
+
+
+def _dynamic_pricing_write_validation_result(job_id, result):
+    """Persist a validation result atomically for later UI inspection."""
+    os.makedirs(EXPORT_DIR, exist_ok=True)
+    path = os.path.join(EXPORT_DIR, f'{job_id}.json')
+    tmp = path + '.tmp'
+    with open(tmp, 'w', encoding='utf-8') as fh:
+        json.dump(result, fh, ensure_ascii=False, indent=2)
+    os.replace(tmp, path)
 
 
 def _dynamic_pricing_apply_unit_numbers(rows):
@@ -5437,19 +8285,12 @@ def _dynamic_pricing_apply_unit_numbers(rows):
             unit['unitId'] = number_by_id.get(source_id, unit['unitId'])
 
 
-def _run_dynamic_pricing_job(job_id: str, limit: int, org_ids=None):
+def _run_dynamic_pricing_job(
+        job_id: str, limit: int, org_ids=None, community_ids=None):
     try:
         _job_update(job_id, note='Finding Entrata communities in Snowflake…')
-        org_ids = org_ids or []
-        org_filter = ''
-        if org_ids:
-            placeholders = ', '.join('%s' for _ in org_ids)
-            org_filter = f'AND b.ORG_ID IN ({placeholders})'
-        communities = snowflake_db.query(
-            _DYNAMIC_PRICING_COMMUNITIES_SQL.format(
-                org_filter=org_filter, limit=int(limit)),
-            params=org_ids or None,
-            timeout=SYNC_ISSUES_QUERY_TIMEOUT)
+        communities = _dynamic_pricing_search_communities(
+            limit, org_ids, community_ids)
         total = len(communities)
         _job_update(job_id, total=total,
                     note=(f'Matching the latest successful MITS sync to a pricing '
@@ -5504,6 +8345,225 @@ def _run_dynamic_pricing_job(job_id: str, limit: int, org_ids=None):
                         'errors': errors,
                         'unitNumberError': unit_number_error,
                     }, note=f'{total} communities analyzed')
+    except Exception as exc:
+        _job_update(job_id, status='error', error=str(exc),
+                    finished=time.time())
+
+
+def _run_dynamic_pricing_validation_job(
+        job_id: str, limit: int, org_ids=None, community_ids=None):
+    """Test Unknown mode causally across the complete selected population."""
+    started = time.time()
+    try:
+        _job_update(
+            job_id,
+            note='Finding Entrata dynamic-pricing communities in Snowflake…')
+        candidates = _dynamic_pricing_search_communities(
+            limit + 1, org_ids, community_ids)
+        population_truncated = len(candidates) > limit
+        communities = candidates[:limit]
+        total = len(communities)
+        _job_update(
+            job_id, total=total,
+            note=(f'Validating Unknown mode against {total} latest-sync '
+                  'pricing matrices, including cadence = 1…'))
+
+        rows = []
+        completed = excluded = errors = cadence_one_tested = no_cadence = 0
+        missing_availability = 0
+        counterexample = None
+        counterexamples = []
+        matrices_passed = matrices_failed = 0
+        cells_tested = incorrect_cells = 0
+
+        def result_payload(partial):
+            cadence_corrections = [
+                {
+                    'buildingId': row.get('buildingId'),
+                    'buildingName': row.get('buildingName'),
+                    'orgId': row.get('orgId'),
+                    'orgName': row.get('orgName'),
+                    'candidateRejections': row.get(
+                        'unknownCadenceCandidateRejections') or [],
+                    'invalidations': row.get(
+                        'unknownCadenceInvalidations') or [],
+                }
+                for row in rows
+                if (row.get('unknownCadenceCandidateRejections')
+                    or row.get('unknownCadenceInvalidations'))
+            ]
+            if partial:
+                validation_status = 'running'
+                confidence = 'Validation is still running.'
+            elif counterexample is not None:
+                validation_status = 'failed'
+                confidence = (
+                    f'{matrices_failed:,} counterexample'
+                    f'{"s" if matrices_failed != 1 else ""} found across '
+                    f'all {len(rows):,} tested matrices. Unknown mode did not '
+                    'reconstruct every complete matrix at 100% accuracy.')
+            elif errors:
+                validation_status = 'incomplete'
+                confidence = (
+                    f'No counterexample found in {len(rows):,} tested '
+                    f'matrices, but {errors:,} retrieval error'
+                    f'{"s" if errors != 1 else ""} prevented full confidence.')
+            elif population_truncated:
+                validation_status = 'sample-passed'
+                confidence = (
+                    f'No counterexample found in the configured sample of '
+                    f'{len(rows):,} matrices with an available cadence.')
+            else:
+                validation_status = 'passed'
+                confidence = (
+                    f'No counterexample found across all {len(rows):,} '
+                    'input-complete matrices with an available cadence in the selected '
+                    'latest-sync population. Matrices missing required unit '
+                    'availability metadata are reported separately.')
+            return {
+                'kind': 'dynamic_pricing_validation',
+                'partial': partial,
+                'validationStatus': validation_status,
+                'confidence': confidence,
+                'communitiesConsidered': total,
+                'communitiesCompleted': completed,
+                'matricesTested': len(rows),
+                'matricesPassed': matrices_passed,
+                'matricesFailed': matrices_failed,
+                'cellsTested': cells_tested,
+                'incorrectCells': incorrect_cells,
+                'overallReconstructionAccuracyPct': round(
+                    100 * (cells_tested - incorrect_cells) / cells_tested, 6)
+                    if cells_tested else 0.0,
+                'cadenceOneSkipped': 0,
+                'cadenceOneTested': cadence_one_tested,
+                'cadenceUnavailableSkipped': no_cadence,
+                'missingAvailabilitySkipped': missing_availability,
+                'excluded': excluded,
+                'errors': errors,
+                'populationTruncated': population_truncated,
+                'stoppedOnCounterexample': False,
+                'counterexample': counterexample,
+                'counterexamples': counterexamples,
+                'cadenceCorrections': cadence_corrections,
+                'rows': sorted(rows, key=lambda item: (
+                    item.get('orgName') or '',
+                    item.get('buildingName') or '',
+                    item.get('buildingId') or '')),
+                'startedAt': datetime.fromtimestamp(
+                    started, timezone.utc).isoformat(),
+                'finishedAt': (None if partial else datetime.now(
+                    timezone.utc).isoformat()),
+                'durationSeconds': round(time.time() - started, 1),
+            }
+
+        max_workers = min(
+            DYNAMIC_PRICING_VALIDATION_WORKERS, max(total, 1))
+        pool = ProcessPoolExecutor(max_workers=max_workers)
+        pending = {}
+        iterator = iter(communities)
+
+        def submit_next():
+            try:
+                community = next(iterator)
+            except StopIteration:
+                return False
+            pending[pool.submit(
+                _dynamic_pricing_fetch_validation_community,
+                community)] = community
+            return True
+
+        for _ in range(max_workers):
+            if not submit_next():
+                break
+
+        while pending:
+            finished, _waiting = wait(
+                tuple(pending), return_when=FIRST_COMPLETED)
+            for future in finished:
+                community = pending.pop(future, None)
+                completed += 1
+                try:
+                    result = future.result()
+                except Exception:
+                    errors += 1
+                    submit_next()
+                    continue
+                row = result.get('summary') or {}
+                if result.get('excluded'):
+                    excluded += 1
+                elif result.get('error'):
+                    errors += 1
+                else:
+                    cadence = result.get('cadenceDays')
+                    if not isinstance(cadence, (int, float)):
+                        no_cadence += 1
+                    elif (not result.get('algorithmInputComplete', True)
+                          or result.get('hasMissingAvailability')):
+                        # Availability date is an explicit algorithm input. A
+                        # matrix with missing metadata, or pricing that begins
+                        # entirely after the availability-derived hold window,
+                        # cannot be reconstructed causally from the permitted
+                        # inputs. Report it separately from algorithm accuracy.
+                        missing_availability += 1
+                    else:
+                        if cadence == 1:
+                            cadence_one_tested += 1
+                        rows.append(row)
+                        accuracy = row.get('unknownReconstructionAccuracyPct')
+                        matrix_cells = result.get('matrixCells') or 0
+                        matrix_incorrect = len(
+                            result.get('incorrectCells') or [])
+                        cells_tested += matrix_cells
+                        incorrect_cells += matrix_incorrect
+                        if accuracy != 100:
+                            matrices_failed += 1
+                            if counterexample is None:
+                                counterexample = dict(row)
+                                counterexample['incorrectCells'] = (
+                                    result.get('incorrectCells') or [])
+                                counterexample['cadenceEvidence'] = (
+                                    result.get('cadenceEvidence'))
+                            counterexamples.append({
+                                'buildingId': row.get('buildingId'),
+                                'buildingName': row.get('buildingName'),
+                                'orgId': row.get('orgId'),
+                                'orgName': row.get('orgName'),
+                                'cadence': row.get('cadence'),
+                                'cadenceDays': row.get('cadenceDays'),
+                                'reconstructionAccuracyPct': accuracy,
+                                'incorrectCells': matrix_incorrect,
+                            })
+                        else:
+                            matrices_passed += 1
+                submit_next()
+
+            partial = result_payload(True)
+            _job_update(
+                job_id, done=completed, result=partial,
+                note=(f'{completed}/{total} communities checked · '
+                      f'{len(rows)} matrices tested'))
+
+        pool.shutdown(wait=True, cancel_futures=True)
+
+        final = result_payload(False)
+        _dynamic_pricing_write_validation_result(job_id, final)
+        _history_record(
+            job_id, 'dynamic_pricing_validation', final, {
+                'validationStatus': final['validationStatus'],
+                'communitiesConsidered': total,
+                'matricesTested': final['matricesTested'],
+                'cadenceOneSkipped': 0,
+                'cadenceOneTested': cadence_one_tested,
+                'missingAvailabilitySkipped': missing_availability,
+                'errors': errors,
+                'populationTruncated': population_truncated,
+            })
+        _job_update(
+            job_id, status='done', done=completed, finished=time.time(),
+            result=final,
+            note=(f'{final["matricesTested"]} matrices tested · '
+                  f'{final["validationStatus"].replace("-", " ")}'))
     except Exception as exc:
         _job_update(job_id, status='error', error=str(exc),
                     finished=time.time())
@@ -6693,13 +9753,14 @@ def delete_history(job_id):
         if not any(item.get('id') == job_id for item in entries):
             return jsonify({'error': 'history entry not found'}), 404
         _history_write([item for item in entries if item.get('id') != job_id])
-    path = os.path.join(EXPORT_DIR, f'{job_id}.csv')
-    try:
-        os.remove(path)
-    except FileNotFoundError:
-        pass
-    except OSError as exc:
-        return jsonify({'error': f'could not delete export: {exc}'}), 500
+    for extension in ('.csv', '.json'):
+        path = os.path.join(EXPORT_DIR, f'{job_id}{extension}')
+        try:
+            os.remove(path)
+        except FileNotFoundError:
+            pass
+        except OSError as exc:
+            return jsonify({'error': f'could not delete export: {exc}'}), 500
     return jsonify({'ok': True})
 
 
@@ -6839,13 +9900,133 @@ def dynamic_pricing_analyze():
             seen_org_ids.add(org_id)
             org_ids.append(org_id)
 
+    raw_community_ids = body.get('communityIds', [])
+    if raw_community_ids in (None, ''):
+        raw_community_ids = []
+    if (not isinstance(raw_community_ids, list)
+            or len(raw_community_ids) > 5000):
+        return jsonify({
+            'error': ('communityIds must be a list of at most 5,000 '
+                      'community IDs')
+        }), 400
+    community_ids = []
+    seen_community_ids = set()
+    for value in raw_community_ids:
+        text = str(value).strip()
+        if not re.fullmatch(r'\d+', text) or int(text) <= 0:
+            return jsonify({
+                'error': ('communityIds must contain only positive integer '
+                          'community IDs')
+            }), 400
+        community_id = int(text)
+        if community_id not in seen_community_ids:
+            seen_community_ids.add(community_id)
+            community_ids.append(community_id)
+
     job_id = _job_new('dynamic_pricing', '', total=0)
     threading.Thread(
         target=_run_dynamic_pricing_job,
-        args=(job_id, limit, org_ids),
+        args=(job_id, limit, org_ids, community_ids),
         daemon=True,
     ).start()
     return jsonify({'jobId': job_id})
+
+
+@app.route('/api/dynamic-pricing/validate-unknown', methods=['POST'])
+def dynamic_pricing_validate_unknown():
+    """Validate Unknown mode across all latest-sync matrices with cadence."""
+    body = request.get_json(silent=True) or {}
+    try:
+        limit = int(body.get('limit', DYNAMIC_PRICING_MAX_COMMUNITIES))
+    except (TypeError, ValueError):
+        return jsonify({'error': 'limit must be an integer'}), 400
+    if not (1 <= limit <= DYNAMIC_PRICING_MAX_COMMUNITIES):
+        return jsonify({
+            'error': ('limit must be between 1 and '
+                      f'{DYNAMIC_PRICING_MAX_COMMUNITIES}')
+        }), 400
+
+    def positive_ids(key, label):
+        raw = body.get(key, [])
+        if raw in (None, ''):
+            raw = []
+        if not isinstance(raw, list) or len(raw) > 5000:
+            raise ValueError(
+                f'{key} must be a list of at most 5,000 {label} IDs')
+        values = []
+        seen = set()
+        for value in raw:
+            text = str(value).strip()
+            if not re.fullmatch(r'\d+', text) or int(text) <= 0:
+                raise ValueError(
+                    f'{key} must contain only positive integer {label} IDs')
+            parsed = int(text)
+            if parsed not in seen:
+                seen.add(parsed)
+                values.append(parsed)
+        return values
+
+    try:
+        org_ids = positive_ids('orgIds', 'organization')
+        community_ids = positive_ids('communityIds', 'community')
+    except ValueError as exc:
+        return jsonify({'error': str(exc)}), 400
+
+    job_id = _job_new('dynamic_pricing_validation', '', total=0)
+    threading.Thread(
+        target=_run_dynamic_pricing_validation_job,
+        args=(job_id, limit, org_ids, community_ids),
+        daemon=True,
+    ).start()
+    return jsonify({'jobId': job_id})
+
+
+@app.route('/api/dynamic-pricing/validation/<job_id>')
+def dynamic_pricing_validation_result(job_id):
+    """Open one persisted Unknown-mode validation result."""
+    if not re.fullmatch(r'[0-9a-f]{6,32}', job_id or ''):
+        return jsonify({'error': 'invalid job id'}), 400
+    path = os.path.join(EXPORT_DIR, f'{job_id}.json')
+    try:
+        with open(path, 'r', encoding='utf-8') as fh:
+            result = json.load(fh)
+    except FileNotFoundError:
+        return jsonify({'error': 'validation result not found'}), 404
+    except (OSError, ValueError, TypeError) as exc:
+        return jsonify({'error': f'could not read validation result: {exc}'}), 500
+    return jsonify(result)
+
+
+@app.route('/api/dynamic-pricing/validation/<job_id>/community/<building_id>')
+def dynamic_pricing_validation_community(job_id, building_id):
+    """Load step-through data for one row in a saved validation result."""
+    if not re.fullmatch(r'[0-9a-f]{6,32}', job_id or ''):
+        return jsonify({'error': 'invalid job id'}), 400
+    if not re.fullmatch(r'\d+', building_id or ''):
+        return jsonify({'error': 'invalid building id'}), 400
+    path = os.path.join(EXPORT_DIR, f'{job_id}.json')
+    try:
+        with open(path, 'r', encoding='utf-8') as fh:
+            result = json.load(fh)
+    except FileNotFoundError:
+        return jsonify({'error': 'validation result not found'}), 404
+    except (OSError, ValueError, TypeError) as exc:
+        return jsonify({'error': f'could not read validation result: {exc}'}), 500
+
+    summary = next((
+        row for row in (result.get('rows') or [])
+        if str(row.get('buildingId') or '') == building_id
+    ), None)
+    if summary is None:
+        return jsonify({'error': 'community is not part of this validation'}), 404
+    try:
+        return jsonify(_dynamic_pricing_fetch_saved_validation_community(
+            summary))
+    except (ClientError, ValueError, TypeError, UnicodeError,
+            gzip_module.BadGzipFile) as exc:
+        return jsonify({'error': str(exc)}), 422
+    except Exception as exc:
+        return jsonify({'error': f'could not load community: {exc}'}), 500
 
 
 @app.route('/api/search/csv/<job_id>')

@@ -286,15 +286,19 @@
     /* ── Dynamic Pricing Cadence ────────────────────────────────────────── */
     #pane-dynamic-pricing { overflow-y: auto; padding: 12px 0; gap: 0; }
     #dp-form { padding: 0 12px; display: flex; flex-direction: column; gap: 10px; }
-    #dp-run-actions { display: flex; gap: 8px; padding-top: 4px; }
-    #btn-run-dynamic-pricing {
+    #dp-run-actions { display: flex; flex-direction: column; gap: 7px; padding-top: 4px; }
+    #btn-run-dynamic-pricing, #btn-validate-dynamic-pricing {
       flex: 1; background: #238636; border: 1px solid #2ea043; color: #fff;
       padding: 7px 0; border-radius: 6px; cursor: pointer;
       font-size: 12.5px; font-weight: 600; font-family: inherit;
       transition: background .1s;
     }
     #btn-run-dynamic-pricing:hover:not([disabled]) { background: #2ea043; }
-    #btn-run-dynamic-pricing[disabled] { opacity: .4; cursor: not-allowed; }
+    #btn-validate-dynamic-pricing { background: #1f6feb; border-color: #388bfd; }
+    #btn-validate-dynamic-pricing:hover:not([disabled]) { background: #388bfd; }
+    #btn-run-dynamic-pricing[disabled], #btn-validate-dynamic-pricing[disabled] {
+      opacity: .4; cursor: not-allowed;
+    }
     #dp-status {
       padding: 8px 12px; font-size: 11px; color: #8b949e;
       border-top: 1px solid #21262d; margin-top: 10px;
@@ -329,9 +333,69 @@
     .dp-summary-actions button.dp-export { background: #238636; border-color: #2ea043; color: #fff; }
     .dp-summary-actions button.dp-export:hover:not(:disabled) { background: #2ea043; }
     .dp-summary-actions button:disabled { opacity: .4; cursor: not-allowed; }
-    .dp-method-note {
-      margin: -4px 0 12px; padding: 8px 10px; border-left: 3px solid #388bfd;
-      background: #161b22; color: #8b949e; font-size: 11px; line-height: 1.45;
+    .dp-algorithm-actions {
+      display: flex; align-items: center; gap: 7px; flex-wrap: wrap;
+      margin: -4px 0 12px; color: #8b949e; font-size: 11px;
+    }
+    .dp-algorithm-actions button {
+      padding: 5px 10px; border: 1px solid #388bfd66; border-radius: 5px;
+      background: #388bfd18; color: #79c0ff; cursor: pointer;
+      font-family: inherit; font-size: 11px; font-weight: 600;
+    }
+    .dp-algorithm-actions button:hover { background: #388bfd33; color: #a5d6ff; }
+    .dp-validation-summary {
+      display: flex; gap: 8px; flex-wrap: wrap; margin-bottom: 10px;
+      color: #8b949e; font-size: 11px;
+    }
+    .dp-validation-summary span {
+      padding: 4px 8px; border: 1px solid #30363d; border-radius: 12px;
+      background: #161b22;
+    }
+    .dp-validation-summary .dp-validation-rollup {
+      flex-basis: 100%; padding: 9px 12px; border-radius: 6px;
+      border-color: #238636; background: #2386361f; color: #c9d1d9;
+      font-size: 13px;
+    }
+    .dp-validation-summary .dp-validation-rollup strong { color: #3fb950; }
+    .dp-validation-summary .dp-validation-status { color: #c9d1d9; font-weight: 600; }
+    .dp-validation-summary .dp-validation-status.pass { color: #3fb950; border-color: #2ea04366; }
+    .dp-validation-summary .dp-validation-status.fail,
+    .dp-validation-fail { color: #f85149 !important; border-color: #f8514966 !important; }
+    .dp-validation-confidence {
+      margin: 0 0 12px; color: #c9d1d9; font-size: 12px; line-height: 1.5;
+    }
+    .dp-validation-warning {
+      margin: -4px 0 12px; color: #d29922; font-size: 11px; line-height: 1.45;
+    }
+    .dp-validation-pass { color: #3fb950 !important; font-weight: 700; }
+    .dp-validation-fail { font-weight: 700; }
+    .dp-validation-table td { white-space: nowrap; }
+    #dp-algorithm-dialog {
+      width: min(920px, calc(100vw - 32px)); max-height: calc(100vh - 32px);
+      padding: 0; border: 1px solid #30363d; border-radius: 8px;
+      background: #161b22; color: #e6edf3; box-shadow: 0 12px 40px #0008;
+    }
+    #dp-algorithm-dialog::backdrop { background: #0009; }
+    .dp-algorithm-dialog-card {
+      display: flex; flex-direction: column; max-height: calc(100vh - 34px);
+    }
+    .dp-algorithm-dialog-header {
+      display: flex; align-items: flex-start; justify-content: space-between;
+      gap: 16px; padding: 16px 18px 12px; border-bottom: 1px solid #30363d;
+    }
+    .dp-algorithm-dialog-header h2 { margin: 0 0 4px; font-size: 16px; }
+    .dp-algorithm-dialog-header p { margin: 0; color: #8b949e; font-size: 11.5px; }
+    #dp-algorithm-close {
+      padding: 6px 10px; border: 1px solid #30363d; border-radius: 5px;
+      background: #21262d; color: #c9d1d9; cursor: pointer;
+      font-family: inherit; font-size: 11px; font-weight: 600;
+    }
+    #dp-algorithm-close:hover { background: #30363d; color: #fff; }
+    .dp-algorithm-dialog-body { overflow: auto; padding: 16px 18px 20px; }
+    #dp-algorithm-code {
+      display: block; margin: 0; white-space: pre-wrap; overflow-wrap: anywhere;
+      color: #c9d1d9; font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
+      font-size: 11.5px; line-height: 1.55;
     }
     .dp-table-wrap { overflow-x: auto; }
     .dp-table {
@@ -387,7 +451,15 @@
     .dp-unit-table { margin: 0; }
     .dp-cadence-common { color: #58a6ff; font-weight: 700; }
     .dp-cadence-varies { color: #d29922; font-weight: 600; }
-    .dp-algorithm-viz { min-width: 0; }
+    .dp-algorithm-viz { width: 100%; min-width: 0; }
+    .dp-algorithm-viz.fullscreen {
+      position: fixed; inset: 0; z-index: 1000; box-sizing: border-box;
+      display: flex; flex-direction: column; padding: 12px;
+      background: #0d1117;
+    }
+    .dp-algorithm-viz.fullscreen .dp-viz-grid-wrap {
+      flex: 1; min-height: 0; max-height: none;
+    }
     .dp-viz-toolbar {
       display: flex; align-items: center; gap: 6px; flex-wrap: wrap;
       margin-bottom: 8px;
@@ -399,8 +471,17 @@
     }
     .dp-viz-toolbar button:hover:not(:disabled) { background: #30363d; color: #fff; }
     .dp-viz-toolbar button:disabled { opacity: .35; cursor: default; }
+    .dp-viz-mode {
+      display: inline-flex; align-items: center; gap: 5px; margin-right: 4px;
+      color: #8b949e; font-size: 10.5px;
+    }
+    .dp-viz-mode select {
+      padding: 5px 24px 5px 7px; border: 1px solid #30363d; border-radius: 5px;
+      background: #161b22; color: #c9d1d9; font: inherit;
+    }
     .dp-viz-slider { flex: 1; min-width: 140px; max-width: 420px; accent-color: #238636; }
     .dp-viz-step-label { margin-left: 4px; color: #e6edf3; font-size: 11px; }
+    .dp-viz-key-hint { color: #6e7681; font-size: 9.5px; }
     .dp-viz-status {
       display: flex; flex-wrap: wrap; gap: 8px; margin-bottom: 7px;
       color: #8b949e; font-size: 10.5px;
@@ -417,54 +498,84 @@
     .dp-viz-legend span { display: inline-flex; align-items: center; gap: 5px; }
     .dp-viz-legend i { width: 13px; height: 13px; border: 1px solid #30363d; }
     .dp-viz-legend i.direct { background: #238636; }
-    .dp-viz-legend i.inferred { background: #174d34; }
+    .dp-viz-legend i.inferred { background: #1f6042; }
+    .dp-algorithm-viz.color-mode .dp-viz-legend i.direct {
+      background: linear-gradient(90deg,
+        hsl(var(--dp-price-start-hue, 125) 68% 45%),
+        hsl(var(--dp-price-end-hue, 350) 68% 45%));
+    }
+    .dp-algorithm-viz.color-mode .dp-viz-legend i.inferred {
+      background: linear-gradient(90deg,
+        hsl(var(--dp-price-start-hue, 125) 56% 35%),
+        hsl(var(--dp-price-end-hue, 350) 56% 35%));
+    }
     .dp-viz-legend i.unknown { background: #161b22; }
-    .dp-viz-legend i.price-change { background: #1d2430; border-left: 3px solid #a371f7; }
+    .dp-viz-legend i.observed-change { background: #1d2430; border-left: 3px solid #a371f7; }
     .dp-viz-legend i.boundary-window {
       background: repeating-linear-gradient(135deg, #161b22, #161b22 3px, #9e6a03 3px, #9e6a03 4px);
     }
     .dp-viz-legend i.boundary { background: #161b22; border-left: 3px solid #d29922; }
     .dp-viz-grid-wrap {
-      max-height: 62vh; overflow: auto; border: 1px solid #30363d;
+      max-height: 62vh; overflow: hidden; border: 1px solid #30363d;
       background: #0d1117;
     }
-    .dp-viz-grid { border-collapse: separate; border-spacing: 0; font-size: 9px; }
+    .dp-viz-grid {
+      width: 100%; table-layout: fixed; border-collapse: separate;
+      border-spacing: 0; font-size: 9px;
+    }
+    .dp-viz-grid col.dp-viz-unit-col { width: var(--dp-viz-unit-width, 190px); }
     .dp-viz-grid th, .dp-viz-grid td {
-      height: 25px; min-width: 34px; padding: 0; border: 0;
+      box-sizing: border-box; height: var(--dp-viz-row-height, 25px);
+      min-width: 0; padding: 0; border: 0; overflow: hidden;
       border-right: 1px solid #21262d; border-bottom: 1px solid #21262d;
     }
     .dp-viz-grid thead th {
-      position: sticky; top: 0; z-index: 3; height: 42px; padding: 3px;
+      position: sticky; top: 0; z-index: 3; height: 46px; padding: 2px 0;
       background: #161b22; color: #8b949e; text-align: center;
       vertical-align: bottom; white-space: nowrap;
     }
+    .dp-viz-date span {
+      display: inline-block; writing-mode: vertical-rl; transform: rotate(180deg);
+      font-size: var(--dp-viz-date-font, 8px); line-height: 1;
+    }
     .dp-viz-grid .dp-viz-corner {
-      left: 0; z-index: 5; min-width: 190px; padding: 6px 8px;
+      left: 0; z-index: 5; min-width: 0; padding: 4px 6px;
       text-align: left; vertical-align: middle;
     }
     .dp-viz-unit {
-      position: sticky; left: 0; z-index: 2; width: 190px; min-width: 190px !important;
-      padding: 4px 8px !important; background: #161b22; text-align: left;
+      position: sticky; left: 0; z-index: 2; min-width: 0 !important;
+      padding: 1px 5px !important; background: #161b22; text-align: left;
       font-weight: 400; white-space: nowrap;
     }
-    .dp-viz-unit strong { display: block; color: #e6edf3; font-size: 10px; }
-    .dp-viz-unit span { display: block; color: #6e7681; font-size: 9px; margin-top: 1px; }
+    .dp-viz-unit strong {
+      display: block; overflow: hidden; color: #e6edf3; font-size: 9px;
+      line-height: 1.1; text-overflow: ellipsis;
+    }
+    .dp-viz-unit span {
+      display: block; overflow: hidden; color: #6e7681; font-size: 8px;
+      line-height: 1.1; text-overflow: ellipsis;
+    }
+    .dp-viz-dense .dp-viz-unit span { display: none; }
+    .dp-viz-dense .dp-viz-unit strong { font-size: 7px; line-height: 1; }
     .dp-viz-unit .phase-known { color: #3fb950; }
     .dp-viz-unit .phase-pending { color: #d29922; }
-    .dp-viz-cell.unknown.price-band-even { background-color: #151a21; }
-    .dp-viz-cell.unknown.price-band-odd { background-color: #1b222b; }
-    .dp-viz-cell.direct.price-band-even { background-color: #238636; }
-    .dp-viz-cell.direct.price-band-odd { background-color: #2ea043; }
-    .dp-viz-cell.inferred.price-band-even { background-color: #174d34; }
-    .dp-viz-cell.inferred.price-band-odd { background-color: #1f6042; }
-    .dp-viz-cell.price-change { border-left: 2px solid #a371f7; }
+    .dp-viz-cell.unknown { background-color: #161b22; }
+    .dp-viz-cell.direct { background-color: #238636; }
+    .dp-viz-cell.inferred { background-color: #1f6042; }
+    .dp-algorithm-viz.color-mode .dp-viz-cell.direct.price-signature {
+      background-color: hsl(var(--dp-price-hue, 125) 68% 45%);
+    }
+    .dp-algorithm-viz.color-mode .dp-viz-cell.inferred.price-signature {
+      background-color: hsl(var(--dp-price-hue, 125) 56% 35%);
+    }
+    .dp-viz-cell.observed-change { border-left: 2px solid #a371f7; }
     .dp-viz-cell.boundary-window {
       background-image: repeating-linear-gradient(135deg, transparent, transparent 5px, rgba(210,153,34,.28) 5px, rgba(210,153,34,.28) 7px);
     }
     .dp-viz-cell.outside {
       background: repeating-linear-gradient(135deg, #0d1117, #0d1117 4px, #111820 4px, #111820 5px);
     }
-    .dp-viz-cell.cycle-start { border-left: 3px solid #d29922; }
+    .dp-viz-cell.cycle-start { box-shadow: inset 3px 0 #d29922; }
     .dp-viz-grid .current-call { outline: 2px solid #58a6ff; outline-offset: -2px; }
     .dp-viz-grid thead .called-date { color: #3fb950; }
 
@@ -1139,7 +1250,7 @@ AWS_SESSION_TOKEN=IQoJb3...</pre>
         <option value="search">Search</option>
         <option value="availability">Availability Agent</option>
         <option value="sync-issues">Sync Issues</option>
-        <option value="dynamic-pricing">Pricing Cadence</option>
+        <option value="dynamic-pricing">Entrata Sparse Dynamic Pricing</option>
       </select>
     </div>
 
@@ -1256,15 +1367,31 @@ AWS_SESSION_TOKEN=IQoJb3...</pre>
           <span class="field-hint">Enter a comma-, space-, or line-separated list. Blank searches every organization.</span>
         </div>
         <div class="field">
+          <label for="dp-community-ids">Community IDs <span class="field-optional">(optional)</span></label>
+          <textarea id="dp-community-ids" rows="3" placeholder="e.g. 4803, 497936, 695607" autocomplete="off"></textarea>
+          <span class="field-hint">Enter a comma-, space-, or line-separated list. When both filters are supplied, results matching either list are included.</span>
+        </div>
+        <div class="field">
           <label for="dp-limit">Maximum communities</label>
           <input type="number" id="dp-limit" min="1" max="5000" step="1" value="25" autocomplete="off" />
           <span class="field-hint">Use a small limit for testing; increase up to 5,000 for the full report.</span>
         </div>
         <div id="dp-run-actions">
-          <button id="btn-run-dynamic-pricing">Analyze Pricing Cadence</button>
+          <button id="btn-run-dynamic-pricing">Analyze Sparse Dynamic Pricing</button>
+          <button id="btn-validate-dynamic-pricing">Validate Unknown Mode</button>
         </div>
       </div>
       <div id="dp-status"></div>
+      <div class="saved-results" id="saved-dynamic-pricing-validation">
+        <div class="saved-header">
+          <button type="button" class="saved-toggle" data-history-kind="dynamic_pricing_validation" aria-expanded="false">
+            <span>Saved validation results</span>
+            <span class="saved-count" data-history-count="dynamic_pricing_validation">(0)</span>
+          </button>
+          <button type="button" class="saved-refresh" data-history-refresh="dynamic_pricing_validation" title="Refresh saved results">↻</button>
+        </div>
+        <div class="saved-list" id="history-dynamic-pricing-validation-list"></div>
+      </div>
     </div>
 
     <!-- Search mode -->
@@ -1446,18 +1573,33 @@ AWS_SESSION_TOKEN=IQoJb3...</pre>
     <!-- Dynamic Pricing Cadence report (shown when mode = dynamic-pricing) -->
     <div id="dp-preview" style="display:none">
       <div id="dp-preview-header">
-        <span id="dp-preview-title">Dynamic Pricing Cadence</span>
+        <span id="dp-preview-title">Entrata Sparse Dynamic Pricing</span>
         <span id="dp-preview-status"></span>
       </div>
       <div id="dp-preview-body">
         <div class="pane-msg" style="flex-direction:column;gap:6px;">
           <span style="font-size:24px;opacity:.3">📈</span>
-          <span>Choose a community limit and run the pricing cadence report</span>
+          <span>Choose a community limit and run the sparse dynamic pricing report</span>
         </div>
       </div>
     </div>
   </div>
 </div>
+
+<dialog id="dp-algorithm-dialog" aria-labelledby="dp-algorithm-title" aria-describedby="dp-algorithm-description">
+  <div class="dp-algorithm-dialog-card">
+    <div class="dp-algorithm-dialog-header">
+      <div>
+        <h2 id="dp-algorithm-title"></h2>
+        <p id="dp-algorithm-description">Response-only pseudocode used by the dynamic pricing simulator.</p>
+      </div>
+      <button type="button" id="dp-algorithm-close">Close</button>
+    </div>
+    <div class="dp-algorithm-dialog-body">
+      <pre><code id="dp-algorithm-code"></code></pre>
+    </div>
+  </div>
+</dialog>
 
 <div id="snowflake-credentials" role="dialog" aria-modal="true" aria-labelledby="snowflake-credentials-title">
   <div id="snowflake-credentials-card">
