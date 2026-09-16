@@ -270,7 +270,7 @@ def _assert_read_only(sql: str):
         raise ValueError('Only read-only statements are permitted')
 
 
-def query(sql: str, params=None, limit=None):
+def query(sql: str, params=None, limit=None, timeout=None):
     """
     Run a read-only query and return a list of dicts.
     `params` must be a sequence/dict of bind values — never interpolate
@@ -280,7 +280,7 @@ def query(sql: str, params=None, limit=None):
     conn = connect()
     cur = conn.cursor(DictCursor)
     try:
-        cur.execute(sql, params or None, timeout=QUERY_TIMEOUT)
+        cur.execute(sql, params or None, timeout=timeout or QUERY_TIMEOUT)
         rows = cur.fetchmany(limit) if limit else cur.fetchall()
         return [dict(r) for r in rows]
     finally:
@@ -469,6 +469,40 @@ def building_ids_for_org(org_value):
         [str(org_value)],
     )
     return {f'building_{r["ID"]}' for r in rows if r['ID'] is not None}
+
+
+_leasing_launch_cache = {'ids': None, 'ts': 0}
+_LEASING_LAUNCH_TTL = 5 * 60
+
+
+def launched_on_leasing_building_ids():
+    """Entity ids ('building_NNN') for buildings launched on the Leasing
+    product: launched_date set and in the past, and not cancelled.
+
+    Batches the same per-building check the Availability Agent's "Include
+    community not launched on Leasing" toggle is built around, across every
+    building at once instead of one row at a time:
+
+        SELECT 1 FROM building_product
+        WHERE building_id = %(building_id)s AND product = 'Leasing'
+          AND launched_date IS NOT NULL AND launched_date < now()
+          AND cancellation_date IS NULL
+    """
+    cached = _leasing_launch_cache['ids']
+    if cached is not None and (time.time() - _leasing_launch_cache['ts']) < _LEASING_LAUNCH_TTL:
+        return set(cached)
+    rows = query(
+        f'SELECT DISTINCT building_product.BUILDING_ID AS BUILDING_ID '
+        f'FROM {APPLICATIONS_PRODUCT_TABLE} building_product '
+        f"WHERE building_product.PRODUCT = 'Leasing' "
+        f'AND building_product.LAUNCHED_DATE IS NOT NULL '
+        f'AND building_product.LAUNCHED_DATE < CURRENT_TIMESTAMP() '
+        f'AND building_product.CANCELLATION_DATE IS NULL'
+    )
+    ids = {f'building_{r["BUILDING_ID"]}' for r in rows if r.get('BUILDING_ID') is not None}
+    _leasing_launch_cache['ids'] = set(ids)
+    _leasing_launch_cache['ts'] = time.time()
+    return set(ids)
 
 
 _availability_filter_cache = {}
